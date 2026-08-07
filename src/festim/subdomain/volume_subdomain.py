@@ -188,6 +188,16 @@ class VolumeSubdomain:
             dolfinx.mesh.create_submesh(mesh, marker.dim, entities)
         )
 
+        tdim = self.submesh.topology.dim
+        imap = self.submesh.topology.index_map(tdim)
+        n = imap.size_local + imap.num_ghosts
+        self.ct = meshtags(
+            self.submesh,
+            tdim,
+            np.arange(n, dtype=np.int32),
+            np.full(n, self.id, dtype=np.int32),
+        )
+
     def create_nested_subdomain(self, mesh: dolfinx.mesh.Mesh):
         """Creates the submesh of a codim-2 subdomain from its parent's submesh.
 
