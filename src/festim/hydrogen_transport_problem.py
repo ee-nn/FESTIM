@@ -1730,19 +1730,21 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         return self.dx(subdomain.id)
 
     def unrestricted_subdomain_measure(
-        self, subdomain: _subdomain.VolumeSubdomain
+        self, subdomain: _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain
     ) -> ufl.Measure:
-        """The ``dx`` an integral over ``subdomain`` should use, *before* it is
-        restricted with ``dx(subdomain.id)``.
+        """The measure an integral over ``subdomain`` should use, *before* it is
+        restricted with ``measure(subdomain.id)``.
 
         This is :meth:`subdomain_measure` for consumers that apply the subdomain id
-        themselves, which is what the derived quantities do. For a codim-0 subdomain
-        that is the parent-mesh measure. For a manifold (codim-1) one the parent
-        measure carries the *volume* meshtags, in which the manifold is not tagged at
-        all -- it lives in the facet meshtags -- so the integral has to be assembled on
-        the manifold's own submesh against
+        themselves, which is what the derived quantities do. A surface gets the
+        parent-mesh ``ds`` and a codim-0 volume the parent-mesh ``dx``. For a manifold
+        (codim-1 volume subdomain) the parent measure carries the *volume* meshtags, in
+        which the manifold is not tagged at all -- it lives in the facet meshtags -- so
+        the integral has to be assembled on the manifold's own submesh against
         :attr:`~festim.VolumeSubdomain.submesh_cell_tag`.
         """
+        if isinstance(subdomain, _subdomain.SurfaceSubdomain):
+            return self.ds
         if subdomain.codim(self.mesh.vdim) == 1:
             return ufl.Measure(
                 "dx",
@@ -1750,6 +1752,82 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 subdomain_data=subdomain.submesh_cell_tag,
             )
         return self.dx
+
+    def unrestricted_subdomain_mesh(
+        self, subdomain: _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain
+    ) -> dolfinx.mesh.Mesh:
+        """The mesh :meth:`unrestricted_subdomain_measure` integrates over.
+
+        Anything *built* for such an integral rather than looked up -- a spatial
+        coordinate, a facet normal, a ``fem.Constant`` -- has to be built on this mesh:
+        UFL admits one integration domain per form, and a constant carries the mesh it
+        was made on.
+        """
+        if (
+            isinstance(subdomain, _subdomain.VolumeSubdomain)
+            and subdomain.codim(self.mesh.vdim) == 1
+        ):
+            return subdomain.submesh
+        return self.mesh.mesh
+
+    def custom_quantity_kwargs(
+        self, subdomain: _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain
+    ) -> dict:
+        """The keyword arguments handed to a ``CustomQuantity``'s ``expr``, built for
+        the mesh its integral will be assembled on.
+
+        A ``CustomQuantity`` differs from the other derived quantities in that the
+        problem does not know its integrand: it hands over the ingredients and gets
+        back a ufl expression it then has to be able to integrate. So the ingredients
+        have to be built on :meth:`unrestricted_subdomain_mesh`, not taken from the
+        parent mesh unconditionally.
+
+        For a codim-0 volume or a surface that mesh *is* the parent mesh, and the
+        species solutions -- which live on submeshes either way -- are related to it by
+        the entity maps passed at assembly. For a manifold the integral is assembled on
+        the manifold's own submesh, and a coefficient bound to the parent mesh cannot
+        appear there: ``x``, ``n``, ``t``, ``T`` and the diffusion coefficients all
+        have to be the submesh mirrors. Those mirrors already exist, because the
+        manifold's own residual has the same constraint, so this reuses
+        :meth:`subdomain_time`, :meth:`subdomain_temperature` and
+        :meth:`diffusion_coefficient` rather than rebuilding them.
+        """
+        if isinstance(subdomain, _subdomain.SurfaceSubdomain):
+            try:
+                volume = self.surface_to_volume[subdomain]
+            except KeyError:
+                raise NotImplementedError(
+                    f"surface subdomain {subdomain.id} is not adjacent to any volume "
+                    "subdomain of the parent mesh. A codim-2 surface bounds a "
+                    "manifold, and derived quantities there are not supported yet."
+                ) from None
+        else:
+            volume = subdomain
+
+        mesh = self.unrestricted_subdomain_mesh(subdomain)
+
+        # only the species that actually live on this subdomain: indexing every species
+        # raises a KeyError naming a VolumeSubdomain object, which says neither which
+        # species is missing nor why
+        kwargs = {
+            species.name: species.subdomain_to_post_processing_solution[volume]
+            for species in self.species
+            if volume in species.subdomain_to_post_processing_solution
+        }
+        kwargs["x"] = ufl.SpatialCoordinate(mesh)
+        kwargs["n"] = ufl.FacetNormal(mesh)
+        kwargs["t"] = self.subdomain_time(volume)
+        kwargs["T"] = self.subdomain_temperature(volume)
+
+        present = [sp for sp in self.species if sp.name in kwargs]
+        D_kwargs = {
+            f"D_{sp.name}": self.diffusion_coefficient(volume, sp) for sp in present
+        }
+        kwargs.update(D_kwargs)
+        kwargs["D"] = {sp.name: D_kwargs[f"D_{sp.name}"] for sp in present}
+        if len(present) == 1:
+            kwargs["D"] = D_kwargs[f"D_{present[0].name}"]
+        return kwargs
 
     def manifold_is_interior(self, manifold: _subdomain.VolumeSubdomain) -> bool:
         """Whether ``manifold`` sits on interior facets of the mesh.
@@ -2650,12 +2728,6 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
     def check_export_compatibility(self):
         """Rejects the derived quantities that cannot yet be computed on a
         codimensional subdomain.
-
-        Without this they fail far from their cause: a quantity built from parent-mesh
-        objects (spatial coordinates, facet normals, the temperature field, the
-        diffusion coefficient) but assembled on a submesh raises inside the form
-        compiler, and a codim-2 surface raises a bare ``KeyError`` on
-        ``surface_to_volume``, which it is not a key of.
         """
         for export in self.exports:
             if isinstance(export, exports.MaximumVolume | exports.MinimumVolume):
@@ -2669,18 +2741,6 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             subdomain = getattr(export, "volume", None) or getattr(
                 export, "subdomain", None
             )
-            is_manifold = (
-                isinstance(subdomain, _subdomain.VolumeSubdomain)
-                and subdomain.codim(self.mesh.vdim) == 1
-            )
-            if isinstance(export, exports.CustomQuantity) and is_manifold:
-                raise NotImplementedError(
-                    f"CustomQuantity {export.title!r} is defined on codim-1 volume "
-                    f"subdomain {subdomain.id}. Its integrand is built from "
-                    "parent-mesh objects, which cannot be assembled on the "
-                    "manifold's submesh."
-                )
-
             surface = getattr(export, "surface", None)
             if surface is None and isinstance(subdomain, _subdomain.SurfaceSubdomain):
                 surface = subdomain
@@ -2756,40 +2816,9 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 export.data = []
 
             if isinstance(export, exports.CustomQuantity):
-                volume = (
-                    export.subdomain
-                    if not isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                    else self.surface_to_volume[
-                        export.subdomain
-                        if isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                        else next(
-                            s
-                            for s in self.surface_subdomains
-                            if s.id == export.subdomain
-                        )
-                    ]
+                export.ufl_expr = export.expr(
+                    **self.custom_quantity_kwargs(export.subdomain)
                 )
-
-                kwargs = {
-                    species.name: species.subdomain_to_post_processing_solution[volume]
-                    for species in self.species
-                }
-                kwargs["n"] = ufl.FacetNormal(self.mesh.mesh)
-                kwargs["t"] = self.t
-                kwargs["T"] = self.temperature_fenics
-
-                D_kwargs = {
-                    f"D_{sp.name}": volume.material.get_diffusion_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, sp
-                    )
-                    for sp in self.species
-                }
-                kwargs.update(D_kwargs)
-                kwargs["D"] = {sp.name: D_kwargs[f"D_{sp.name}"] for sp in self.species}
-                if len(self.species) == 1:
-                    kwargs["D"] = kwargs[f"D_{self.species[0].name}"]
-                kwargs["x"] = ufl.SpatialCoordinate(self.mesh.mesh)
-                export.ufl_expr = export.expr(**kwargs)
 
     def post_processing(self):
         # update post-processing solutions (for each species in each subdomain)
@@ -2879,12 +2908,11 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     export.compute()
 
             elif isinstance(export, exports.CustomQuantity):
-                is_surface = isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                measure = self.ds if is_surface else self.dx
-
-                # getting entity_maps
                 entity_maps = [sd.cell_map for sd in self.volume_subdomains]
-                export.compute(measure, entity_maps=entity_maps)
+                export.compute(
+                    self.unrestricted_subdomain_measure(export.subdomain),
+                    entity_maps=entity_maps,
+                )
 
             elif isinstance(export, exports.GasPressure):
                 export.compute()
