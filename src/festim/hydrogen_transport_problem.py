@@ -1717,27 +1717,22 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             if isinstance(source, _source.ParticleSource):
                 V = source.species.subdomain_to_function_space[source.volume]
 
-                # a self source on a codimensional subdomain is integrated over its
-                # own submesh, so its time and temperature must live there. A coupling
-                # source is integrated over the mesh of the coupling measure: the
-                # parent mesh for a manifold, the host manifold's submesh for a nested
-                # subdomain
+                # a self source on a manifold is integrated over its submesh, so its
+                # time and temperature must live there; a coupling source is integrated
+                # on the parent mesh and keeps the parent-mesh ones
                 if self.is_manifold_self_source(source):
-                    owner = source.volume
-                elif (
-                    source.volume in self.manifold_to_volumes
-                    and source.volume.codim(self.mesh.vdim) == 2
-                ):
-                    owner = source.volume.parent
+                    t = self.subdomain_time(source.volume)
+                    temperature = self.subdomain_temperature(source.volume)
                 else:
-                    owner = None
-
-                if owner is None:
                     t = self.t
                     temperature = self.temperature_fenics
-                else:
-                    t = self.subdomain_time(owner)
-                    temperature = self.subdomain_temperature(owner)
+                    if source.volume in self.manifold_to_volumes:
+                        # a coupling source is integrated on the parent mesh, so its
+                        # spatial coordinate has to be the parent mesh's as well --
+                        # ufl.SpatialCoordinate of the manifold's submesh is silently
+                        # wrong under the "+"/"-" restriction of an interior manifold.
+                        # only function_space.mesh is read on the up_to_ufl_expr path
+                        V = dolfinx.fem.functionspace(self.mesh.mesh, ("CG", 1))
 
                 source.value.convert_input_value(
                     function_space=V,
@@ -2806,7 +2801,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     temperature = self.temperature_fenics
                     t = self.t
                 bc.create_value_fenics(
-                    mesh=volume_subdomain.submesh,
+                    mesh=self.mesh.mesh,
                     temperature=temperature,
                     t=t,
                 )
