@@ -616,16 +616,58 @@ def test_volume_quantities_on_bulk_still_use_the_parent_measure():
 
 @pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 @pytest.mark.parametrize("cls", [F.MaximumVolume, F.MinimumVolume])
-def test_extremum_volume_quantities_raise(cls):
-    """These read ``volume_meshtags`` and the single ``post_processing_solution`` of
-    the parent mesh, neither of which a subdomain-wise problem sets."""
+def test_extremum_volume_quantities_on_manifold(cls):
+    """An extremum over a manifold is taken over its submesh.
+
+    The submesh of a codim-1 subdomain holds exactly the facets it is tagged on and
+    nothing else, so no cell meshtags are needed to select them -- the same property
+    the codim-0 path relies on. With a uniform source and no coupling the field is
+    ``c = 3 t`` everywhere along Gamma, so the maximum and the minimum coincide.
+    """
 
     def build(gamma, H_gam):
         return [cls(field=H_gam, volume=gamma)]
 
     model, _, _ = uncoupled_with_exports(build)
-    with pytest.raises(NotImplementedError, match="not supported"):
+    model.initialise()
+    model.run()
+
+    assert np.isclose(model.exports[0].data[-1], 3.0 * float(model.t), rtol=1e-9)
+
+
+@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
+def test_derived_quantity_on_the_boundary_of_a_manifold_raises():
+    """A codim-2 surface carries no facet meshtag, so there is nothing to integrate
+    over. It is rejected at initialisation rather than exporting a wrong number."""
+    model, _gamma, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
+    end = F.SurfaceSubdomain(id=7, dim=0, locator=lambda x: np.isclose(x[1], 0.0))
+    model.subdomains = [*model.subdomains, end]
+    model.exports = [F.TotalSurface(field=H_gam, surface=end)]
+
+    with pytest.raises(NotImplementedError, match="codim-2"):
         model.initialise()
+
+
+@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
+def test_custom_quantity_kwargs_skip_immobile_species():
+    """Only mobile species have a diffusion coefficient.
+
+    A material with per-species ``D_0`` raises when asked for the coefficient of a
+    trapped species, so building ``D_<name>`` for every species present broke any
+    manifold carrying a trap. The continuous problem filters the same way.
+    """
+    trapped = F.Species("trapped", subdomains=[], mobile=False)
+    model, gamma, _H_gam = uncoupled(
+        F.Stepsize(0.5), 1.0, 3.0, extra_species=(trapped,)
+    )
+    trapped.subdomains = [gamma]
+    model.exports = [_custom(lambda **kw: kw["H_gam"], gamma, "c")]
+    model.initialise()
+
+    kwargs = model.custom_quantity_kwargs(gamma)
+    assert "trapped" in kwargs
+    assert "D_trapped" not in kwargs
+    assert kwargs["D"] is kwargs["D_H_gam"]
 
 
 def _custom(expr, subdomain, title):

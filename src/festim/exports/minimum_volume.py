@@ -68,5 +68,14 @@ class MinimumVolume(VolumeQuantity):
         # a process may hold no dof of the volume at all, np.min would then raise
         local_min = np.min(values) if values.size > 0 else np.inf
 
+        # ... but if *no* process holds one, the volume id is not in these meshtags,
+        # and the allreduce below would return the sentinel as if it were a result
+        if mesh.comm.allreduce(values.size, op=MPI.SUM) == 0:
+            raise ValueError(
+                f"Cannot compute {self.title}: volume id {self.volume.id} matches no "
+                "cell of the given meshtags, so there is no value to take the "
+                "minimum of."
+            )
+
         self.value = mesh.comm.allreduce(local_min, op=MPI.MIN)
         self.data.append(self.value)

@@ -506,3 +506,94 @@ def test_extrema_exports_discontinuous(tmpdir):
     assert np.isclose(bot_surf_max.value, 0.0, atol=1e-8)
     assert np.isclose(top_surf_min.value, 1.0, atol=1e-8)
     assert np.isclose(top_surf_max.value, 1.0, atol=1e-8)
+
+
+def make_two_material_model(exports_fn):
+    """A two-material discontinuous problem, parametrised by its exports."""
+    fenics_mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 10, 10)
+
+    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model.mesh = F.Mesh(fenics_mesh)
+
+    top_volume = F.VolumeSubdomain(
+        id=3,
+        material=F.Material(name="A", D_0=1, E_D=0, K_S_0=2, E_K_S=0),
+        locator=lambda x: x[1] >= 0.5,
+    )
+    bottom_volume = F.VolumeSubdomain(
+        id=4,
+        material=F.Material(name="B", D_0=2, E_D=0, K_S_0=3, E_K_S=0),
+        locator=lambda x: x[1] <= 0.5,
+    )
+    top_surface = F.SurfaceSubdomain(id=1, locator=lambda x: np.isclose(x[1], 1.0))
+    bottom_surface = F.SurfaceSubdomain(id=2, locator=lambda x: np.isclose(x[1], 0.0))
+
+    my_model.subdomains = [top_surface, bottom_surface, top_volume, bottom_volume]
+    my_model.interfaces = [
+        F.Interface(5, (bottom_volume, top_volume), penalty_term=1000)
+    ]
+
+    H = F.Species("H", subdomains=[bottom_volume, top_volume])
+    my_model.species = [H]
+    my_model.temperature = 400
+    my_model.boundary_conditions = [
+        F.FixedConcentrationBC(subdomain=top_surface, value=1.0, species=H),
+        F.FixedConcentrationBC(subdomain=bottom_surface, value=0.0, species=H),
+    ]
+    my_model.settings = F.Settings(atol=1e-10, rtol=1e-10, transient=False)
+    my_model.exports = exports_fn(top_volume, bottom_volume, top_surface, H)
+    return my_model
+
+
+@pytest.mark.parametrize(
+    "make_export",
+    [
+        lambda vol, surf, H: F.MinimumVolume(field=H, volume=vol.id),
+        lambda vol, surf, H: F.MaximumVolume(field=H, volume=vol.id),
+        lambda vol, surf, H: F.TotalVolume(field=H, volume=vol.id),
+        lambda vol, surf, H: F.MinimumSurface(field=H, surface=surf.id),
+        lambda vol, surf, H: F.TotalSurface(field=H, surface=surf.id),
+    ],
+)
+def test_export_subdomain_given_by_id(make_export):
+    """`volume` and `surface` accept a bare id, and the discontinuous problem keys
+    everything by object -- an unresolved id used to surface as `KeyError: 2` or
+    `AttributeError: 'int' object has no attribute 'id'`."""
+    model = make_two_material_model(
+        lambda top, bot, top_surf, H: [make_export(top, top_surf, H)]
+    )
+    model.initialise()
+    model.run()
+
+    assert len(model.exports[0].data) == 1
+
+
+def test_export_subdomain_id_not_found():
+    model = make_two_material_model(
+        lambda top, bot, top_surf, H: [F.TotalVolume(field=H, volume=404)]
+    )
+    with pytest.raises(ValueError, match="matches no declared volume subdomain"):
+        model.initialise()
+
+
+@pytest.mark.parametrize(
+    "make_export",
+    [
+        lambda vol, surf, H: F.MinimumVolume(field="H", volume=vol),
+        lambda vol, surf, H: F.TotalVolume(field="H", volume=vol),
+        lambda vol, surf, H: F.MinimumSurface(field="H", surface=surf),
+        lambda vol, surf, H: F.SurfaceFlux(field="H", surface=surf),
+    ],
+)
+def test_export_field_given_by_name(make_export):
+    """`field` accepts a species name. The continuous problem resolves it; the
+    discontinuous one used to let the string through initialisation and fail during
+    post-processing with an AttributeError naming `str`."""
+    model = make_two_material_model(
+        lambda top, bot, top_surf, H: [make_export(top, top_surf, H)]
+    )
+    model.initialise()
+    model.run()
+
+    assert isinstance(model.exports[0].field, F.Species)
+    assert len(model.exports[0].data) == 1

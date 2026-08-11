@@ -28,24 +28,31 @@ class MaximumSurface(SurfaceQuantity):
 
     def compute(
         self,
-        facet_meshtags: dolfinx.mesh.MeshTags,
         u: dolfinx.fem.Function | None = None,
+        facet_meshtags: dolfinx.mesh.MeshTags | None = None,
     ):
         """Computes the maximum value of the field on the defined surface subdomain, and
         appends it to the data list.
 
         Args:
+            u: the field the maximum is computed from. Defaults to
+                ``self.field.post_processing_solution``
             facet_meshtags: the facet meshtags used to locate the facets of the
                 surface subdomain. Defaults to ``self.facet_meshtags``. For the
                 discontinuous problem these are the facet meshtags of the submesh
                 the field lives on (``VolumeSubdomain.ft``)
-            u: the field the maximum is computed from. Defaults to
-                ``self.field.post_processing_solution``
 
         Raises:
-            ValueError: if no facet meshtags are available
+            ValueError: if no facet meshtags are available, or if the surface id is
+                absent from them on every process
         """
         solution = self.field.post_processing_solution if u is None else u
+        meshtags = self.facet_meshtags if facet_meshtags is None else facet_meshtags
+        if meshtags is None:
+            raise ValueError(
+                f"Cannot compute {self.title}: no facet meshtags were passed to "
+                "`compute` and none are set on the export."
+            )
 
         if isinstance(solution, dolfinx.fem.Function):
             V = solution.function_space
@@ -54,7 +61,7 @@ class MaximumSurface(SurfaceQuantity):
         mesh = V.mesh
         fdim = mesh.topology.dim - 1
 
-        entities = facet_meshtags.find(self.surface.id)
+        entities = meshtags.find(self.surface.id)
         mesh.topology.create_connectivity(fdim, mesh.topology.dim)
         dofs = dolfinx.fem.locate_dofs_topological(
             V=V, entity_dim=fdim, entities=entities
@@ -63,6 +70,15 @@ class MaximumSurface(SurfaceQuantity):
 
         # a process may hold no dof of the surface at all, np.max would then raise
         local_max = np.max(values) if values.size > 0 else -np.inf
+
+        # ... but if *no* process holds one the surface id is not in these meshtags,
+        # and the allreduce below would return the sentinel as if it were a result
+        if mesh.comm.allreduce(values.size, op=MPI.SUM) == 0:
+            raise ValueError(
+                f"Cannot compute {self.title}: surface id {self.surface.id} matches "
+                "no facet of the given meshtags, so there is no value to take the "
+                "maximum of."
+            )
 
         self.value = mesh.comm.allreduce(local_max, op=MPI.MAX)
         self.data.append(self.value)
