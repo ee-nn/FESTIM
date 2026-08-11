@@ -1770,53 +1770,6 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             return subdomain.submesh
         return self.mesh.mesh
 
-    def export_volume(
-        self, subdomain: _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain
-    ) -> _subdomain.VolumeSubdomain:
-        """The volume subdomain whose submesh carries the solution an export on
-        ``subdomain`` reads: ``subdomain`` itself for a volume subdomain, and the
-        adjacent volume for a surface subdomain.
-
-        Raises:
-            NotImplementedError: if ``subdomain`` is a surface with no adjacent volume
-                subdomain in ``surface_to_volume``, which is what the boundary of a
-                manifold looks like. Indexing ``surface_to_volume`` directly raises a
-                ``KeyError`` whose message is the ``repr`` of a subdomain object,
-                naming neither the subdomain nor the reason.
-        """
-        if not isinstance(subdomain, _subdomain.SurfaceSubdomain):
-            return subdomain
-        try:
-            return self.surface_to_volume[subdomain]
-        except KeyError:
-            raise NotImplementedError(
-                f"surface subdomain {subdomain.id} is not adjacent to any volume "
-                "subdomain of the parent mesh. A surface bounding a codim-1 volume "
-                "subdomain (a manifold) carries no facet meshtag, and derived "
-                "quantities there are not supported yet. If it is meant to bound an "
-                "ordinary volume subdomain, check that its id matches a tagged facet."
-            ) from None
-
-    def subdomain_solution(
-        self, field: _species.Species, volume: _subdomain.VolumeSubdomain
-    ) -> fem.Function:
-        """The post-processing solution of ``field`` on ``volume``'s submesh.
-
-        Raises:
-            ValueError: if ``field`` does not live on ``volume``. Indexing
-                ``subdomain_to_post_processing_solution`` directly raises a
-                ``KeyError`` whose message is the ``repr`` of a subdomain object.
-        """
-        try:
-            return field.subdomain_to_post_processing_solution[volume]
-        except KeyError:
-            raise ValueError(
-                f"species {field.name} does not live on volume subdomain "
-                f"{volume.id}, so an export of it there has nothing to read. Either "
-                "add the subdomain to the species' `subdomains`, or point the export "
-                "at a subdomain the species lives on."
-            ) from None
-
     def custom_quantity_kwargs(
         self, subdomain: _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain
     ) -> dict:
@@ -1839,7 +1792,18 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         :meth:`subdomain_time`, :meth:`subdomain_temperature` and
         :meth:`diffusion_coefficient` rather than rebuilding them.
         """
-        volume = self.export_volume(subdomain)
+        if isinstance(subdomain, _subdomain.SurfaceSubdomain):
+            try:
+                volume = self.surface_to_volume[subdomain]
+            except KeyError:
+                raise NotImplementedError(
+                    f"surface subdomain {subdomain.id} is not adjacent to any volume "
+                    "subdomain of the parent mesh. A codim-2 surface bounds a "
+                    "manifold, and derived quantities there are not supported yet."
+                ) from None
+        else:
+            volume = subdomain
+
         mesh = self.unrestricted_subdomain_mesh(subdomain)
 
         # only the species that actually live on this subdomain: indexing every species
@@ -2761,73 +2725,31 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     t=self.t,
                 )
 
-    def export_subdomain(
-        self, export: exports.DerivedQuantity
-    ) -> _subdomain.VolumeSubdomain | _subdomain.SurfaceSubdomain | None:
-        """The subdomain a derived quantity is defined on, whichever attribute holds
-        it: ``volume``, ``surface`` or ``subdomain`` depending on the class. ``None``
-        for an export that has none of them.
-
-        The attribute may hold a bare ``id`` rather than a subdomain, because the
-        setters of :class:`~festim.VolumeQuantity` and
-        :class:`~festim.SurfaceQuantity` both accept an ``int``. A subdomain-wise
-        problem keys everything by object -- ``surface_to_volume``,
-        ``subdomain_to_post_processing_solution`` -- so an id left unresolved reaches
-        those dictionaries and raises a bare ``KeyError``. It is resolved against the
-        declared subdomains here, once, so that everything downstream sees an object.
-
-        Raises:
-            ValueError: if an id matches no declared subdomain of the right kind.
-        """
-        for attr, declared in (
-            ("volume", self.volume_subdomains),
-            ("surface", self.surface_subdomains),
-            ("subdomain", self.volume_subdomains + self.surface_subdomains),
-        ):
-            # `getattr(export, attr, None) or ...` would skip a legitimate id of 0
-            value = getattr(export, attr, None)
-            if value is None:
-                continue
-            if not isinstance(value, int):
-                return value
-            match = [sd for sd in declared if sd.id == value]
-            if not match:
-                raise ValueError(
-                    f"{type(export).__name__} is defined on {attr}={value}, which "
-                    f"matches no declared {attr} subdomain of the problem. Pass the "
-                    "subdomain object rather than its id."
-                )
-            setattr(export, attr, match[0])
-            return match[0]
-        return None
-
     def check_export_compatibility(self):
         """Rejects the derived quantities that cannot yet be computed on a
-        codimensional subdomain, and resolves any subdomain given by id.
-
-        A codim-1 volume subdomain (a manifold) supports every derived quantity. Its
-        *boundary* -- a codim-2 surface subdomain -- supports none: it carries no facet
-        meshtag, so it takes no part in ``surface_to_volume`` and there is nothing to
-        integrate over or locate dofs on.
+        codimensional subdomain.
         """
         for export in self.exports:
-            if not isinstance(export, exports.DerivedQuantity):
-                continue
+            if isinstance(export, exports.MaximumVolume | exports.MinimumVolume):
+                raise NotImplementedError(
+                    f"{type(export).__name__} is not supported by "
+                    f"{type(self).__name__}: it reads the volume meshtags and the "
+                    "single post-processing solution of the parent mesh, neither of "
+                    "which a subdomain-wise problem has."
+                )
 
-            subdomain = self.export_subdomain(export)
-            if not isinstance(subdomain, _subdomain.SurfaceSubdomain):
-                continue
-
-            # `codim` reads `dim`, which defaults to None (ie. codim 1) even for a
-            # surface that in fact bounds a manifold, so an unmapped surface is
-            # rejected too rather than reaching `surface_to_volume` as a bare KeyError
-            if subdomain.codim(self.mesh.vdim) == 2:
+            subdomain = getattr(export, "volume", None) or getattr(
+                export, "subdomain", None
+            )
+            surface = getattr(export, "surface", None)
+            if surface is None and isinstance(subdomain, _subdomain.SurfaceSubdomain):
+                surface = subdomain
+            if surface is not None and surface.codim(self.mesh.vdim) == 2:
                 raise NotImplementedError(
                     f"{type(export).__name__} is defined on codim-2 surface subdomain "
-                    f"{subdomain.id}, which bounds a manifold. Derived quantities on "
-                    "the boundary of a codim-1 volume subdomain are not supported yet."
+                    f"{surface.id}, which bounds a manifold. Derived quantities on the "
+                    "boundary of a codim-1 volume subdomain are not supported yet."
                 )
-            self.export_volume(subdomain)
 
     def initialise_exports(self):
         self.check_export_compatibility()
@@ -2880,7 +2802,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         # HydrogenTransportProblem
         for export in self.exports:
             if isinstance(export, exports.SurfaceQuantity):
-                volume = self.export_volume(export.surface)
+                volume = self.surface_to_volume[export.surface]
                 D = volume.material.get_diffusion_coefficient(
                     self.mesh.mesh, self.temperature_fenics, export.field
                 )
@@ -2902,7 +2824,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             )
             if is_extremum and isinstance(export.field, _species.Species):
                 if isinstance(export, exports.SurfaceQuantity):
-                    volume = self.export_volume(export.surface)
+                    volume = self.surface_to_volume[export.surface]
                     location = f"surface {export.surface.id}"
                 else:
                     volume = export.volume
@@ -2985,8 +2907,11 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                             "Advection terms are not currently accounted for in the "
                             "evaluation of surface flux values"
                         )
-                    export_vol = self.export_volume(export.surface)
-                    submesh_function = self.subdomain_solution(export.field, export_vol)
+                    export_surf = export.surface
+                    export_vol = self.surface_to_volume[export_surf]
+                    submesh_function = (
+                        export.field.subdomain_to_post_processing_solution[export_vol]
+                    )
                     entity_maps = [sd.cell_map for sd in self.volume_subdomains]
 
                     export.compute(
@@ -2998,9 +2923,11 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     # the field lives on the submesh of the volume the surface
                     # belongs to, so the extremum is computed there using the
                     # facet meshtags transferred to that submesh
-                    export_vol = self.export_volume(export.surface)
+                    export_vol = self.surface_to_volume[export.surface]
                     export.compute(
-                        u=self.subdomain_solution(export.field, export_vol),
+                        u=export.field.subdomain_to_post_processing_solution[
+                            export_vol
+                        ],
                         facet_meshtags=export_vol.ft,
                     )
                 else:
@@ -3011,17 +2938,19 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     entity_maps = [sd.cell_map for sd in self.volume_subdomains]
 
                     export.compute(
-                        u=self.subdomain_solution(export.field, export.volume),
+                        u=export.field.subdomain_to_post_processing_solution[
+                            export.volume
+                        ],
                         dx=self.unrestricted_subdomain_measure(export.volume),
                         entity_maps=entity_maps,
                     )
                 elif isinstance(export, exports.MaximumVolume | exports.MinimumVolume):
-                    # the submesh of a volume subdomain contains exactly the cells of
-                    # that subdomain, so no cell meshtags are needed. This holds for a
-                    # manifold too: its submesh is built from the facets it is tagged
-                    # on, and carries nothing else
+                    # the submesh of the volume subdomain contains exactly the cells
+                    # of that volume, so no cell meshtags are needed
                     export.compute(
-                        u=self.subdomain_solution(export.field, export.volume),
+                        u=export.field.subdomain_to_post_processing_solution[
+                            export.volume
+                        ],
                     )
                 else:
                     export.compute()

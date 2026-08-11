@@ -265,14 +265,8 @@ Limitations
   so the exchange with it would not be well posed.
 * Boundary conditions on the boundary of a manifold are limited to
   :class:`festim.FixedConcentrationBC`.
-* Derived quantities work on a manifold: :class:`festim.TotalVolume`,
-  :class:`festim.AverageVolume`, :class:`festim.MaximumVolume`,
-  :class:`festim.MinimumVolume` and :class:`festim.CustomQuantity` all take a manifold
-  as their subdomain, and are assembled on its submesh.
-  :class:`festim.VTXSpeciesExport` and :class:`festim.Profile1DExport` work on a
-  manifold too. On the **boundary** of a manifold — a codim-2 surface subdomain —
-  none of them are available: such a surface carries no meshtag, so there is nothing
-  to integrate over. Declaring one raises rather than exporting a wrong number.
+* Dedicated exports on a manifold or on its boundary are not available;
+  :class:`festim.VTXSpeciesExport` on a manifold works.
 * Cartesian coordinates only.
 
 ----------

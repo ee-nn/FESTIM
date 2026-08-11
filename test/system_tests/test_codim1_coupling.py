@@ -615,154 +615,17 @@ def test_volume_quantities_on_bulk_still_use_the_parent_measure():
 
 
 @pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-def test_extremum_volume_quantities_on_manifold():
-    """A maximum or a minimum over a manifold reads the manifold's own submesh.
-
-    The submesh of a volume subdomain holds exactly that subdomain, so the extremum is
-    taken over the whole of the post-processing solution and needs no cell meshtags --
-    which is just as well, because a manifold is tagged in the *facet* meshtags and
-    ``volume_meshtags.find(gamma.id)`` selects nothing.
-
-    The manifold's material is made non-diffusive so that each node evolves as an
-    independent ODE, ``c(y) = S(y) t``, exact under backward Euler. The source varies
-    along Gamma, so the maximum and the minimum differ and a lookup that silently read
-    a single node, or the bulk field, would not reproduce both.
-    """
+@pytest.mark.parametrize("cls", [F.MaximumVolume, F.MinimumVolume])
+def test_extremum_volume_quantities_raise(cls):
+    """These read ``volume_meshtags`` and the single ``post_processing_solution`` of
+    the parent mesh, neither of which a subdomain-wise problem sets."""
 
     def build(gamma, H_gam):
-        return [
-            F.MaximumVolume(field=H_gam, volume=gamma),
-            F.MinimumVolume(field=H_gam, volume=gamma),
-        ]
+        return [cls(field=H_gam, volume=gamma)]
 
-    model, gamma, _ = uncoupled_with_exports(build)
-    # no diffusion along Gamma: the tangential gradient of the exact solution below is
-    # non-zero at the ends, which the natural zero-flux condition there would fight
-    gamma.material = F.Material(D_0=0.0, E_D=0.0)
-    model.sources[0].value = lambda x: 3.0 + x[1]
-    model.initialise()
-    model.run()
-
-    maximum, minimum = model.exports
-    t = float(model.t)
-    # Gamma spans y in [0, 1] and both ends carry a node of the 8x8 mesh
-    assert np.isclose(maximum.data[-1], 4.0 * t, rtol=1e-9)
-    assert np.isclose(minimum.data[-1], 3.0 * t, rtol=1e-9)
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-@pytest.mark.parametrize("cls", [F.MaximumVolume, F.MinimumVolume])
-def test_extremum_volume_quantities_read_only_their_own_subdomain(cls):
-    """The bulk and the manifold carry different fields, so an extremum over one must
-    not pick up the other. Both are exported from the same run to catch a lookup that
-    resolves to whichever submesh happens to come first."""
-
-    model, gamma, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    omega = next(v for v in model.volume_subdomains if v is not gamma)
-    H_om = next(s for s in model.species if s.name == "H_om")
-    model.exports = [
-        cls(field=H_gam, volume=gamma),
-        cls(field=H_om, volume=omega),
-    ]
-    model.initialise()
-    model.run()
-
-    on_gamma, on_omega = model.exports
-    # Omega is inert with a zero Dirichlet BC; Gamma is fed a source of 3
-    assert np.isclose(on_gamma.data[-1], 3.0 * float(model.t), rtol=1e-9)
-    assert np.isclose(on_omega.data[-1], 0.0, atol=1e-12)
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-@pytest.mark.parametrize(
-    "cls", [F.TotalSurface, F.AverageSurface, F.SurfaceFlux, F.MaximumSurface]
-)
-def test_derived_quantities_on_a_manifold_boundary_raise(cls):
-    """A codim-2 surface bounds a manifold. It carries no facet meshtag, so it is
-    absent from ``surface_to_volume`` and there is nothing to integrate over or to
-    locate dofs on. Rejecting it at setup beats a ``KeyError`` after the first solve.
-    """
-    model, _, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    end = F.SurfaceSubdomain(id=9, dim=0, locator=lambda x: np.isclose(x[1], 0.0))
-    model.subdomains.append(end)
-    model.exports = [cls(field=H_gam, surface=end)]
-
-    with pytest.raises(NotImplementedError, match="codim-2 surface subdomain 9"):
+    model, _, _ = uncoupled_with_exports(build)
+    with pytest.raises(NotImplementedError, match="not supported"):
         model.initialise()
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-def test_unmapped_surface_is_rejected_by_id():
-    """``SurfaceSubdomain.dim`` defaults to ``None``, ie. codimension 1, so a surface
-    that in fact bounds a manifold but was declared without ``dim`` passes the codim
-    check and reaches ``surface_to_volume``. Indexing that dict raises a ``KeyError``
-    whose message is the ``repr`` of a subdomain object, naming neither the subdomain
-    nor the reason."""
-    model, _, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    # on the manifold but no `dim=0`, so it is not recognised as codim-2
-    end = F.SurfaceSubdomain(
-        id=9,
-        locator=lambda x: np.logical_and(np.isclose(x[0], 0.0), np.isclose(x[1], 0.0)),
-    )
-    model.subdomains.append(end)
-    model.exports = [F.TotalSurface(field=H_gam, surface=end)]
-
-    with pytest.raises(NotImplementedError, match="surface subdomain 9"):
-        model.initialise()
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-def test_derived_quantities_accept_a_subdomain_id():
-    """``VolumeQuantity.volume`` and ``SurfaceQuantity.surface`` both accept an ``int``.
-    A subdomain-wise problem keys everything by object, so an id has to be resolved
-    before it reaches ``surface_to_volume`` or the compatibility check -- the former
-    raises ``KeyError: 2``, the latter ``'int' object has no attribute 'codim'``."""
-    model, gamma, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    H_om = next(s for s in model.species if s.name == "H_om")
-    model.exports = [
-        F.TotalVolume(field=H_gam, volume=GAMMA_ID),
-        F.MaximumVolume(field=H_gam, volume=GAMMA_ID),
-        F.TotalSurface(field=H_om, surface=RIGHT_ID),
-    ]
-    model.initialise()
-
-    # resolved in place, so everything downstream sees the object
-    assert all(
-        getattr(e, "volume", None) is gamma
-        for e in model.exports
-        if hasattr(e, "volume")
-    )
-    model.run()
-
-    # Gamma has unit length and carries c = 3 t
-    total, maximum, _ = model.exports
-    assert np.isclose(total.data[-1], 3.0 * float(model.t), rtol=1e-9)
-    assert np.isclose(maximum.data[-1], 3.0 * float(model.t), rtol=1e-9)
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-def test_derived_quantity_on_an_unknown_id_is_rejected():
-    model, _, H_gam = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    model.exports = [F.TotalVolume(field=H_gam, volume=99)]
-
-    with pytest.raises(ValueError, match="volume=99"):
-        model.initialise()
-
-
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
-@pytest.mark.parametrize("cls", [F.TotalVolume, F.AverageVolume])
-def test_volume_quantity_of_an_absent_species_is_diagnosable(cls):
-    """A species that does not live on the target subdomain has no post-processing
-    solution there. Indexing ``subdomain_to_post_processing_solution`` raises a
-    ``KeyError`` naming a ``VolumeSubdomain`` object, which says neither which species
-    is missing nor why."""
-    model, gamma, _ = uncoupled(F.Stepsize(0.5), 1.0, 3.0)
-    H_om = next(s for s in model.species if s.name == "H_om")
-    model.exports = [cls(field=H_om, volume=gamma)]
-    model.initialise()
-
-    with pytest.raises(ValueError, match="H_om does not live on volume subdomain 2"):
-        model.run()
 
 
 def _custom(expr, subdomain, title):
