@@ -6,6 +6,7 @@ import dolfinx
 import numpy as np
 import pytest
 import ufl
+from scifem import assemble_scalar
 
 import festim as F
 from festim.helpers import solution_on
@@ -432,3 +433,122 @@ def test_manifold_gradient_uses_the_submesh_measure():
         )
     )
     assert not np.isclose(wrong, reference, rtol=1e-3)
+
+
+def _three_strips(n=12):
+    """A unit square cut into three vertical strips tagged 1, 2, 3, with the facets at
+    ``x = 1/3`` (between strips 1 and 2) and ``x = 2/3`` tagged 7 and 8."""
+    mesh = unit_square(n)
+    tdim = mesh.topology.dim
+    cells = np.arange(mesh.topology.index_map(tdim).size_local, dtype=np.int32)
+    midpoints = dolfinx.mesh.compute_midpoints(mesh, tdim, cells)
+    values = (np.digitize(midpoints[:, 0], [1 / 3, 2 / 3]) + 1).astype(np.int32)
+    ct = dolfinx.mesh.meshtags(mesh, tdim, cells, values)
+
+    facets, tags = [], []
+    for tag, x0 in ((7, 1 / 3), (8, 2 / 3)):
+        found = dolfinx.mesh.locate_entities(
+            mesh, tdim - 1, lambda x, x0=x0: np.isclose(x[0], x0)
+        )
+        facets.append(found)
+        tags.append(np.full(len(found), tag, dtype=np.int32))
+    order = np.argsort(np.concatenate(facets))
+    ft = dolfinx.mesh.meshtags(
+        mesh,
+        tdim - 1,
+        np.concatenate(facets)[order].astype(np.int32),
+        np.concatenate(tags)[order],
+    )
+    return ct, ft
+
+
+@pytest.mark.parametrize("plus, minus", [(1, 2), (2, 1)])
+def test_ordered_interior_facet_data_puts_requested_subdomain_on_plus(plus, minus):
+    """The "+" restriction is the subdomain asked for, whichever way DOLFINx (or the
+    cell tag values) happens to order the two cells of the facet."""
+    ct, ft = _three_strips()
+    material = F.Material(D_0=1, E_D=0)
+    tag, data = F.subdomain.compute_ordered_interior_facet_data(
+        ct,
+        ft,
+        7,
+        F.VolumeSubdomain(id=plus, material=material),
+        F.VolumeSubdomain(id=minus, material=material),
+    )
+    assert tag == 7
+    quadruples = data.reshape(-1, 4)
+    assert (ct.values[quadruples[:, 0]] == plus).all()
+    assert (ct.values[quadruples[:, 2]] == minus).all()
+
+
+def test_ordered_interior_facet_data_rejects_facets_elsewhere():
+    """Facets that do not all separate the two given subdomains cannot be ordered."""
+    ct, ft = _three_strips()
+    material = F.Material(D_0=1, E_D=0)
+    with pytest.raises(ValueError, match="do not all separate volume subdomain"):
+        F.subdomain.compute_ordered_interior_facet_data(
+            ct,
+            ft,
+            8,  # between strips 2 and 3
+            F.VolumeSubdomain(id=1, material=material),
+            F.VolumeSubdomain(id=2, material=material),
+        )
+
+
+def test_surface_quantity_accepts_a_manifold_subdomain():
+    """A manifold is passed directly wherever a surface is expected, exports included.
+
+    Which subdomain object it is cannot tell whether it is really codim 1 -- that needs
+    the mesh -- so the setter accepts any volume subdomain and the problem checks at
+    initialisation.
+    """
+    gamma = F.VolumeSubdomain(id=2, material=F.Material(D_0=1, E_D=0), dim=1)
+    export = F.SurfaceFlux(field=F.Species("H"), surface=gamma)
+    assert export.surface is gamma
+
+
+@pytest.mark.parametrize("bad", [True, "top", 1.0, None])
+def test_surface_quantity_rejects_other_types(bad):
+    with pytest.raises(TypeError, match="surface should be"):
+        F.SurfaceFlux(field=F.Species("H"), surface=bad)
+
+
+def test_export_volume_measure_is_on_the_submesh_for_a_manifold():
+    """A manifold's fields live on its submesh, so a volume quantity over it integrates
+    there. The measure carries a tag over the whole submesh, so indexing it by the
+    subdomain id -- which is what the export does -- selects all of it."""
+    model, omega, gamma, _ = build_manifold_model([])
+    model.initialise()
+
+    dx_gamma = model.export_volume_measure(gamma)
+    assert dx_gamma.ufl_domain() is gamma.submesh.ufl_domain()
+    # the manifold is the full top edge of the unit square
+    assert np.isclose(assemble_scalar(1 * dx_gamma(gamma.id)), 1.0)
+
+    # an ordinary subdomain is untouched
+    assert model.export_volume_measure(omega) is model.dx
+
+
+def test_unindexed_coupling_measure_agrees_with_the_indexed_one():
+    """Derived quantities need the measure itself, since they index it by the id of the
+    subdomain they export, exactly as they do with the parent ds."""
+    model, _, gamma, _ = build_manifold_model([])
+    model.initialise()
+
+    unindexed = model.unindexed_coupling_measure(gamma)
+    assert unindexed(gamma.id) == model.coupling_measure(gamma)
+
+
+def test_manifold_boundary_measure_is_memoised():
+    """DOLFINx requires every integral of a compiled form to share the *same*
+    subdomain_data object, not merely an equal one."""
+    end = F.SurfaceSubdomain(id=7, dim=0, locator=lambda x: np.isclose(x[0], 0.0))
+    model, _, gamma, H_gam = build_manifold_model([end])
+    model.exports = [F.TotalSurface(field=H_gam, surface=end)]
+    model.initialise()
+
+    first = model._manifold_boundary_measure(end, gamma)
+    assert model._manifold_boundary_measure(end, gamma) is first
+    assert first.ufl_domain() is gamma.submesh.ufl_domain()
+    # a single endpoint of a 1D submesh, of unit measure
+    assert np.isclose(assemble_scalar(1 * first(end.id)), 1.0)

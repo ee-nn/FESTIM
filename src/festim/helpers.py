@@ -45,6 +45,7 @@ def as_mapped_function(
     temperature: fem.Function | fem.Constant | ufl.core.expr.Expr | None = None,
     species_dependent_value: dict[str, "Species"] | None = None,
     subdomain: "VolumeSubdomain | None" = None,
+    mesh: dolfinx.mesh.Mesh | None = None,
 ) -> ufl.core.expr.Expr:
     """Maps a user given callable function to the mesh, time, temperature or the
     concentration of other species within festim as needed.
@@ -74,8 +75,16 @@ def as_mapped_function(
         kwargs["x"] = x
     if "T" in arguments:
         kwargs["T"] = temperature
+    if "x" in arguments:
+        # the spatial coordinate must come from the mesh the integral is assembled
+        # over, which is not always the mesh the unknown lives on
+        kwargs["x"] = ufl.SpatialCoordinate(mesh or function_space.mesh)
 
     for name, species in (species_dependent_value or {}).items():
+        # only pass the species the callable actually declares, as done above for
+        # t/x/T, so a value may be given more species than it uses
+        if name not in arguments:
+            continue
         if species.concentration is not None:
             kwargs[name] = species.concentration
         else:  # discontinuous case: the species has one solution per subdomain
@@ -114,6 +123,29 @@ def solution_on(species: "Species", subdomain: "VolumeSubdomain"):
         f"has a solution on several other subdomains ({others}), so it is ambiguous "
         "which one this expression should use."
     )
+
+
+def restrict(expression, restriction: str | None):
+    """Apply ``restriction`` to a whole expression.
+
+    Interior facet integrals need every discontinuous terminal restricted to one side
+    of the facet. Restricting the expression as a whole rather than each terminal keeps
+    a compound cross-mesh expression -- ``k * (c_bulk - c_manifold)``, or a flux
+    ``-D * grad(c) . n`` -- on a single side, which also picks the outward normal of
+    that side.
+
+    Args:
+        expression: the ufl expression to restrict
+        restriction: ``"+"``, ``"-"``, or ``None`` for an exterior facet integral, where
+            nothing needs restricting
+
+    Returns:
+        The restricted expression, or ``expression`` unchanged when ``restriction`` is
+        ``None``
+    """
+    if restriction is None:
+        return expression
+    return ufl.as_ufl(expression)(restriction)
 
 
 def as_fenics_interp_expr_and_function(
@@ -191,13 +223,7 @@ class Value:
     """
 
     input_value: (
-        float
-        | int
-        | fem.Constant
-        | np.ndarray
-        | fem.Expression
-        | ufl.core.expr.Expr
-        | fem.Function
+        float | int | fem.Constant | fem.Expression | ufl.core.expr.Expr | fem.Function
     )
     species_dependent_value: dict[str, "Species"] | None
 
@@ -234,7 +260,6 @@ class Value:
             float
             | int
             | fem.Constant
-            | np.ndarray
             | fem.Expression
             | ufl.core.expr.Expr
             | fem.Function,
@@ -244,7 +269,7 @@ class Value:
             self._input_value = value
         else:
             raise TypeError(
-                "Value must be a float, int, fem.Constant, np.ndarray, fem.Expression,"
+                "Value must be a float, int, fem.Constant, fem.Expression,"
                 f" ufl.core.expr.Expr, fem.Function, or callable not {value}"
             )
 
@@ -289,6 +314,7 @@ class Value:
         temperature: fem.Function | fem.Constant | ufl.core.expr.Expr | None = None,
         up_to_ufl_expr: bool | None = False,
         subdomain: "VolumeSubdomain | None" = None,
+        mesh: dolfinx.mesh.Mesh | None = None,
     ):
         """Converts a user given value to a relevent fenics object depending on the type
         of the value provided.
@@ -302,7 +328,17 @@ class Value:
             subdomain: the volume subdomain on which the value is evaluated. Only needed
                 in the discontinuous case to select the correct species solution,
                 optional
+            mesh: the mesh the integral carrying this value is assembled over.
+                Defaults to ``function_space.mesh``. Pass it explicitly when the two
+                differ -- a term coupling a codim-1 subdomain to the bulk is a
+                parent-mesh facet integral although its unknowns live on submeshes --
+                so that ``ufl.SpatialCoordinate`` and any ``fem.Constant`` are built
+                on the integration domain, not on the space of the unknown. Only
+                meaningful with ``up_to_ufl_expr=True``.
         """
+        if mesh is None and function_space is not None:
+            mesh = function_space.mesh
+
         if isinstance(
             self.input_value, fem.Constant | fem.Function | ufl.core.expr.Expr
         ):
@@ -318,7 +354,6 @@ class Value:
 
         elif callable(self.input_value):
             args = self.input_value.__code__.co_varnames
-            # if only t is an argument, create constant object
             if (
                 "t" in args
                 and "x" not in args
@@ -330,15 +365,14 @@ class Value:
                         "self.value should return a float or an int, not "
                         + f"{type(self.input_value(t=float(t)))} "
                     )
-
                 self.fenics_object = as_fenics_constant(
-                    value=self.input_value(t=float(t)), mesh=function_space.mesh
+                    value=self.input_value(t=float(t)), mesh=mesh
                 )
-
             elif up_to_ufl_expr:
                 self.fenics_object = as_mapped_function(
                     value=self.input_value,
                     function_space=function_space,
+                    mesh=mesh,
                     t=t,
                     temperature=temperature,
                     species_dependent_value=self.species_dependent_value,
@@ -346,6 +380,12 @@ class Value:
                 )
 
             else:
+                if mesh is not function_space.mesh:
+                    raise ValueError(
+                        "a value interpolated into `function_space` must be built on "
+                        "that space's mesh; `mesh` may only differ from "
+                        "`function_space.mesh` with `up_to_ufl_expr=True`."
+                    )
                 self.fenics_interpolation_expression, self.fenics_object = (
                     as_fenics_interp_expr_and_function(
                         value=self.input_value,

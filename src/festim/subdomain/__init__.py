@@ -4,7 +4,6 @@ from .volume_subdomain import (
     VolumeSubdomain,
     VolumeSubdomain1D,
     map_manifold_to_volume_subdomains,
-    map_nested_to_manifold_subdomains,
     map_surface_to_volume_subdomains,
 )
 
@@ -17,6 +16,5 @@ __all__ = [
     "VolumeSubdomain1D",
     "compute_ordered_interior_facet_data",
     "map_manifold_to_volume_subdomains",
-    "map_nested_to_manifold_subdomains",
     "map_surface_to_volume_subdomains",
 ]
