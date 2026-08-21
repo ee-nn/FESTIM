@@ -46,7 +46,7 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import ufl
-from dolfinx.io import gmsh as gmshio
+from dolfinx.io import gmshio
 
 import festim as F
 
@@ -61,16 +61,35 @@ DELTA = 1e-3  # grain-boundary width
 K_EX = 1.0  # bulk <-> grain-boundary exchange (see the Fisher example on units)
 C0 = 1.0  # surface concentration
 
-RCL = 1.2  # element size in the grain interiors, relative to average cell size
-RCL_FACE = 0.15  # element size on the grain boundaries
-RCL_EDGE = 0.08  # element size on the triple lines
+RCL = 0.8  # element size in the grain interiors, relative to average cell size
+RCL_FACE = 0.2  # element size on the grain boundaries
+RCL_EDGE = None  # element size on the triple lines; None = same as the faces
 PL = 2.5  # progression factor: max length ratio between adjacent 1D elements
-MESH_QUAL_MIN = None  # -meshqualmin, default 0.9; lower is faster to mesh
+
+# -rsel, the small-edge length used by regularization. Neper's default is 1,
+# picked to suit the *default* -rcl; the docs say it should track whatever -rcl
+# you actually use. Leaving it low relative to RCL lets short edges and slivers
+# survive into the mesh, where they force 2D-mesh pinch fixing and degenerate
+# faces -- a large part of what makes -M slow. It costs nothing: it happens
+# during -T.
+REG_RSEL = RCL
+
+# Meshing effort. Multimeshing retries each face and polyhedron with several
+# algorithms until MESH_QUAL_MIN is reached, so quality target and meshing time
+# trade off directly against each other; 0.9 is Neper's default and 0.7 is a
+# reasonable setting while iterating on element sizes. MESH_MAX_TIME caps the
+# per-entity budget: the default is 1000 s, long enough for one pathological
+# cell to stall a run without saying so.
+MESH_QUAL_MIN = 0.7
+MESH_MAX_TIME = None  # seconds per face/polyhedron; try 30 when diagnosing
 T_END, DT = 3.0, 0.05
 
-# The mesh cost is dominated by RCL, not RCL_FACE: the faces are 2D and the
-# interiors are 3D, so an interior element size half as large costs eight times
-# as much. Neper meshes each face at RCL_FACE and then fills each polyhedron
+# Two competing costs. The element *count* is dominated by RCL, since the faces
+# are 2D and the interiors 3D. But the meshing *time* is driven by the ratio
+# RCL/RCL_FACE: a steep size jump means Netgen grades hard, fails the quality
+# target more often, and multimeshing retries. Pushing RCL up without moving
+# RCL_FACE therefore buys a smaller mesh that takes longer to build. Neper meshes
+# each face at RCL_FACE and then fills each polyhedron
 # from that boundary mesh at RCL, grading between the two, so refinement near
 # the boundaries is preserved however coarse the interior gets. With D_B and
 # T_END as set here, lattice diffusion reaches only ~2*sqrt(D_B*T_END), so
@@ -171,8 +190,11 @@ EDGE_KEYS = ("domtype", "facenb", "length")
 VER_KEYS = ("domtype", "edgenb")
 
 
-def run_interruptible(cmd):
+def run_interruptible(cmd, cwd=None):
     """Run a Neper command, surviving a Ctrl+C long enough for it to finish.
+
+    ``cwd`` is used to keep every path Neper sees short and relative -- see the
+    note in :func:`run_neper` about whitespace in directory names.
 
     Neper treats SIGINT as "stop optimizing, keep the current solution and
     write the output". But Ctrl+C goes to the whole foreground process group,
@@ -181,7 +203,7 @@ def run_interruptible(cmd):
     files, or none. Catching it here and waiting lets Neper land its output;
     a second Ctrl+C still gets you out.
     """
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, cwd=cwd)
     try:
         code = proc.wait()
     except KeyboardInterrupt:
@@ -227,6 +249,12 @@ def run_neper(
             "conda-forge package that provides the command is `gmsh` "
             "(`python-gmsh` is only the bindings). Set GMSH_BIN to its path."
         )
+    if any(c.isspace() for c in str(GMSH_BIN)):
+        raise ValueError(
+            f"the gmsh path {str(GMSH_BIN)!r} contains whitespace. Neper "
+            "re-tokenizes its arguments, so a path with a space in it is torn "
+            "into fragments. Move or symlink the binary somewhere without one."
+        )
 
     if REGULARIZE and PERIODICITY:
         raise ValueError(
@@ -251,6 +279,8 @@ def run_neper(
         tess += ["-morphooptistop", MORPHO_STOP]
     if REGULARIZE:
         tess += ["-reg", "1"]
+        if REG_RSEL is not None:
+            tess += ["-rsel", str(REG_RSEL)]
     if PERIODICITY:
         tess += ["-periodicity", PERIODICITY]
     tess += [
@@ -261,20 +291,37 @@ def run_neper(
         "-statver",
         ",".join(VER_KEYS),
         "-o",
-        str(base),
+        stem,
     ]
     # -T can be the expensive half when the morphology needs optimization, and
     # it is a pure function of (n, seed, morpho), so cache it on its own rather
     # than only on the final mesh: a failure in -M should not cost it again.
+    # Neper re-parses its input-file argument -- it is a structured field
+    # supporting comma-separated files and colon-separated transformations --
+    # and splits it on whitespace, so an absolute path through a directory like
+    # "mwes + examples" arrives as several unusable fragments. Running with cwd
+    # set to the output directory and passing bare names sidesteps it entirely,
+    # and keeps the command lines readable in the log.
+    wd = str(base.parent)
+    # Gmsh scratch: Neper writes one .geo per tessellation face and polyhedron,
+    # meshes it, reads the .msh back and deletes the pair. The default location
+    # is the working directory, so a run that aborts before cleanup leaves
+    # dozens of tmp*.geo / tmp*.msh files sitting among the real outputs.
+    # Giving them their own directory keeps results/ readable and makes the
+    # leftovers safe to delete wholesale -- though they are worth inspecting
+    # first if it was -M itself that failed, since running gmsh on the
+    # offending .geo by hand is the usual way to find out why.
+    tmp = base.parent / "tmp"
+    tmp.mkdir(exist_ok=True)
     if not base.with_suffix(".tess").exists() or force:
-        run_interruptible(tess)
+        run_interruptible(tess, cwd=wd)
     else:
         print(f"  reusing {base.name}.tess")
     run_interruptible(
         [
             NEPER_BIN,
             "-M",
-            str(base) + ".tess",
+            stem + ".tess",
             "-gmsh",
             GMSH_BIN,  # do not rely on whichever PATH is active
             "-order",
@@ -285,17 +332,35 @@ def run_neper(
             str(rcl),
             "-rclface",
             str(rclface),
-            "-rcledge",
-            str(RCL_EDGE),
+            *(["-rcledge", str(RCL_EDGE)] if RCL_EDGE is not None else []),
             "-pl",
             str(PL),
             *(["-meshqualmin", str(MESH_QUAL_MIN)] if MESH_QUAL_MIN else []),
+            *(
+                [
+                    "-mesh2dmaxtime",
+                    str(MESH_MAX_TIME),
+                    "-mesh3dmaxtime",
+                    str(MESH_MAX_TIME),
+                ]
+                if MESH_MAX_TIME
+                else []
+            ),
+            "-tmp",
+            "tmp",  # relative to cwd, so no whitespace reaches neper
             "-format",
             "msh4",
             "-o",
-            str(base),
-        ]
+            stem,
+        ],
+        cwd=wd,
     )
+    leftovers = list(tmp.glob("*"))
+    if leftovers:
+        # -M succeeded, so anything still here is from an earlier failed run
+        for f in leftovers:
+            f.unlink()
+        print(f"  cleared {len(leftovers)} stale gmsh scratch files")
     return base
 
 
