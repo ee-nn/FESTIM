@@ -46,7 +46,7 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import ufl
-from dolfinx.io import gmshio
+from dolfinx.io import gmsh as gmshio
 
 import festim as F
 

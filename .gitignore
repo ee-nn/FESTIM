@@ -116,6 +116,8 @@ venv.bak/
 *.zip
 *.png
 *.mp4
+*.msh
+*.geo
 
 # Docs files
 docs/source/_build/
