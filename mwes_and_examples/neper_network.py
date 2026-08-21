@@ -61,15 +61,35 @@ DELTA = 1e-3  # grain-boundary width
 K_EX = 1.0  # bulk <-> grain-boundary exchange (see the Fisher example on units)
 C0 = 1.0  # surface concentration
 
-RCL = 0.4  # element size in the grains, relative to the average cell size
+RCL = 1.2  # element size in the grain interiors, relative to average cell size
 RCL_FACE = 0.15  # element size on the grain boundaries
+RCL_EDGE = 0.08  # element size on the triple lines
+PL = 2.5  # progression factor: max length ratio between adjacent 1D elements
+MESH_QUAL_MIN = None  # -meshqualmin, default 0.9; lower is faster to mesh
 T_END, DT = 3.0, 0.05
+
+# The mesh cost is dominated by RCL, not RCL_FACE: the faces are 2D and the
+# interiors are 3D, so an interior element size half as large costs eight times
+# as much. Neper meshes each face at RCL_FACE and then fills each polyhedron
+# from that boundary mesh at RCL, grading between the two, so refinement near
+# the boundaries is preserved however coarse the interior gets. With D_B and
+# T_END as set here, lattice diffusion reaches only ~2*sqrt(D_B*T_END), so
+# resolving deep grain interiors finely buys nothing -- the gradients are all
+# within a fraction of a grain of the network.
 
 THETA_MIN = 0.0  # keep only boundaries above this disorientation (degrees)
 THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 
 STEM = "poly"
-WORKDIR = "."
+# Anchored to this file rather than the process working directory, so the
+# outputs land next to the script no matter where it was launched from.
+# Path(".") would resolve against the CWD, which an IDE or notebook may set
+# somewhere unexpected.
+try:
+    _HERE = Path(__file__).resolve().parent
+except NameError:  # interactive session: no __file__
+    _HERE = Path.cwd()
+WORKDIR = _HERE / "results"
 
 # Neper is a command-line program, so it does not have to live in the same
 # conda environment as FESTIM -- it only has to be a path. Keeping it in its
@@ -151,6 +171,33 @@ EDGE_KEYS = ("domtype", "facenb", "length")
 VER_KEYS = ("domtype", "edgenb")
 
 
+def run_interruptible(cmd):
+    """Run a Neper command, surviving a Ctrl+C long enough for it to finish.
+
+    Neper treats SIGINT as "stop optimizing, keep the current solution and
+    write the output". But Ctrl+C goes to the whole foreground process group,
+    so the Python parent gets it too -- and if the parent exits immediately,
+    the child is killed part-way through writing and you are left with partial
+    files, or none. Catching it here and waiting lets Neper land its output;
+    a second Ctrl+C still gets you out.
+    """
+    proc = subprocess.Popen(cmd)
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        print(
+            "\ninterrupted: waiting for neper to write its output "
+            "(Ctrl+C again to abandon it)"
+        )
+        try:
+            code = proc.wait()
+        except KeyboardInterrupt:
+            proc.kill()
+            raise
+    if code != 0:
+        raise subprocess.CalledProcessError(code, cmd)
+
+
 def run_neper(
     n=N_CELLS,
     seed=SEED,
@@ -161,9 +208,11 @@ def run_neper(
     force=False,
 ):
     """Generate and mesh a polycrystal. Returns the base path (no extension)."""
-    base = Path(workdir) / stem
+    base = (Path(workdir) / stem).resolve()
     base.parent.mkdir(parents=True, exist_ok=True)
+    print(f"neper outputs -> {base.parent}")
     if base.with_suffix(".msh4").exists() and not force:
+        print(f"  reusing {base.name}.msh4")
         return base
 
     if shutil.which(NEPER_BIN) is None and not Path(NEPER_BIN).is_file():
@@ -218,8 +267,10 @@ def run_neper(
     # it is a pure function of (n, seed, morpho), so cache it on its own rather
     # than only on the final mesh: a failure in -M should not cost it again.
     if not base.with_suffix(".tess").exists() or force:
-        subprocess.run(tess, check=True)
-    subprocess.run(
+        run_interruptible(tess)
+    else:
+        print(f"  reusing {base.name}.tess")
+    run_interruptible(
         [
             NEPER_BIN,
             "-M",
@@ -234,12 +285,16 @@ def run_neper(
             str(rcl),
             "-rclface",
             str(rclface),
+            "-rcledge",
+            str(RCL_EDGE),
+            "-pl",
+            str(PL),
+            *(["-meshqualmin", str(MESH_QUAL_MIN)] if MESH_QUAL_MIN else []),
             "-format",
             "msh4",
             "-o",
             str(base),
-        ],
-        check=True,
+        ]
     )
     return base
 
@@ -506,8 +561,12 @@ def solve(d_gb):
             stepsize=F.Stepsize(initial_value=DT),
         ),
         exports=[
-            F.VTXSpeciesExport("neper_grains.bp", field=c_b, subdomain=grains),
-            F.VTXSpeciesExport("neper_network.bp", field=c_gb, subdomain=network),
+            F.VTXSpeciesExport(
+                str(base.parent / "neper_grains.bp"), field=c_b, subdomain=grains
+            ),
+            F.VTXSpeciesExport(
+                str(base.parent / "neper_network.bp"), field=c_gb, subdomain=network
+            ),
         ]
         if fast
         else [],
