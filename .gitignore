@@ -118,6 +118,10 @@ venv.bak/
 *.mp4
 *.msh
 *.geo
+*.stedge
+*.stface
+*.stver
+*.tess
 
 # Docs files
 docs/source/_build/

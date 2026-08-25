@@ -31,9 +31,6 @@ Three things the scipy construction could not give at all:
   actually decides whether a boundary is a fast path;
 * exact topology of the triple lines and quadruple points, instead of the
   Counter/union-find reconstruction from rounded vertex coordinates.
-
-UNTESTED: written from the Neper 5.0 documentation and the FESTIM codim branch
-(PR #1216), not run. The places most likely to need adjusting are marked CHECK.
 """
 
 import os
@@ -477,11 +474,6 @@ def read_mesh(base, comm=MPI.COMM_WORLD, rank=0):
     tessellation face id, because Neper writes every tessellation entity as an
     element set and the 2D physical ids run 1..facenb independently of the 3D
     ones.
-
-    CHECK: that gmsh's reader picks the physical groups out of Neper's msh4
-    writer. If ``facet_tags`` comes back empty, go through meshio to XDMF, or
-    parse the native .msh (its format is documented) and rebuild the tags with
-    ``gmshio.distribute_entity_data`` so they survive repartitioning.
     """
     result = gmshio.read_from_msh(str(base) + ".msh4", comm, rank, gdim=3)
     if hasattr(result, "mesh"):
@@ -491,7 +483,7 @@ def read_mesh(base, comm=MPI.COMM_WORLD, rank=0):
     if facet_tags is None or facet_tags.values.size == 0:
         raise RuntimeError(
             "no facet tags were read: the 2D element sets did not survive the "
-            "msh4 round trip (see the CHECK note above)"
+            "msh4 round trip"
         )
     return mesh, cell_tags, facet_tags
 
@@ -527,11 +519,6 @@ def gb_diffusivity_field(network, micro, d_low, d_high, theta_c=15.0):
     on the *one* submesh: splitting the network into a high-angle and a
     low-angle subdomain would give two disconnected submeshes and put the
     junction conditions straight back.
-
-    CHECK: whether ``F.Material`` on the codim branch accepts a ready-made
-    fenics function for ``D_0``. If it only takes a float or a callable of
-    ``(x, t)``, this field still works as a plain coefficient but has to be
-    threaded into the form by hand.
     """
     submesh = network.submesh
     parent = None
