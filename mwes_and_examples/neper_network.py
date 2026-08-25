@@ -344,7 +344,7 @@ def run_neper(
                 else []
             ),
             "-tmp",
-            "tmp",  # relative to cwd, so no whitespace reaches neper
+            os.path.abspath(os.path.join(wd, "tmp")),
             "-format",
             "msh4",
             "-o",
