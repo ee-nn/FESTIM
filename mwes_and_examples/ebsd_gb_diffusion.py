@@ -157,6 +157,15 @@ NEPER_ENV = "/home/fenna/anaconda3/envs/neper-env/bin"
 NEPER_BIN = os.path.join(NEPER_ENV, "neper")
 GMSH_BIN = os.path.join(NEPER_ENV, "gmsh")
 
+# neper -V renders PNGs through a separate `povray` process that it looks up on
+# PATH unless told otherwise (-povray <binary>, default `povray`), which is why
+# the check images only appeared with neper-env active. Resolve it like gmsh;
+# the shell script also prepends NEPER_ENV to PATH for anything else Neper
+# spawns. If POV-Ray is not in NEPER_ENV, fall back to whatever PATH has.
+POVRAY_BIN = os.path.join(NEPER_ENV, "povray")
+if not Path(POVRAY_BIN).is_file():
+    POVRAY_BIN = "povray"
+
 # ctf_to_tesr.py, next to this file, owns the cubic disorientation function
 # used to segment the map; theta is computed with the same function so a
 # boundary's theta here means the same thing as the threshold that created it.
@@ -234,11 +243,17 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             )
 
     env = dict(os.environ)
+    # the equivalent of activating neper-env for the child processes only:
+    # neper, gmsh and povray are passed as explicit paths, and PATH is
+    # prepended so that helper programs Neper spawns by name resolve there too
+    env["PATH"] = NEPER_ENV + os.pathsep + env.get("PATH", "")
     env.update(
         {
             "TESR": str(tesr_path),
             "NEPER_BIN": NEPER_BIN,
             "GMSH_BIN": GMSH_BIN,
+            "POVRAY_BIN": POVRAY_BIN,
+            "NEPER_ENV": NEPER_ENV,
             "STEM": stem,
             "WORKDIR": str(base.parent),
             "FORCE": "1" if force else "0",

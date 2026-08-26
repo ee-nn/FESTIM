@@ -46,6 +46,15 @@ set -euo pipefail
 : "${TESR:?set TESR to the EBSD raster tessellation (.tesr)}"
 : "${NEPER_BIN:=neper}"
 : "${GMSH_BIN:=gmsh}"
+: "${POVRAY_BIN:=povray}"            # neper -V renders through this
+: "${NEPER_ENV:=}"                   # bin dir of the neper environment, if any
+# Make the neper environment's helper programs visible without activating it:
+# neper -V spawns `povray` (and -M spawns gmsh) by name unless given a path.
+# The caller's python3 is remembered first, as a last resort for the overlay.
+CALLER_PYTHON=$(command -v python3 || true)
+if [ -n "$NEPER_ENV" ]; then
+    export PATH="$NEPER_ENV:$PATH"
+fi
 : "${STEM:=poly}"
 : "${WORKDIR:=.}"
 : "${FORCE:=0}"
@@ -60,9 +69,16 @@ set -euo pipefail
 
 # check images (neper -V needs POV-Ray, mesh_overlay.py needs matplotlib; a
 # failure here is reported, not fatal). PYTHON_BIN is whichever interpreter
-# has numpy and matplotlib; the driver passes its own.
+# has numpy and matplotlib; the driver passes its own, and if that one lacks
+# matplotlib the neper environment's python is tried before giving up.
 : "${CHECK_IMAGES:=1}"
 : "${PYTHON_BIN:=python3}"
+for candidate in "$PYTHON_BIN" ${NEPER_ENV:+"$NEPER_ENV/python"} ${CALLER_PYTHON:+"$CALLER_PYTHON"}; do
+    if "$candidate" -c "import matplotlib" 2>/dev/null; then
+        PYTHON_BIN="$candidate"
+        break
+    fi
+done
 
 # interface smoothing before meshing (Neper's defaults). The reconstructed
 # boundaries are pixel staircases; Laplacian smoothing rounds them off.
@@ -160,18 +176,18 @@ echo "  grains: $NCELL"
 # 0b. Check images. Look at these before trusting anything downstream: an
 #     inverted orientation convention shows up as IPF colours that disagree
 #     with AZtec/MTEX, and a bad segmentation shows up as speckle or as grains
-#     that are obviously back-filled. neper -V renders through POV-Ray, which
-#     the conda neper package does not pull in, so a missing renderer only
-#     costs the pictures.
+#     that are obviously back-filled. neper -V renders through POV-Ray
+#     (POVRAY_BIN, else `povray` on PATH); the conda neper package does not
+#     pull it in, so a missing renderer only costs the pictures.
 # -----------------------------------------------------------------------------
 if [ "$CHECK_IMAGES" = "1" ]; then
     if need "check-ori.png"; then
-        "$NEPER_BIN" -V "${STEM}-raw.tesr" -datavoxcol ori -datavoxcolscheme ipf \
-            -print check-ori \
+        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" \
+            -datavoxcol ori -datavoxcolscheme ipf -print check-ori \
             || echo "  WARNING: neper -V failed for check-ori (POV-Ray missing?)" >&2
     fi
     if need "check-grains.png"; then
-        "$NEPER_BIN" -V "${STEM}-raw.tesr" -print check-grains \
+        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" -print check-grains \
             || echo "  WARNING: neper -V failed for check-grains (POV-Ray missing?)" >&2
     fi
 fi
