@@ -29,8 +29,9 @@
 #   ${STEM}.msh4          Gmsh v4 mesh, linear triangles, all dimensions
 #   ${STEM}.sttesr        raster geometry, used to derive the domain size
 #   ${STEM}-grainori.txt  one orientation per grain, as read out of the tesr
-#   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
-#   check-grains.png      raster coloured by cell id
+#   check-ori.png         raster coloured by per-voxel orientation (IPF-z),
+#                         border trimmed, scale bar added (micrograph.py)
+#   check-grains.png      raster coloured by cell id, likewise
 #   check-mesh.png        raster cells with every reconstructed boundary edge
 #                         of the mesh drawn on top (mesh_overlay.py)
 #
@@ -73,6 +74,7 @@ fi
 # matplotlib the neper environment's python is tried before giving up.
 : "${CHECK_IMAGES:=1}"
 : "${PYTHON_BIN:=python3}"
+: "${UNIT_NAME:=um}"                 # length unit of the raster, for scale bars
 for candidate in "$PYTHON_BIN" ${NEPER_ENV:+"$NEPER_ENV/python"} ${CALLER_PYTHON:+"$CALLER_PYTHON"}; do
     if "$candidate" -c "import matplotlib" 2>/dev/null; then
         PYTHON_BIN="$candidate"
@@ -181,15 +183,24 @@ echo "  grains: $NCELL"
 #     pull it in, so a missing renderer only costs the pictures.
 # -----------------------------------------------------------------------------
 if [ "$CHECK_IMAGES" = "1" ]; then
-    if need "check-ori.png"; then
-        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" \
-            -datavoxcol ori -datavoxcolscheme ipf -print check-ori \
-            || echo "  WARNING: neper -V failed for check-ori (POV-Ray missing?)" >&2
-    fi
-    if need "check-grains.png"; then
-        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" -print check-grains \
-            || echo "  WARNING: neper -V failed for check-grains (POV-Ray missing?)" >&2
-    fi
+    for img in check-ori check-grains; do
+        need "$img.png" || continue
+        if [ "$img" = check-ori ]; then
+            opts="-datavoxcol ori -datavoxcolscheme ipf"
+        else
+            opts=""
+        fi
+        # shellcheck disable=SC2086
+        if "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img"; then
+            # neper -V frames the flat map in the middle of a 3D canvas; cut the
+            # border away and add a scale bar (the trimmed width is LX)
+            "$PYTHON_BIN" "$(dirname "$0")/micrograph.py" "$img.png" \
+                --trim --width "$LX" --unit "$UNIT_NAME" \
+                || echo "  WARNING: $img.png left untrimmed (Pillow/matplotlib missing?)" >&2
+        else
+            echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
+        fi
+    done
 fi
 
 # -----------------------------------------------------------------------------
@@ -227,7 +238,7 @@ fi
 # -----------------------------------------------------------------------------
 if [ "$CHECK_IMAGES" = "1" ] && need "check-mesh.png"; then
     "$PYTHON_BIN" "$(dirname "$0")/mesh_overlay.py" \
-        "${STEM}-raw.tesr" "${STEM}.msh4" -o check-mesh.png \
+        "${STEM}-raw.tesr" "${STEM}.msh4" -o check-mesh.png --unit "$UNIT_NAME" \
         || echo "  WARNING: check-mesh.png not written (matplotlib missing?)" >&2
 fi
 

@@ -113,6 +113,7 @@ def main(argv=None):
     p.add_argument("msh4")
     p.add_argument("-o", "--output", default="check-mesh.png")
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--unit", default="um", help="raster length unit, for the scale bar")
     args = p.parse_args(argv)
 
     import matplotlib
@@ -146,8 +147,11 @@ def main(argv=None):
         f"{len(sides)} edges ({sum(len(s) == 2 for s in sides.values())} interior), "
         f"{n_int + n_surf} segments over {int(cells.max())} raster cells"
     )
-    ax.set_xlabel("x (tesr units)")
-    ax.set_ylabel("y (tesr units)")
+    ax.set_xlabel(f"x ({args.unit})")
+    ax.set_ylabel(f"y ({args.unit})")
+    from micrograph import scale_bar_ax
+
+    scale_bar_ax(ax, nx * vox[0], args.unit)
     fig.tight_layout()
     fig.savefig(args.output, dpi=args.dpi)
     print(f"wrote {args.output}")

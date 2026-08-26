@@ -86,6 +86,7 @@ TESR_SMOOTH_ITER = 5
 # O(1e-6). The mesh is converted here, once, right after it is read, so the
 # transport parameters below and everything derived from the mesh stay in SI.
 TESR_UNIT = 1e-6
+UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr units")
 
 # Check images. The shell script writes check-ori/check-grains (neper -V) and
 # check-mesh (every reconstructed edge over the raster); with CHECK_PNG the
@@ -265,6 +266,7 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
             "CHECK_IMAGES": "1" if CHECK_PNG else "0",
             "PYTHON_BIN": sys.executable,
+            "UNIT_NAME": UNIT_NAME,
         }
     )
     if TESR_TRANSFORM:
@@ -606,6 +608,7 @@ def write_network_png(base, mesh, micro, tesr_path):
         import matplotlib.pyplot as plt
         from matplotlib.collections import LineCollection
         from mesh_overlay import draw_raster, read_tesr
+        from micrograph import scale_bar_ax
     except ImportError as exc:
         print(f"  check-network.png skipped ({exc})")
         return
@@ -638,8 +641,9 @@ def write_network_png(base, mesh, micro, tesr_path):
         f"network used by FESTIM: {n_kept} of {n_int} boundaries above "
         f"{THETA_MIN:g} deg\n(dashed white = dropped, grey = specimen surface)"
     )
-    ax.set_xlabel("x (tesr units)")
-    ax.set_ylabel("y (tesr units)")
+    ax.set_xlabel(f"x ({UNIT_NAME})")
+    ax.set_ylabel(f"y ({UNIT_NAME})")
+    scale_bar_ax(ax, nx * vox[0], UNIT_NAME)
     fig.tight_layout()
     out = base.parent / "check-network.png"
     fig.savefig(out, dpi=150)

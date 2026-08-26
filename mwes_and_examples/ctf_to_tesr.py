@@ -49,8 +49,7 @@ crystal one. The file is written as tesr format 2.2: Neper 4.10.0 swapped the
 meaning of `active` and `passive` and bumped the tesr version to 2.2, and a
 file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
 (neut_tesr_fscanf2.c, "Fixing orientation convention") while `**oridata` is
-taken literally, leaving the two sections in opposite conventions. The conversion
-is verified against Neper's own convention table,
+taken literally, leaving the two sections in opposite conventions. The conversion is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
 (0.965925826, 0.258819045, 0, 0); see the self-test at the bottom, which runs
 on every invocation.
@@ -183,6 +182,23 @@ def euler_bunge_to_quat(phi1, Phi, phi2, degrees=True):
     return np.where(q[..., :1] < 0, -q, q)
 
 
+def crystal_equivalents(q, sym):
+    """All symmetry-equivalent descriptions of the orientations q, (n, 24, 4).
+
+    The crystal symmetry multiplies on the *right* in this quaternion
+    convention: q maps sample to crystal (Bunge, passive), so a symmetry
+    operator S, which relabels crystal axes, composes as q * S. Multiplying on
+    the left, S * q, would instead rotate the sample frame and yield a
+    physically different orientation. Checked against Neper: for a cell pair
+    (q, q*S) `-statedge theta` under -crysym cubic is 0; for (q, S*q) it is
+    17 degrees. The same fact is what makes `qconj(a) * b` in
+    segment_grains the right misorientation product: symmetry-equivalents of
+    a and b move to the outside of it, (a S2)^-1 (b S1) = S2^-1 (a^-1 b) S1,
+    which is where cubic_disorientation_angle minimises over them.
+    """
+    return qmul(q[:, None, :], sym[None, :, :])
+
+
 def to_fundamental_zone(q, sym, chunk=50_000):
     """Pick, for each orientation, the symmetry equivalent closest to identity.
 
@@ -194,7 +210,7 @@ def to_fundamental_zone(q, sym, chunk=50_000):
     out = np.empty_like(q)
     for lo in range(0, len(q), chunk):
         blk = q[lo : lo + chunk]
-        cand = qmul(sym[None, :, :], blk[:, None, :])  # (n, 24, 4)
+        cand = crystal_equivalents(blk, sym)  # (n, 24, 4)
         best = np.argmax(np.abs(cand[..., 0]), axis=1)
         picked = cand[np.arange(len(blk)), best]
         out[lo : lo + chunk] = np.where(picked[..., :1] < 0, -picked, picked)
@@ -507,7 +523,7 @@ def grain_mean_orientations(qgrid, cellids, ncells, sym, chunk=50_000):
         acc = np.zeros(4)
         for lo in range(0, len(qs), chunk):
             blk = qs[lo : lo + chunk]
-            cand = qmul(sym[None, :, :], blk[:, None, :])
+            cand = crystal_equivalents(blk, sym)
             dots = cand @ ref
             best = np.argmax(np.abs(dots), axis=1)
             picked = cand[np.arange(len(blk)), best]
@@ -571,7 +587,206 @@ def write_tesr(path, cellids, ori_cell, ori_vox, oridef, voxsize, crysym, precis
 
 
 # --- diagnostics -------------------------------------------------------------
-def write_quality_png(path, diag, ok, unassigned, cellids, args, flip_y=False):
+def _scale_bar(ax, width, unit):
+    """Scale bar from micrograph.py if it sits next to this script; else none."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from micrograph import scale_bar_ax
+    except ImportError:
+        return
+    scale_bar_ax(ax, width, unit)
+
+
+def ipf_z_colours(q):
+    """Simplified IPF-Z colouring of quaternions (n, 4), cubic symmetry.
+
+    The crystal-frame direction of the sample z axis is taken to the standard
+    triangle by |components| sorted so that k <= h <= l, and coloured
+    (l - h, h - k, k) normalised to unit maximum: [001] red, [101] green,
+    [111] blue, as in the usual IPF key. It is a simplified scheme -- AZtec and
+    neper -V use their own angle-based interpolations, so shades differ from
+    check-ori.png -- but the raw and read-back panels use the *same* scheme,
+    which is what makes them comparable.
+    """
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    # third column of the rotation matrix = image of e_z
+    d = np.stack((2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)), 1)
+    d = np.sort(np.abs(d), axis=1)  # k <= h <= l
+    k, h, l = d[:, 0], d[:, 1], d[:, 2]
+    rgb = np.stack((l - h, h - k, k), 1)
+    rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1e-12)
+    return rgb
+
+
+def read_tesr_back(path):
+    """Minimal reader for what this script writes: header, **data, **oridata, **oridef."""
+    with open(path) as fh:
+        tok = fh.read().split()
+    i = tok.index("**general")
+    nx, ny = int(tok[i + 2]), int(tok[i + 3])
+    vox = (float(tok[i + 4]), float(tok[i + 5]))
+    n = nx * ny
+    out = {"nx": nx, "ny": ny, "vox": vox}
+    i = tok.index("**data")
+    out["cells"] = np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx)
+    if "**oridata" in tok:
+        i = tok.index("**oridata")
+        out["orides"] = tok[i + 1]
+        r = np.array(tok[i + 3 : i + 3 + 3 * n], dtype=float).reshape(n, 3)
+        qq = np.column_stack((np.ones(n), r))
+        out["quat"] = (qq / np.linalg.norm(qq, axis=1)[:, None]).reshape(ny, nx, 4)
+        i = tok.index("**oridef")
+        out["oridef"] = (
+            np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx).astype(bool)
+        )
+    return out
+
+
+def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
+    """Re-read the written tesr and compare with what was meant to be written.
+
+    Three checks: the cell map is identical, `**oridef` is the quality mask,
+    and every voxel orientation read back is the same rotation as the raw
+    Euler triple (disorientation under cubic symmetry ~ 0; the file holds a
+    symmetry-equivalent, fundamental-zone representative, so identity is only
+    expected up to the symmetry group, which is what the disorientation
+    measures).
+    """
+    back = read_tesr_back(path)
+    exp_cells = cellids[::-1] if flip_y else cellids
+    exp_ok = ok[::-1] if flip_y else ok
+    exp_q = qgrid[::-1] if flip_y else qgrid
+    report = []
+    same_cells = np.array_equal(back["cells"], exp_cells)
+    report.append(
+        f"read-back: cell ids {'identical' if same_cells else 'DIFFER'} "
+        f"({back['nx']} x {back['ny']} voxels)"
+    )
+    result = {"cells_ok": same_cells, "dis": None, "oridef_ok": None}
+    if "quat" in back:
+        same_def = np.array_equal(back["oridef"], exp_ok)
+        result["oridef_ok"] = same_def
+        report.append(
+            f"read-back: **oridef {'identical' if same_def else 'DIFFERS'} to the quality mask"
+        )
+        dis = cubic_disorientation_angle(
+            qmul(qconj(exp_q.reshape(-1, 4)), back["quat"].reshape(-1, 4))
+        ).reshape(exp_q.shape[:2])
+        result["dis"] = dis[::-1] if flip_y else dis
+        report.append(
+            f"read-back: voxel orientations vs raw Euler angles: max "
+            f"{dis.max():.2e} deg, mean {dis.mean():.2e} deg over {dis.size} voxels"
+            + ("" if dis.max() < 1e-3 else "  <-- NOT a round trip")
+        )
+    result["report"] = report
+    return result
+
+
+def write_raw_png(
+    path, qgrid_full, ok_full, window, qgrid, ok, check, ctf, args, vox, unit
+):
+    """<output>-raw.png: the .ctf as read, the window as written, and their difference.
+
+    (a) the whole map, IPF-Z from the raw Euler angles, with the crop window
+    drawn; (b) the window from the raw Euler angles; (c) the window as read
+    back from the .tesr just written, same colouring, `**oridef` = 0 in grey;
+    (d) the per-voxel disorientation between (b) and (c), which is the
+    quantitative statement that nothing was lost or altered in the reading
+    and writing -- it should be ~1e-12 degrees everywhere.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        return
+
+    NY, NX = ok_full.shape
+    ny, nx = ok.shape
+    xs, ys = ctf.header["XStep"] * args.scale, ctf.header["YStep"] * args.scale
+
+    full_rgb = ipf_z_colours(qgrid_full.reshape(-1, 4)).reshape(NY, NX, 3)
+    full_rgb[~ok_full] = 0.6
+    win_rgb = ipf_z_colours(qgrid.reshape(-1, 4)).reshape(ny, nx, 3)
+    win_rgb[~ok] = 0.6
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 5.5 + 5.5 * ny / nx))
+    kw_full = dict(
+        interpolation="nearest", origin="lower", extent=(0, NX * xs, 0, NY * ys)
+    )
+    kw = dict(
+        interpolation="nearest", origin="lower", extent=(0, nx * vox[0], 0, ny * vox[1])
+    )
+
+    ax = axes[0, 0]
+    ax.imshow(full_rgb, **kw_full)
+    y0, y1 = window[0].start, window[0].stop
+    x0, x1 = window[1].start, window[1].stop
+    ax.add_patch(
+        Rectangle(
+            (x0 * xs, y0 * ys),
+            (x1 - x0) * xs,
+            (y1 - y0) * ys,
+            fill=False,
+            ec="white",
+            lw=1.5,
+        )
+    )
+    ax.set_title(
+        f"whole .ctf: {NX} x {NY} px, {ctf.npoints} rows read of {NX * NY}\n"
+        f"grey = rejected ({100 * (~ok_full).mean():.1f} %), box = window"
+    )
+    _scale_bar(ax, NX * xs, unit)
+
+    ax = axes[0, 1]
+    ax.imshow(win_rgb, **kw)
+    ax.set_title("window, raw Euler angles (simplified IPF-Z)")
+    _scale_bar(ax, nx * vox[0], unit)
+
+    ax = axes[1, 0]
+    if check["dis"] is not None:
+        back = read_tesr_back(args.output or str(Path(args.ctf).with_suffix(".tesr")))
+        q_back = back["quat"][::-1] if args.flip_y else back["quat"]
+        def_back = back["oridef"][::-1] if args.flip_y else back["oridef"]
+        back_rgb = ipf_z_colours(q_back.reshape(-1, 4)).reshape(ny, nx, 3)
+        back_rgb[~def_back] = 0.6
+        ax.imshow(back_rgb, **kw)
+        ax.set_title(
+            f"window read back from {Path(args.output).name if args.output else 'tesr'} ({back['orides']})"
+        )
+    else:
+        ax.set_title("no **oridata in the tesr (--no-voxel-ori)")
+    _scale_bar(ax, nx * vox[0], unit)
+
+    ax = axes[1, 1]
+    if check["dis"] is not None:
+        # floor the scale at 1e-3 deg so an exact round trip shows as a flat
+        # black panel and any real discrepancy stands out
+        im = ax.imshow(
+            check["dis"], cmap="magma", vmin=0, vmax=max(check["dis"].max(), 1e-3), **kw
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label(
+            "disorientation raw vs read back (deg)"
+        )
+        ax.set_title(
+            f"max {check['dis'].max():.1e} deg: {'round trip exact' if check['dis'].max() < 1e-3 else 'MISMATCH'}"
+        )
+    _scale_bar(ax, nx * vox[0], unit)
+
+    for ax in axes.ravel():
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def write_quality_png(
+    path, diag, ok, unassigned, cellids, args, vox, unit, flip_y=False
+):
     """Four panels tracing every grey pixel of `neper -V ... -datavoxcol ori`.
 
     Neper paints a voxel grey when `**oridef` is 0, and this script writes
@@ -623,7 +838,11 @@ def write_quality_png(path, diag, ok, unassigned, cellids, args, flip_y=False):
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 10 * ny / nx))
-    kw = dict(interpolation="nearest", origin="lower")
+    kw = dict(
+        interpolation="nearest",
+        origin="lower",
+        extent=(0, nx * vox[0], 0, ny * vox[1]),
+    )
 
     ax = axes[0, 0]
     if err is not None:
@@ -681,6 +900,7 @@ def write_quality_png(path, diag, ok, unassigned, cellids, args, flip_y=False):
     for ax in axes.ravel():
         ax.set_xticks([])
         ax.set_yticks([])
+        _scale_bar(ax, nx * vox[0], unit)
     fig.suptitle(
         f"{Path(args.ctf).name}: {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
     )
@@ -720,6 +940,22 @@ def self_test():
 
     # symmetry operators are unit quaternions and closed under multiplication
     assert np.allclose(np.linalg.norm(sym, axis=1), 1.0)
+
+    # The crystal symmetry acts on the right (see crystal_equivalents): every
+    # equivalent must be at zero disorientation from the original, the
+    # fundamental-zone representative must be the same orientation, and the
+    # left-multiplied version must NOT be (it is a sample-frame rotation). A
+    # regression of the S*q bug that used to corrupt **oridata and *ori.
+    qq = euler_bunge_to_quat(np.array([37.0]), np.array([52.0]), np.array([131.0]))
+    equiv = crystal_equivalents(qq, sym)[0]
+    d = cubic_disorientation_angle(qmul(qconj(np.repeat(qq, 24, 0)), equiv))
+    assert d.max() < 1e-4, d.max()
+    assert (
+        cubic_disorientation_angle(qmul(qconj(qq), to_fundamental_zone(qq, sym)))[0]
+        < 1e-4
+    )
+    wrong = qmul(sym[13][None], qq)
+    assert cubic_disorientation_angle(qmul(qconj(qq), wrong))[0] > 10.0
 
 
 def main(argv=None):
@@ -794,10 +1030,13 @@ def main(argv=None):
     p.add_argument(
         "--diagnostics",
         action="store_true",
-        help="also write <output>-quality.png: the .ctf's Error codes and MAD "
-        "over the window, the pixels this script rejected and why (these are "
-        "the grey pixels in neper -V's orientation map, **oridef = 0), and "
-        "the pixels the cell map back-filled. Needs matplotlib",
+        help="also write <output>-quality.png (the .ctf's Error codes and MAD "
+        "over the window, the pixels this script rejected and why -- these are "
+        "the grey pixels in neper -V's orientation map, **oridef = 0 -- and the "
+        "pixels the cell map back-filled) and <output>-raw.png (the whole .ctf "
+        "with the window marked, the window from the raw Euler angles, the "
+        "window read back from the written tesr, and their per-voxel "
+        "disorientation, i.e. proof of a lossless round trip). Needs matplotlib",
     )
     args = p.parse_args(argv)
 
@@ -828,6 +1067,8 @@ def main(argv=None):
     qgrid, ok, diag = build_grid(
         ctf, args.phase, args.max_mad, not args.allow_error, args.min_bands
     )
+    qgrid_full, ok_full = qgrid, ok
+    window = (slice(0, ny), slice(0, nx))
     if args.crop:
         qgrid, ok, window = crop_grid(
             qgrid, ok, args.crop, ctf.header["XStep"], ctf.header["YStep"]
@@ -903,8 +1144,27 @@ def main(argv=None):
     write_tesr(out, cellids, ori_cell, ori_vox, ok, vox, crysym)
 
     if args.diagnostics:
+        unit = "um" if np.isclose(args.scale, 1.0) else f"x{args.scale:g} um"
         png = out.with_name(out.stem + "-quality.png")
-        write_quality_png(png, diag, ok, unassigned, cellids, args, flip_y=args.flip_y)
+        write_quality_png(
+            png, diag, ok, unassigned, cellids, args, vox, unit, flip_y=args.flip_y
+        )
+        check = verify_readback(out, qgrid, ok, cellids, args.flip_y, sym)
+        for line in check["report"]:
+            print(f"  {line}")
+        write_raw_png(
+            out.with_name(out.stem + "-raw.png"),
+            qgrid_full,
+            ok_full,
+            window,
+            qgrid,
+            ok,
+            check,
+            ctf,
+            args,
+            vox,
+            unit,
+        )
 
     lx, ly = nx * vox[0], ny * vox[1]
     mean_px = counts.mean()
