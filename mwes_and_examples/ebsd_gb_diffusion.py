@@ -72,7 +72,7 @@ ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 # avoids its tesr write path, which produces an unreadable file when the input
 # carries **oridata (Neper 5.0.0).
 TESR_TRANSFORM = None
-OBJ_RES = 8  # control points per grain per direction in the fit objective
+OBJ_RES = 16  # control points per grain per direction in the fit objective
 
 # Stopping criterion for the tessellation fit. Neper's tesr objective is
 # `avdiameq * rms(distance)` in the tesr's absolute length unit, so `val` and
@@ -84,6 +84,17 @@ OBJ_RES = 8  # control points per grain per direction in the fit objective
 # which is what the network-through-the-grains picture was. `reps` would be
 # the scale-free alternative if the unit ever changes again.
 MORPHO_STOP = "eps<1e-6||val<1e-12||iter>=20000||time>=3600"
+
+# Optimization algorithms, tried in order. When a loop stalls for
+# -morphooptialgomaxiter iterations (default max(varnb,1000)) Neper retries the
+# same algorithm once, then steps to the next entry, then gives up, keeping the
+# best solution throughout (net_tess_opt_comp2.c). Neper's default is kept: on
+# the D5 map praxis returned an NLopt error ("Failed due to unknown error")
+# after two subplex loops had already plateaued, which changed nothing -- the
+# plateau, not praxis, is what ended the fit. A single-entry list is not
+# recommended: the index used after the last plateau is not bounds-checked.
+# If the fit plateaus early, raise OBJ_RES before touching this.
+MORPHO_ALGO = "subplex,praxis"
 
 # Metres per tesr length unit. ctf_to_tesr.py keeps the .ctf's microns so that
 # Neper's fit tolerances and Gmsh's absolute geometric tolerances are exercised
@@ -259,6 +270,7 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "ORIDES": ORIDES,
             "OBJ_RES": str(OBJ_RES),
             "MORPHO_STOP": MORPHO_STOP,
+            "MORPHO_ALGO": MORPHO_ALGO,
             "RSEL": str(REG_RSEL),
             "RCL": str(RCL),
             "RCL_EDGE": str(RCL_EDGE),
@@ -287,6 +299,23 @@ def domain_extent(base):
     """
     cols = np.loadtxt(str(base) + ".sttesr", ndmin=2)[0]
     return float(cols[1]) * TESR_UNIT, float(cols[2]) * TESR_UNIT
+
+
+def fisher_length(delta, d_gb, d_b, t):
+    """Decay length of the boundary concentration, c_gb ~ exp(-y/L).
+
+    Fisher's quasi-steady model (J. Appl. Phys. 22 (1951) 74): the boundary is
+    in local equilibrium with the adjacent lattice, which drains it at
+    c sqrt(D_b / (pi t)) per unit area on each side, so along the boundary
+    D_gb delta c'' = 2 c sqrt(D_b / (pi t)) and
+
+        L = [ delta D_gb sqrt(pi t) / (2 sqrt(D_b)) ]^(1/2).
+
+    L scales as (delta D_gb)^(1/2) t^(1/4) D_b^(-1/4); shortening the run does
+    not lengthen the tail. Local equilibrium holds whenever K_EX is large
+    against D_b / sqrt(D_b t), which it is by many orders of magnitude here.
+    """
+    return float(np.sqrt(delta * d_gb * np.sqrt(np.pi * t) / (2.0 * np.sqrt(d_b))))
 
 
 class StatFile:
@@ -425,15 +454,25 @@ class Microstructure:
             )
         return ori.shape[0]
 
-    def check_units(self, extent, n_grains, delta, d_b, t_end):
-        """Two ways a physical domain breaks parameters written for a unit square.
+    def check_units(self, extent, n_grains, delta, d_b, d_gb, t_end):
+        """Three ways a physical domain breaks parameters written for a unit square.
 
-        The grain-boundary width has to be small compared with a grain and the
-        diffusion distance small compared with the specimen, and neither is
-        automatic once the domain is 40 microns instead of 1.
+        The grain-boundary width has to be small compared with a grain, the
+        diffusion distance small compared with the specimen, and the boundary
+        tail long compared with a grain -- none of which is automatic once the
+        domain is 160 microns instead of 1.
         """
         lx, ly = extent
         grain_size = np.sqrt(lx * ly / max(n_grains, 1))
+        l_f = fisher_length(delta, d_gb, d_b, t_end)
+        if l_f < grain_size:
+            print(
+                f"  WARNING: Fisher tail length L = {l_f:.3g} is shorter than a "
+                f"grain (~{grain_size:.3g}). Past the first grain the network "
+                "carries nothing, the inventory enhancement will be ~1 and the "
+                "junction-transport numbers below will be solver noise. L grows "
+                "as sqrt(delta D_gb) t^1/4 D_b^-1/4, so raise delta*D_gb"
+            )
         if delta > 0.05 * grain_size:
             print(
                 f"  WARNING: delta = {delta:g} is not small against the grain "
@@ -558,7 +597,7 @@ base = run_ebsd_pipeline()
 micro = Microstructure(base)
 LX, LY = domain_extent(base)
 N_GRAINS = micro.check_orientations(base)
-micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, T_END)
+micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
 mesh, cell_tags, facet_tags = read_mesh(base)
 
 grains = F.VolumeSubdomain(
@@ -654,7 +693,11 @@ model, cb_fast, cgb_fast = solve(D_GB)
 def submesh_length(subdomain):
     """Total length of the network submesh -- the 2D analogue of its area."""
     sub = subdomain.submesh
-    seg = sub.geometry.dofmap.reshape(-1, 2)[: sub.topology.index_map(1).size_local]
+    geom = sub.geometry
+    # dolfinx >= 0.9 exposes one dofmap per coordinate element; the scalar
+    # attribute is deprecated there and absent in later releases
+    dofmap = geom.dofmaps[0] if hasattr(geom, "dofmaps") else geom.dofmap
+    seg = dofmap.reshape(-1, 2)[: sub.topology.index_map(1).size_local]
     x = sub.geometry.x
     local = float(np.sum(np.linalg.norm(x[seg[:, 1]] - x[seg[:, 0]], axis=1)))
     return sub.comm.allreduce(local, op=MPI.SUM)
@@ -761,6 +804,11 @@ print(
 
 beta = DELTA * (D_GB / D_B - 1) / (2 * np.sqrt(D_B * T_END))
 print(f"  type-B parameter beta          : {beta:.0f}  (short circuit needs beta >> 1)")
+l_fisher = fisher_length(DELTA, D_GB, D_B, T_END)
+print(
+    f"  Fisher tail length L           : {l_fisher:.3g}  "
+    f"(grain ~{np.sqrt(LX * LY / N_GRAINS):.3g}; a visible tail needs L >~ grain)"
+)
 
 bulk_y = cb_fast.function_space.tabulate_dof_coordinates()[:, 1]
 c_grain_deep = cb_fast.x.array[bulk_y < junction_only_below].mean()
@@ -770,7 +818,15 @@ print(f"y = {junction_only_below:.4g}, so everything the network holds there has
 print("crossed at least one triple junction.")
 print(f"  max c on the network there     : {c_deep:.4e}")
 print(f"  mean c in the grains there     : {c_grain_deep:.4e}")
-print(f"  ratio                          : x {c_deep / c_grain_deep:.0f}")
+# Both are solver noise around zero whenever the Fisher tail is shorter than
+# the junction-only depth, and noise has a sign; the ratio is then 0/0
+if c_grain_deep > 1e-12 * C0:
+    print(f"  ratio                          : x {c_deep / c_grain_deep:.0f}")
+else:
+    print(
+        "  ratio                          : n/a -- nothing has reached this "
+        "depth on either path (see the Fisher tail length above)"
+    )
 print(
     "\nconnectivity in 2D is not 3D connectivity: percolation thresholds are "
     "far lower in the plane, so read the enhancement as a lower bound unless "

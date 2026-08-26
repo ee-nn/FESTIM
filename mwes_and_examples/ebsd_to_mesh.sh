@@ -57,6 +57,11 @@ set -euo pipefail
 # and Neper returns the initial Laguerre guess after one iteration.
 : "${OBJ_RES:=8}"                     # control points per grain per direction
 : "${MORPHO_STOP:=eps<1e-6||val<1e-12||iter>=20000||time>=3600}"
+# Algorithms tried in order after a plateau (Neper retries the current one
+# once, then moves on, then gives up, keeping the best solution). Neper's
+# default; see MORPHO_ALGO in the driver before changing it, and avoid a
+# single-entry list.
+: "${MORPHO_ALGO:=subplex,praxis}"
 : "${RSEL:=0.8}"                      # small-edge length for regularization
 
 # meshing. In 2D the cells are faces, so -rcl sets the element size inside the
@@ -173,7 +178,7 @@ if need "${STEM}-fit.tess"; then
         -morpho "tesr:file(${STEM}-raw.tesr)" \
         -morphooptiobjective "tesr:pts(region=surf,res=${OBJ_RES})+val(bounddist)" \
         -morphooptidof x,y,w \
-        -morphooptialgo subplex,praxis \
+        -morphooptialgo "$MORPHO_ALGO" \
         -morphooptistop "$MORPHO_STOP" \
         -morphooptilogval iter,val \
         -crysym "$CRYSYM" \
