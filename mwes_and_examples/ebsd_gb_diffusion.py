@@ -87,6 +87,13 @@ TESR_SMOOTH_ITER = 5
 # transport parameters below and everything derived from the mesh stay in SI.
 TESR_UNIT = 1e-6
 
+# Check images. The shell script writes check-ori/check-grains (neper -V) and
+# check-mesh (every reconstructed edge over the raster); with CHECK_PNG the
+# driver adds check-network.png, the same overlay after THETA_MIN: kept edges
+# coloured by theta, dropped ones dashed white, specimen surface grey. Serial
+# only; needs matplotlib in this environment.
+CHECK_PNG = True
+
 # --- transport ---------------------------------------------------------------
 # CHECK these against the domain size printed at startup. They are written for a
 # specimen tens of microns across with metres as the length unit. The mesh and
@@ -241,6 +248,8 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "TESR_SMOOTH": TESR_SMOOTH,
             "TESR_SMOOTH_FACT": str(TESR_SMOOTH_FACT),
             "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
+            "CHECK_IMAGES": "1" if CHECK_PNG else "0",
+            "PYTHON_BIN": sys.executable,
         }
     )
     if TESR_TRANSFORM:
@@ -564,6 +573,65 @@ class Microstructure:
         print(f"  boundary length                 : {self.network_length:.4g}")
 
 
+def write_network_png(base, mesh, micro, tesr_path):
+    """check-network.png: the raster with the boundaries as FESTIM will use them.
+
+    Same background as check-mesh.png (mesh_overlay.py), but the edges are the
+    driver's: those above THETA_MIN coloured by theta, interior edges below it
+    dashed white, specimen-surface edges grey. Compare with check-mesh.png to
+    see what the disorientation filter removed, and with check-grains.png to
+    see how far interface smoothing moved the boundaries off the pixels.
+    """
+    if mesh.comm.size > 1:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+        from mesh_overlay import draw_raster, read_tesr
+    except ImportError as exc:
+        print(f"  check-network.png skipped ({exc})")
+        return
+
+    cells, vox = read_tesr(tesr_path)
+    fdim = mesh.topology.dim - 1
+    owned = np.arange(mesh.topology.index_map(fdim).size_local, dtype=np.int32)
+    owned = owned[micro.facet_edge[owned] > 0]
+    nodes = dolfinx.mesh.entities_to_geometry(mesh, fdim, owned, False)
+    segs = mesh.geometry.x[nodes][:, :, :2] / TESR_UNIT  # back to tesr units
+    e = micro.facet_edge[owned] - 1
+    surface = micro.edges["domtype"][e] > 0
+    kept = micro.network_mask[e]
+    dropped = ~surface & ~kept
+
+    ny, nx = cells.shape
+    fig, ax = plt.subplots(figsize=(8, 8 * ny * vox[1] / (nx * vox[0])))
+    draw_raster(ax, cells, vox)
+    ax.add_collection(LineCollection(segs[surface], colors="0.6", lw=0.7))
+    ax.add_collection(
+        LineCollection(segs[dropped], colors="white", lw=1.3, linestyles="--")
+    )
+    net = LineCollection(segs[kept], cmap="inferno", lw=1.8)
+    net.set_array(micro.edges["theta"][e[kept]])
+    net.set_clim(THETA_MIN, 62.8)
+    ax.add_collection(net)
+    fig.colorbar(net, ax=ax, fraction=0.046).set_label("theta (deg)")
+    n_kept, n_int = int(micro.network_mask.sum()), int(micro.interior_mask.sum())
+    ax.set_title(
+        f"network used by FESTIM: {n_kept} of {n_int} boundaries above "
+        f"{THETA_MIN:g} deg\n(dashed white = dropped, grey = specimen surface)"
+    )
+    ax.set_xlabel("x (tesr units)")
+    ax.set_ylabel("y (tesr units)")
+    fig.tight_layout()
+    out = base.parent / "check-network.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
 # mesh
 def read_mesh(base, comm=MPI.COMM_WORLD, rank=0):
     """Read the Neper mesh into dolfinx.
@@ -658,6 +726,9 @@ mesh, cell_tags, facet_tags = read_mesh(base)
 micro = Microstructure(base, mesh, cell_tags, facet_tags, (LX, LY))
 N_GRAINS = micro.check_orientations()
 micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
+if CHECK_PNG:
+    # the staged raster is the one that was meshed, transform or not
+    write_network_png(base, mesh, micro, base.parent / f"{STEM}-raw.tesr")
 
 grains = F.VolumeSubdomain(
     id=1,

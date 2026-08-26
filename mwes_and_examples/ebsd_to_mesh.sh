@@ -31,6 +31,8 @@
 #   ${STEM}-grainori.txt  one orientation per grain, as read out of the tesr
 #   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
 #   check-grains.png      raster coloured by cell id
+#   check-mesh.png        raster cells with every reconstructed boundary edge
+#                         of the mesh drawn on top (mesh_overlay.py)
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
@@ -56,8 +58,11 @@ set -euo pipefail
 # skipping this avoids Neper's tesr write path (see stage 0).
 : "${TESR_TRANSFORM:=}"
 
-# check images (neper -V needs POV-Ray; a failure here is reported, not fatal)
+# check images (neper -V needs POV-Ray, mesh_overlay.py needs matplotlib; a
+# failure here is reported, not fatal). PYTHON_BIN is whichever interpreter
+# has numpy and matplotlib; the driver passes its own.
 : "${CHECK_IMAGES:=1}"
+: "${PYTHON_BIN:=python3}"
 
 # interface smoothing before meshing (Neper's defaults). The reconstructed
 # boundaries are pixel staircases; Laplacian smoothing rounds them off.
@@ -196,6 +201,18 @@ if need "${STEM}.msh4"; then
         -format msh4 \
         -statmesh nodenb,eltnb \
         -o "$STEM"
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Mesh overlay: the raster cells with every edge# element set of the mesh
+#    drawn over them, black between two grains and grey on the specimen
+#    surface. This is the set of segments the driver can select a network
+#    from; the driver draws the theta-filtered subset as check-network.png.
+# -----------------------------------------------------------------------------
+if [ "$CHECK_IMAGES" = "1" ] && need "check-mesh.png"; then
+    "$PYTHON_BIN" "$(dirname "$0")/mesh_overlay.py" \
+        "${STEM}-raw.tesr" "${STEM}.msh4" -o check-mesh.png \
+        || echo "  WARNING: check-mesh.png not written (matplotlib missing?)" >&2
 fi
 
 # Neper writes one .geo/.msh pair per tessellation entity into -tmp and deletes

@@ -49,7 +49,8 @@ crystal one. The file is written as tesr format 2.2: Neper 4.10.0 swapped the
 meaning of `active` and `passive` and bumped the tesr version to 2.2, and a
 file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
 (neut_tesr_fscanf2.c, "Fixing orientation convention") while `**oridata` is
-taken literally, leaving the two sections in opposite conventions. The conversion is verified against Neper's own convention table,
+taken literally, leaving the two sections in opposite conventions. The conversion
+is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
 (0.965925826, 0.258819045, 0, 0); see the self-test at the bottom, which runs
 on every invocation.
@@ -334,7 +335,17 @@ def build_grid(ctf, phase, max_mad, require_zero_error, min_bands):
     ok = np.zeros((ny, nx), dtype=bool)
     qgrid[iy[inside], ix[inside]] = quat[inside]
     ok[iy[good], ix[good]] = True
-    return qgrid, ok
+
+    # Per-pixel provenance for --diagnostics: what the .ctf itself says about
+    # each point, so a rejected pixel can be traced to the column that
+    # rejected it rather than blamed on the conversion.
+    diag = {}
+    for col, fill in (("Error", -1), ("MAD", np.nan), ("Bands", -1), ("Phase", -1)):
+        if ctf.has(col):
+            g = np.full((ny, nx), fill, dtype=float)
+            g[iy[inside], ix[inside]] = ctf[col][inside]
+            diag[col] = g
+    return qgrid, ok, diag
 
 
 def crop_grid(qgrid, ok, spec, xstep, ystep):
@@ -374,7 +385,8 @@ def crop_grid(qgrid, ok, spec, xstep, ystep):
             f"pixels. The map is {nx} x {ny} pixels of {xstep} x {ystep}, "
             f"i.e. {nx * xstep:g} x {ny * ystep:g} in those units."
         )
-    return qgrid[iy0:iy1, ix0:ix1], ok[iy0:iy1, ix0:ix1]
+    window = (slice(iy0, iy1), slice(ix0, ix1))
+    return qgrid[window], ok[window], window
 
 
 def segment_grains(qgrid, ok, threshold, sym):
@@ -558,6 +570,126 @@ def write_tesr(path, cellids, ori_cell, ori_vox, oridef, voxsize, crysym, precis
         fh.write("***end\n")
 
 
+# --- diagnostics -------------------------------------------------------------
+def write_quality_png(path, diag, ok, unassigned, cellids, args, flip_y=False):
+    """Four panels tracing every grey pixel of `neper -V ... -datavoxcol ori`.
+
+    Neper paints a voxel grey when `**oridef` is 0, and this script writes
+    `**oridef` from the quality mask `ok` -- so a grey pixel is a point the
+    .ctf's own columns failed: Error != 0 (unless --allow-error), MAD above
+    --max-mad, Bands below --min-bands, or the wrong phase. No orientation is
+    dropped in conversion: `**oridata` still carries the point's Euler angles
+    (Neper requires a placeholder anyway). The panels show, in order, the
+    Error column, the MAD column, the rejection reason, and which pixels of
+    the final cell map were back-filled from the nearest surviving cell
+    because they were rejected or belonged to a pruned grain.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+    except ImportError:
+        print("  --diagnostics: matplotlib not available, no PNG written")
+        return
+
+    def orient(a):
+        return a[::-1] if flip_y else a
+
+    ny, nx = ok.shape
+    err = diag.get("Error")
+    mad = diag.get("MAD")
+    bands = diag.get("Bands")
+    phase = diag.get("Phase")
+
+    # rejection reason, first failing test wins
+    reason = np.zeros((ny, nx), dtype=int)  # 0 kept
+    if phase is not None:
+        reason[(reason == 0) & (phase != args.phase)] = 4
+    if err is not None and not args.allow_error:
+        reason[(reason == 0) & (err != 0)] = 1
+    if mad is not None:
+        reason[(reason == 0) & (mad > args.max_mad)] = 2
+    if bands is not None and args.min_bands:
+        reason[(reason == 0) & (bands < args.min_bands)] = 3
+    reason[ok] = 0
+    labels = [
+        "kept",
+        "Error != 0",
+        f"MAD > {args.max_mad:g}",
+        "Bands < min",
+        "other phase",
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 10 * ny / nx))
+    kw = dict(interpolation="nearest", origin="lower")
+
+    ax = axes[0, 0]
+    if err is not None:
+        codes = np.unique(err[err >= 0]).astype(int)
+        im = ax.imshow(orient(err), cmap="tab10", vmin=-0.5, vmax=9.5, **kw)
+        cb = fig.colorbar(im, ax=ax, ticks=codes, fraction=0.046)
+        cb.set_label("Error column (0 = indexed, 3 = no solution)")
+        ax.set_title(
+            "ctf Error code: "
+            + ", ".join(f"{c}: {int((err == c).sum())}" for c in codes)
+        )
+    else:
+        ax.set_title("no Error column")
+
+    ax = axes[0, 1]
+    if mad is not None:
+        im = ax.imshow(
+            orient(mad), cmap="viridis", vmin=0, vmax=max(args.max_mad * 1.5, 1.0), **kw
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label("MAD (deg)")
+        over = int((mad > args.max_mad).sum())
+        ax.set_title(f"ctf MAD: {over} px above --max-mad {args.max_mad:g}")
+    else:
+        ax.set_title("no MAD column")
+
+    ax = axes[1, 0]
+    cmap = ListedColormap(["white", "tab:red", "tab:orange", "tab:purple", "tab:brown"])
+    im = ax.imshow(orient(reason), cmap=cmap, vmin=-0.5, vmax=4.5, **kw)
+    cb = fig.colorbar(im, ax=ax, ticks=range(5), fraction=0.046)
+    cb.set_ticklabels(labels)
+    counts = np.bincount(reason.ravel(), minlength=5)
+    ax.set_title(
+        f"rejected (grey in neper -V): {int((~ok).sum())} of {ok.size} px "
+        f"({100 * (~ok).mean():.1f} %)"
+    )
+
+    ax = axes[1, 1]
+    ncell = int(cellids.max())
+    perm = np.random.default_rng(0).permutation(ncell) + 1
+    shown = np.where(cellids > 0, perm[np.maximum(cellids - 1, 0)], 0).astype(float)
+    shown[cellids == 0] = np.nan
+    ax.imshow(orient(shown), cmap="tab20", **kw)
+    filled = unassigned & (cellids > 0)
+    ax.imshow(
+        orient(np.where(filled, 1.0, np.nan)),
+        cmap=ListedColormap(["black"]),
+        alpha=0.45,
+        **kw,
+    )
+    ax.set_title(
+        f"{ncell} cells; {int(filled.sum())} px back-filled (dark), "
+        f"{int((cellids == 0).sum())} left empty"
+    )
+
+    for ax in axes.ravel():
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(
+        f"{Path(args.ctf).name}: {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 # --- self-test ---------------------------------------------------------------
 def self_test():
     """Check the conventions against values Neper publishes, on every run.
@@ -659,6 +791,14 @@ def main(argv=None):
         help="omit **oridata/**oridef. Much smaller file; keeps the grain "
         "orientations but loses per-pixel colouring in -V and GOS in -S",
     )
+    p.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="also write <output>-quality.png: the .ctf's Error codes and MAD "
+        "over the window, the pixels this script rejected and why (these are "
+        "the grey pixels in neper -V's orientation map, **oridef = 0), and "
+        "the pixels the cell map back-filled. Needs matplotlib",
+    )
     args = p.parse_args(argv)
 
     self_test()
@@ -685,13 +825,14 @@ def main(argv=None):
     print(f"  phase {args.phase}: {phase['name']}, Laue {phase['laue']} -> {crysym}")
 
     sym = cubic_symmetry_quaternions()
-    qgrid, ok = build_grid(
+    qgrid, ok, diag = build_grid(
         ctf, args.phase, args.max_mad, not args.allow_error, args.min_bands
     )
     if args.crop:
-        qgrid, ok = crop_grid(
+        qgrid, ok, window = crop_grid(
             qgrid, ok, args.crop, ctf.header["XStep"], ctf.header["YStep"]
         )
+        diag = {k: v[window] for k, v in diag.items()}
         ny, nx = ok.shape
         print(f"  cropped to {nx} x {ny} pixels ({args.crop})")
     frac = ok.mean()
@@ -717,7 +858,8 @@ def main(argv=None):
     # "Listing cell voxels", and the objective function cannot place
     # pts(res=N) control points on a cell two pixels across either. Report the
     # bottom of the distribution so the failure is visible here, not there.
-    empty_before = int((cellids == 0).sum())
+    unassigned = cellids == 0
+    empty_before = int(unassigned.sum())
     print(
         f"  unassigned voxels: {empty_before} of {cellids.size} "
         f"({100 * empty_before / cellids.size:.1f} %)"
@@ -760,15 +902,21 @@ def main(argv=None):
     out = Path(args.output or Path(args.ctf).with_suffix(".tesr"))
     write_tesr(out, cellids, ori_cell, ori_vox, ok, vox, crysym)
 
+    if args.diagnostics:
+        png = out.with_name(out.stem + "-quality.png")
+        write_quality_png(png, diag, ok, unassigned, cellids, args, flip_y=args.flip_y)
+
     lx, ly = nx * vox[0], ny * vox[1]
     mean_px = counts.mean()
     grain_size = np.sqrt(mean_px) * vox[0]
     print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
     print(f"  domain      : {lx:.4g} x {ly:.4g}")
     print(f"  grain size  : ~{grain_size:.4g} (equivalent square)")
-    print("\ncheck it before fitting:")
+    print("\ncheck it before meshing (ebsd_to_mesh.sh does the first two itself):")
     print(f"  neper -V {out} -datavoxcol ori -datavoxcolscheme ipf -print check-ori")
     print(f"  neper -V {out} -print check-grains")
+    if not args.diagnostics:
+        print("  re-run with --diagnostics to see why pixels are grey in check-ori")
     if ncells > 400:
         side = grain_size * np.sqrt(250)
         print(
