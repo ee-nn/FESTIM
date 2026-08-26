@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
 # =============================================================================
-# A single EBSD map -> fitted 2D tessellation -> triangular mesh, for the
-# FESTIM codim-1 grain-boundary transport script.
+# A single EBSD map -> triangular mesh conforming to the raster's own grain
+# boundaries, for the FESTIM codim-1 grain-boundary transport script.
 #
-# In 2D the tessellation cells *are* the faces, so the grain boundaries are
-# edges and the triple junctions are vertices. Everything the transport script
-# needs therefore comes out of `-statedge` and `-statver` rather than
-# `-statface` and `-statedge`:
+# This is "route A": `neper -M map.tesr` meshes the raster directly, which
+# Neper supports in 2D only (neper_m.html: "Free meshing of raster
+# tessellations works for 2D tessellations only"). Neper reconstructs the
+# interfaces of the raster into a vertex/edge/face topology, smooths them
+# (-tesrsmooth) and meshes that, so the mesh conforms to the measured
+# boundaries, non-convex ones included. Route B (fitting a convex-cell Laguerre
+# tessellation with -T -morpho tesr) was abandoned because its objective has a
+# floor set by grain convexity: with a median grain solidity of ~0.8 it left
+# ~17 % of the voxels in the wrong cell however long it ran.
 #
-#   grain boundary  : interior edge      (theta, length live here)
-#   triple junction : interior vertex with 3+ edges
-#   quadruple node  : does not exist in 2D
+# What route A does not give is a .tess, so there is no -statedge / -statver:
+# `-format tess` on a raster input segfaults in Neper 5.0.0 while "Writing
+# geometry results". Everything the transport script needs is recovered from
+# the mesh instead. The msh4 carries the reconstructed topology as physical
+# groups named ver#, edge#, face#, and face k is raster cell k, so:
 #
-# This is still "route B": a convex-cell (Laguerre) tessellation is *fitted* to
-# the raster and the mesh is built from that. Route A -- `neper -M map.tesr`,
-# which is available in 2D and only in 2D -- is not used, because it produces
-# no .tess and therefore no `-statedge`, hence no theta and no way to tell a
-# grain boundary from a piece of specimen surface.
+#   grain boundary  : 1D element set "edge#", touching two "face#" sets
+#   specimen surface: 1D element set touching one face
+#   theta           : disorientation of the two grains' orientations
+#                     (${STEM}-grainori.txt), computed in the Python driver
+#   triple junction : mesh vertex where 3+ distinct edge ids meet
 #
 # Outputs, all named ${STEM}:
-#   ${STEM}.tess          regularized tessellation (the one that was meshed)
-#   ${STEM}.msh4          Gmsh v4 mesh, linear triangles
-#   ${STEM}.stedge        domtype domedge theta length ymin ymax  (per edge)
-#   ${STEM}.stver         domtype edgenb                          (per vertex)
+#   ${STEM}.msh4          Gmsh v4 mesh, linear triangles, all dimensions
 #   ${STEM}.sttesr        raster geometry, used to derive the domain size
 #   ${STEM}-grainori.txt  one orientation per grain, as read out of the tesr
+#   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
+#   check-grains.png      raster coloured by cell id
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
@@ -50,27 +56,23 @@ set -euo pipefail
 # skipping this avoids Neper's tesr write path (see stage 0).
 : "${TESR_TRANSFORM:=}"
 
-# tessellation fitting. The objective is `avdiameq * rms(distance)` in the
-# tesr's absolute length unit, so `val` and `eps` are dimensional: keep the
-# raster in microns (ctf_to_tesr.py's default) and never use `val<1e-6` with a
-# metre-scale raster, where the initial objective (~1e-10) already satisfies it
-# and Neper returns the initial Laguerre guess after one iteration.
-: "${OBJ_RES:=8}"                     # control points per grain per direction
-: "${MORPHO_STOP:=eps<1e-6||val<1e-12||iter>=20000||time>=3600}"
-# Algorithms tried in order after a plateau (Neper retries the current one
-# once, then moves on, then gives up, keeping the best solution). Neper's
-# default; see MORPHO_ALGO in the driver before changing it, and avoid a
-# single-entry list.
-: "${MORPHO_ALGO:=subplex,praxis}"
-: "${RSEL:=0.8}"                      # small-edge length for regularization
+# check images (neper -V needs POV-Ray; a failure here is reported, not fatal)
+: "${CHECK_IMAGES:=1}"
 
-# meshing. In 2D the cells are faces, so -rcl sets the element size inside the
-# grains; the grain boundaries are edges (-rcledge) and the triple junctions
-# are vertices (-rclver).
-: "${RCL:=0.8}"
-: "${RCL_EDGE:=0.2}"
-: "${RCL_VER:=}"
-: "${PL:=2.5}"
+# interface smoothing before meshing (Neper's defaults). The reconstructed
+# boundaries are pixel staircases; Laplacian smoothing rounds them off.
+: "${TESR_SMOOTH:=laplacian}"
+: "${TESR_SMOOTH_FACT:=0.5}"
+: "${TESR_SMOOTH_ITER:=5}"
+
+# meshing. Only -rcl acts on a raster input: in nem_meshing_para_cl1.c the
+# tesr branch derives the edge and vertex characteristic lengths from the face
+# value and never consults -rcledge / -rclver, and the 1D element count is
+# unchanged by them (804 segments on the D5 crop with or without -rcledge 0.2).
+# The rcl -> cl conversion also differs from the tess path: rcl 0.8 gave
+# cl = 1.045 um on the fitted tess and cl = 4.044 um here, so the default is
+# lowered to keep the element size near what the fitted mesh had.
+: "${RCL:=0.25}"
 : "${MESH_QUAL_MIN:=0.7}"
 : "${MESH_MAX_TIME:=}"
 
@@ -125,7 +127,7 @@ fi
 read -r DIM LX LY VSX VSY < "${STEM}.sttesr"
 echo "  raster: dim=$DIM  extent=${LX} x ${LY}  pixel=${VSX} x ${VSY}"
 # Everything below runs in the raster's unit; the Python driver converts the
-# mesh and the .st* lengths to metres (TESR_UNIT) after reading them.
+# mesh to metres (TESR_UNIT) after reading it.
 
 if [ "$DIM" != "2" ]; then
     echo "ERROR: this pipeline expects a 2D EBSD map, got a ${DIM}D tesr." >&2
@@ -150,89 +152,44 @@ NCELL=$(wc -l < "${STEM}-grainori.txt")
 echo "  grains: $NCELL"
 
 # -----------------------------------------------------------------------------
-# 1. Fit the tessellation.
-#
-# -n from_morpho takes the cell count from the raster. The objective function
-# samples control points on the grain boundaries and minimises the distance
-# between raster and tessellation cell boundaries; res is the number of control
-# points per grain per direction (Neper's default is 5).
-#
-# 2D is the cheap case: with -morphooptidof x,y,w there are three degrees of
-# freedom per grain instead of four, and the cells are polygons rather than
-# polyhedra, so a few hundred grains fit in minutes rather than hours. Crop
-# anyway if the map has thousands -- the cost is superlinear.
-#
-# The orientations are attached here rather than afterwards: `-ori from_morpho`
-# reads them from `-morphooptiini ori:file(...)`, so cell k of the tessellation
-# carries line k of the file, which is cell k of the raster. Getting this wrong
-# is silent -- the geometry is unaffected and only `theta` goes wrong -- so the
-# Python driver cross-checks the count and the disorientation distribution.
+# 0b. Check images. Look at these before trusting anything downstream: an
+#     inverted orientation convention shows up as IPF colours that disagree
+#     with AZtec/MTEX, and a bad segmentation shows up as speckle or as grains
+#     that are obviously back-filled. neper -V renders through POV-Ray, which
+#     the conda neper package does not pull in, so a missing renderer only
+#     costs the pictures.
 # -----------------------------------------------------------------------------
-# Check `Initial solution: f = ...` and the iteration count in the log: at
-# micron scale the initial value is O(10-100) and the fit should run for
-# minutes. A one-iteration exit on `val' means the raster unit is wrong.
-if need "${STEM}-fit.tess"; then
-    "$NEPER_BIN" -T -n from_morpho \
-        -dim 2 \
-        -domain "square($LX,$LY)" \
-        -morpho "tesr:file(${STEM}-raw.tesr)" \
-        -morphooptiobjective "tesr:pts(region=surf,res=${OBJ_RES})+val(bounddist)" \
-        -morphooptidof x,y,w \
-        -morphooptialgo "$MORPHO_ALGO" \
-        -morphooptistop "$MORPHO_STOP" \
-        -morphooptilogval iter,val \
-        -crysym "$CRYSYM" \
-        -oridescriptor "$ORIDES" \
-        -ori from_morpho \
-        -morphooptiini "ori:file(${STEM}-grainori.txt,des=${ORIDES})" \
-        -o "${STEM}-fit"
+if [ "$CHECK_IMAGES" = "1" ]; then
+    if need "check-ori.png"; then
+        "$NEPER_BIN" -V "${STEM}-raw.tesr" -datavoxcol ori -datavoxcolscheme ipf \
+            -print check-ori \
+            || echo "  WARNING: neper -V failed for check-ori (POV-Ray missing?)" >&2
+    fi
+    if need "check-grains.png"; then
+        "$NEPER_BIN" -V "${STEM}-raw.tesr" -print check-grains \
+            || echo "  WARNING: neper -V failed for check-grains (POV-Ray missing?)" >&2
+    fi
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Regularize, and write the statistics *from the regularized tessellation*.
+# 1. Mesh the raster. Linear triangles, Gmsh v4, all dimensions, because the
+#    FESTIM side reads it with dolfinx.io.gmshio and needs the 1D element sets
+#    intact -- they carry the edge ids of the reconstructed boundary topology,
+#    and those ids are what select the network and index theta.
 #
-# This ordering is not cosmetic. Regularization deletes small edges, so edge ids
-# are renumbered. The mesh is built from the regularized tess and the 1D element
-# sets in the .msh4 carry *its* edge ids, so the .stedge used to interpret those
-# tags has to come from the same file, not from the fitted one.
-#
-# -rsel is relative to the average cell size; a value of 1 corresponds to a
-# length of 0.125 for a unit-area cell in 2D. It should track whatever -rcl is
-# actually used, which is why the Python driver sets both from one number.
-#
-# `domtype` is 0/1 for an entity on a domain vertex/edge and negative when the
-# entity is interior; `domedge` is the id of the domain edge an edge lies on, or
-# -1. In 2D the domain boundary is made of edges, so either column identifies
-# specimen surface vs real grain boundary -- both are written so the Python side
-# can cross-check them against each other rather than trusting one convention.
-# -----------------------------------------------------------------------------
-if need "${STEM}.tess"; then
-    "$NEPER_BIN" -T -loadtess "${STEM}-fit.tess" \
-        -reg 1 -rsel "$RSEL" \
-        -statedge domtype,domedge,theta,length,ymin,ymax \
-        -statver domtype,edgenb \
-        -o "$STEM"
-fi
-
-# -----------------------------------------------------------------------------
-# 3. Mesh. Linear triangles, Gmsh v4, because the FESTIM side reads it with
-#    dolfinx.io.gmshio and needs the 1D element sets to survive intact -- they
-#    are what carry the tessellation edge ids that select the network.
-#
-#    -dim all is redundant (the .msh always holds every dimension unless :msh
-#    is appended) but makes the intent explicit: the 1D mesh is not a by-product
-#    here, it is the object of interest.
+#    Neper reconstructs the interfaces, smooths them, then meshes the edges
+#    and faces with the -rcl-derived length. -tmp must exist beforehand.
 # -----------------------------------------------------------------------------
 if need "${STEM}.msh4"; then
-    "$NEPER_BIN" -M "${STEM}.tess" \
+    "$NEPER_BIN" -M "${STEM}-raw.tesr" \
         -gmsh "$GMSH_BIN" \
         -dim all \
         -order 1 \
         -elttype tri \
         -rcl "$RCL" \
-        -rcledge "$RCL_EDGE" \
-        ${RCL_VER:+-rclver "$RCL_VER"} \
-        -pl "$PL" \
+        -tesrsmooth "$TESR_SMOOTH" \
+        -tesrsmoothfact "$TESR_SMOOTH_FACT" \
+        -tesrsmoothitermax "$TESR_SMOOTH_ITER" \
         ${MESH_QUAL_MIN:+-meshqualmin "$MESH_QUAL_MIN"} \
         ${MESH_MAX_TIME:+-mesh2dmaxtime "$MESH_MAX_TIME"} \
         -tmp tmp \

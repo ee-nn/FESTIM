@@ -18,16 +18,19 @@ What moves down a dimension is the bookkeeping. In a 2D tessellation the cells
     theta lives on  faces               edges
     mesh tags from  2D element sets     1D element sets
 
-`theta` is a face key in 3D and an edge key in 2D
-(https://neper.info/doc/exprskeys.html), and correspondingly a 2D-elset key in
-3D meshes and a 1D-elset key in 2D meshes. Nothing about a disorientation
-requires three dimensions -- it is computed from the two grain orientations
-either way.
+Nothing about a disorientation requires three dimensions -- it is computed
+from the two grain orientations either way.
 
-Route B is still the only option: meshing the raster directly (`neper -M
-map.tesr`) is *available* in 2D, unlike in 3D, but it produces no tessellation
-and therefore no `-statedge`, hence no theta and no way to separate grain
-boundaries from specimen surface.
+The mesh is Neper's direct meshing of the raster (`neper -M map.tesr`, 2D
+only), so the grain boundaries are the measured ones, non-convex shapes
+included, rather than a convex-cell tessellation fitted to them. Neper writes
+no .tess for that route (`-format tess` segfaults in 5.0.0), so the
+tessellation-level bookkeeping -- which grains an edge separates, whether it
+lies on the specimen surface, theta, length, junctions -- is rebuilt here from
+the mesh: the msh4 carries the reconstructed boundary topology as 1D element
+sets `edge#` and the grains as 2D element sets `face#`, with face k being
+raster cell k, and theta follows from the two grain orientations under cubic
+symmetry using the same disorientation function that segmented the map.
 
 The one thing 2D genuinely costs is connectivity, which is what this script
 measures. See the note at the end of ebsd_to_mesh.sh: percolation thresholds
@@ -42,6 +45,7 @@ All extensive quantities below are per unit thickness out of plane.
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from mpi4py import MPI
@@ -63,44 +67,24 @@ TESR = "ebsd-centre.tesr"
 CRYSYM = "cubic"
 ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 
-# Crop the map before fitting, in the tesr's own length units. The 2D fit is
-# cheap by 3D standards -- three optimization degrees of freedom per grain
-# rather than four, and polygons rather than polyhedra -- but the cost is still
-# superlinear, so a few hundred grains is a comfortable working size.
 # Optional Neper transformation chain for the raster. Leave as None: cropping
 # and hole-filling are done by ctf_to_tesr.py, and skipping the Neper pass
 # avoids its tesr write path, which produces an unreadable file when the input
 # carries **oridata (Neper 5.0.0).
 TESR_TRANSFORM = None
-OBJ_RES = 16  # control points per grain per direction in the fit objective
 
-# Stopping criterion for the tessellation fit. Neper's tesr objective is
-# `avdiameq * rms(distance)` in the tesr's absolute length unit, so `val` and
-# `eps` are dimensional: with the map in microns the initial value is O(10-100)
-# and the default `eps<1e-6||val<1e-12` drives a real optimization. Do not put
-# `val<1e-6` back in: for the earlier metre-scale tesr the initial objective was
-# ~1e-10, the criterion was met before the first iteration, and the "fit" that
-# came out was the initial Laguerre guess (seeds at centroids, weights radeq),
-# which is what the network-through-the-grains picture was. `reps` would be
-# the scale-free alternative if the unit ever changes again.
-MORPHO_STOP = "eps<1e-6||val<1e-12||iter>=20000||time>=3600"
-
-# Optimization algorithms, tried in order. When a loop stalls for
-# -morphooptialgomaxiter iterations (default max(varnb,1000)) Neper retries the
-# same algorithm once, then steps to the next entry, then gives up, keeping the
-# best solution throughout (net_tess_opt_comp2.c). Neper's default is kept: on
-# the D5 map praxis returned an NLopt error ("Failed due to unknown error")
-# after two subplex loops had already plateaued, which changed nothing -- the
-# plateau, not praxis, is what ended the fit. A single-entry list is not
-# recommended: the index used after the last plateau is not bounds-checked.
-# If the fit plateaus early, raise OBJ_RES before touching this.
-MORPHO_ALGO = "subplex,praxis"
+# Interface smoothing applied by neper -M before meshing (Neper's defaults,
+# neper_m.html "Raster Tessellation Meshing Options"). The reconstructed
+# boundaries are pixel staircases; Laplacian smoothing with factor A for N
+# iterations rounds them off. "none" keeps the staircase.
+TESR_SMOOTH = "laplacian"
+TESR_SMOOTH_FACT = 0.5
+TESR_SMOOTH_ITER = 5
 
 # Metres per tesr length unit. ctf_to_tesr.py keeps the .ctf's microns so that
-# Neper's fit tolerances and Gmsh's absolute geometric tolerances are exercised
-# at O(1-100) rather than O(1e-6). Everything Neper writes -- the mesh, the
-# raster extent and the edge lengths/positions in .stedge -- is converted here,
-# once, so the transport parameters below stay in SI.
+# Gmsh's absolute geometric tolerances are exercised at O(1-100) rather than
+# O(1e-6). The mesh is converted here, once, right after it is read, so the
+# transport parameters below and everything derived from the mesh stay in SI.
 TESR_UNIT = 1e-6
 
 # --- transport ---------------------------------------------------------------
@@ -130,24 +114,13 @@ THETA_MIN = 15.0
 THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 
 # --- meshing -----------------------------------------------------------------
-# In 2D the cells are faces, so RCL sets the element size inside the grains and
-# RCL_EDGE the size along the grain boundaries. RCL_VER refines the triple
-# junctions, which is where the interesting transport happens and where the
-# elements are worst; None leaves them at the edge value.
-RCL = 0.8
-RCL_EDGE = 0.2
-RCL_VER = None
-PL = 2.5  # progression factor: max length ratio between adjacent 1D elements
-
-# -rsel, the small-edge length used by regularization. Neper's default is 1,
-# picked to suit the *default* -rcl; the docs say it should track whatever -rcl
-# you actually use, and a value of 1 corresponds to a length of 0.125 for a
-# unit-area cell in 2D. Leaving it low relative to RCL lets short edges survive
-# into the mesh, where they force pinch fixing and degenerate triangles. It
-# matters more here than for a Voronoi tessellation, because a fitted Laguerre
-# tessellation inherits the awkward near-degenerate edges of whatever grain
-# arrangement was actually measured.
-REG_RSEL = RCL
+# RCL is the only size control Neper honours for a raster input: the tesr
+# branch of nem_meshing_para_cl1.c derives the edge and vertex lengths from the
+# face value and never reads -rcledge / -rclver, and the 1D element count does
+# not respond to them. Its rcl -> cl conversion also differs from the tess
+# path (rcl 0.8: cl = 1.045 um on the fitted tess, 4.044 um here), hence the
+# lower value; 0.25 gives ~1.3 um elements on the D5 crop.
+RCL = 0.25
 
 # Multimeshing retries each face with several algorithms until MESH_QUAL_MIN is
 # reached, so quality target and meshing time trade off directly; 0.9 is Neper's
@@ -177,13 +150,10 @@ NEPER_ENV = "/home/fenna/anaconda3/envs/neper-env/bin"
 NEPER_BIN = os.path.join(NEPER_ENV, "neper")
 GMSH_BIN = os.path.join(NEPER_ENV, "gmsh")
 
-# The stat keys below are all scalars, one column each, one line per entity in
-# id order. They are written by ebsd_to_mesh.sh from the *regularized*
-# tessellation, which is the one that got meshed -- regularization renumbers
-# edges, so stats taken before it would not match the .msh4 tags. Keep these
-# tuples in step with the -stat* options in the shell script.
-EDGE_KEYS = ("domtype", "domedge", "theta", "length", "ymin", "ymax")
-VER_KEYS = ("domtype", "edgenb")
+# ctf_to_tesr.py, next to this file, owns the cubic disorientation function
+# used to segment the map; theta is computed with the same function so a
+# boundary's theta here means the same thing as the threshold that created it.
+sys.path.insert(0, str(_HERE))
 
 
 def run_interruptible(cmd, cwd=None, env=None):
@@ -215,11 +185,10 @@ def run_interruptible(cmd, cwd=None, env=None):
 
 
 def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
-    """Fit and mesh the EBSD map. Returns the base path (no extension).
+    """Mesh the EBSD map. Returns the base path (no extension).
 
     All the Neper invocations live in ebsd_to_mesh.sh; this only marshals the
-    parameters and checks the binaries. Caching is per stage inside the script,
-    so a failed -M does not cost the fit again.
+    parameters and checks the binaries. Caching is per stage inside the script.
     """
     base = (Path(workdir) / stem).resolve()
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -268,19 +237,14 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "FORCE": "1" if force else "0",
             "CRYSYM": CRYSYM,
             "ORIDES": ORIDES,
-            "OBJ_RES": str(OBJ_RES),
-            "MORPHO_STOP": MORPHO_STOP,
-            "MORPHO_ALGO": MORPHO_ALGO,
-            "RSEL": str(REG_RSEL),
             "RCL": str(RCL),
-            "RCL_EDGE": str(RCL_EDGE),
-            "PL": str(PL),
+            "TESR_SMOOTH": TESR_SMOOTH,
+            "TESR_SMOOTH_FACT": str(TESR_SMOOTH_FACT),
+            "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
         }
     )
     if TESR_TRANSFORM:
         env["TESR_TRANSFORM"] = TESR_TRANSFORM
-    if RCL_VER is not None:
-        env["RCL_VER"] = str(RCL_VER)
     if MESH_QUAL_MIN:
         env["MESH_QUAL_MIN"] = str(MESH_QUAL_MIN)
     if MESH_MAX_TIME:
@@ -318,70 +282,180 @@ def fisher_length(delta, d_gb, d_b, t):
     return float(np.sqrt(delta * d_gb * np.sqrt(np.pi * t) / (2.0 * np.sqrt(d_b))))
 
 
-class StatFile:
-    """One Neper .st* file: scalar keys in columns, entities in id order.
+def _ids(mask):
+    """Boolean mask over entities in id order -> 1-based ids."""
+    return np.flatnonzero(mask).astype(np.int32) + 1
 
-    Ids are 1-based throughout Neper, so ``self.values[k]`` is entity ``k + 1``
-    and :meth:`ids` converts a boolean mask back into ids.
-    """
 
-    def __init__(self, path, keys):
-        raw = np.loadtxt(path, ndmin=2)
-        if raw.shape[1] != len(keys):
-            raise ValueError(
-                f"{path} has {raw.shape[1]} columns but {len(keys)} keys were "
-                f"expected ({', '.join(keys)}); the -stat option in "
-                "ebsd_to_mesh.sh and the key tuple here have drifted apart"
-            )
-        self.values = {k: raw[:, i] for i, k in enumerate(keys)}
-        self.n = raw.shape[0]
+def _allreduce(comm, arr, op):
+    out = np.empty_like(arr)
+    comm.Allreduce(np.ascontiguousarray(arr), out, op=op)
+    return out
+
+
+def _rodrigues_to_quat(r):
+    """Rodrigues vector r = (q1, q2, q3)/q0 -> unit quaternion (q0 > 0)."""
+    q = np.column_stack((np.ones(len(r)), r))
+    return q / np.linalg.norm(q, axis=1)[:, None]
+
+
+class EdgeTable:
+    """Per-edge scalars in id order: ``values[k]`` belongs to edge ``k + 1``."""
+
+    def __init__(self, values):
+        self.values = values
+        self.n = len(next(iter(values.values())))
 
     def __getitem__(self, key):
         return self.values[key]
 
-    @staticmethod
-    def ids(mask):
-        return np.flatnonzero(mask).astype(np.int32) + 1
-
 
 class Microstructure:
-    """The tessellation's own description of itself, read back from the stats.
+    """The grain-boundary topology, rebuilt from the mesh Neper wrote.
 
-    This replaces ``order_ring`` / ``clip_to_box`` / ``polygon_area`` /
-    ``face_edges`` / ``connected_components`` and the Counter arithmetic over
-    rounded coordinates: every number below is Neper's, computed on the exact
-    topology rather than reconstructed from the geometry. With an EBSD-derived
-    tessellation ``theta`` is also a measurement rather than a by-product of
-    random orientation assignment, which is what makes THETA_MIN meaningful.
+    With route A there is no tessellation file to take statistics from, but the
+    msh4 carries the reconstructed topology: every 1D element set ``edge#`` is
+    one boundary edge of the raster (after interface smoothing) and every 2D
+    element set ``face#`` is raster cell k, so the grains on either side of an
+    edge are the tags of the cells its facets belong to. From that:
+
+    - ``domtype``: -1 for an edge between two grains, 1 for an edge with a
+      single grain, i.e. on the specimen surface (in 2D the domain boundary is
+      made of edges, so this is the whole story);
+    - ``theta``: cubic disorientation between the two grains' mean
+      orientations, read from ``-grainori.txt``. It is invariant under a
+      global inversion of all orientations (the misorientations are inverted
+      and conjugated, neither of which changes an angle under two-sided cubic
+      symmetry), so the active/passive question does not enter here;
+    - ``length``, ``ymin``, ``ymax``: summed / extremised over the edge's
+      facets, in metres because the mesh was scaled on reading;
+    - triple junctions: vertices where 3+ distinct edge ids meet and that do
+      not lie on the bounding box. On a raster four grains can meet at a pixel
+      corner, and those are counted too.
+
+    The adjacency is gathered across ranks because a facet on a partition
+    boundary sees only one of its two cells locally; lengths and extrema are
+    reduced. The junction count is exact in serial and a lower bound in
+    parallel, like component_count().
     """
 
-    def __init__(self, base):
-        self.edges = StatFile(str(base) + ".stedge", EDGE_KEYS)
-        self.vertices = StatFile(str(base) + ".stver", VER_KEYS)
-        # Neper reports lengths and coordinates in the tesr's unit (microns);
-        # theta, domtype, domedge and edgenb are unit-free
-        for key in ("length", "ymin", "ymax"):
-            self.edges.values[key] = self.edges.values[key] * TESR_UNIT
-        self._check_interior_conventions()
+    def __init__(self, base, mesh, cell_tags, facet_tags, extent):
+        from ctf_to_tesr import cubic_disorientation_angle, qconj, qmul
 
-    # In 2D the domain boundary is made of edges, so a tessellation edge is a
-    # real grain boundary exactly when it lies on none of them. `domtype` is
-    # 0/1 for an entity on a domain vertex/edge and negative otherwise, and
-    # `domedge` is the domain edge id or -1. Two independent columns saying the
-    # same thing, which is why both are written: if they ever disagree, the
-    # assumption about the sign convention is what broke, and it is better to
-    # hear about it here than to silently include the specimen surface in the
-    # network and watch hydrogen short circuit around the outside.
-    def _check_interior_conventions(self):
-        by_domtype = self.edges["domtype"] < 0
-        by_domedge = self.edges["domedge"] < 0
-        if not np.array_equal(by_domtype, by_domedge):
-            n = int((by_domtype != by_domedge).sum())
-            raise RuntimeError(
-                f"domtype and domedge disagree on {n} of {self.edges.n} edges "
-                "about which are interior. Inspect the .stedge file: the "
-                "interior sentinel is not the negative value assumed here."
+        if CRYSYM != "cubic":
+            raise NotImplementedError(
+                "theta is computed with the closed-form cubic disorientation "
+                f"from ctf_to_tesr.py; CRYSYM = {CRYSYM!r} needs a general "
+                "symmetry-operator search"
             )
+        comm = mesh.comm
+        top = mesh.topology
+        tdim = top.dim
+        fdim = tdim - 1
+        top.create_connectivity(fdim, tdim)
+        top.create_connectivity(0, fdim)
+        f2c = top.connectivity(fdim, tdim)
+        v2f = top.connectivity(0, fdim)
+        fmap, cmap, vmap = top.index_map(fdim), top.index_map(tdim), top.index_map(0)
+
+        facet_edge = np.zeros(fmap.size_local + fmap.num_ghosts, dtype=np.int32)
+        facet_edge[facet_tags.indices] = facet_tags.values
+        cell_grain = np.zeros(cmap.size_local + cmap.num_ghosts, dtype=np.int32)
+        cell_grain[cell_tags.indices] = cell_tags.values
+        n_edge = comm.allreduce(int(facet_edge.max(initial=0)), op=MPI.MAX)
+        n_grain = comm.allreduce(int(cell_grain.max(initial=0)), op=MPI.MAX)
+        if n_edge == 0 or n_grain == 0:
+            raise RuntimeError("the mesh carries no edge# / face# element sets")
+        self.facet_edge = facet_edge
+        self.n_grains = n_grain
+
+        # grains on either side of each edge
+        local = {}
+        for f in np.flatnonzero(facet_edge):
+            local.setdefault(int(facet_edge[f]), set()).update(
+                int(cell_grain[c]) for c in f2c.links(f)
+            )
+        grains = [set() for _ in range(n_edge + 1)]
+        for part in comm.allgather({k: sorted(v) for k, v in local.items()}):
+            for k, v in part.items():
+                grains[k].update(v)
+        sides = np.array([len(g) for g in grains[1:]])
+        if sides.min() < 1 or sides.max() > 2 or 0 in set().union(*grains[1:]):
+            bad = _ids((sides < 1) | (sides > 2))
+            raise RuntimeError(
+                f"edges {bad[:10]} touch {sides[bad[:10] - 1]} grains; every "
+                "edge# set must lie between two face# sets or between one "
+                "face# set and the domain. The msh4 is not a neper -M raster "
+                "mesh, or the cell tags did not survive the read."
+            )
+        pair = np.array(
+            [sorted(g) + [0] * (2 - len(g)) for g in grains[1:]], dtype=np.int32
+        )
+        domtype = np.where(sides == 2, -1.0, 1.0)
+
+        # length, ymin, ymax over owned facets, then reduced
+        owned = np.arange(fmap.size_local, dtype=np.int32)
+        owned = owned[facet_edge[owned] > 0]
+        nodes = dolfinx.mesh.entities_to_geometry(mesh, fdim, owned, False)
+        x = mesh.geometry.x[nodes]  # (nf, 2, 3)
+        e = facet_edge[owned]
+        length = np.bincount(
+            e, weights=np.linalg.norm(x[:, 1] - x[:, 0], axis=1), minlength=n_edge + 1
+        )
+        ymin = np.full(n_edge + 1, np.inf)
+        ymax = np.full(n_edge + 1, -np.inf)
+        np.minimum.at(ymin, e, x[:, :, 1].min(axis=1))
+        np.maximum.at(ymax, e, x[:, :, 1].max(axis=1))
+        length = _allreduce(comm, length[1:], MPI.SUM)
+        ymin = _allreduce(comm, ymin[1:], MPI.MIN)
+        ymax = _allreduce(comm, ymax[1:], MPI.MAX)
+
+        # theta from the grain orientations, line k of the file = face k
+        self.ori = np.loadtxt(str(base) + "-grainori.txt", ndmin=2)
+        if self.ori.shape[0] != n_grain:
+            raise RuntimeError(
+                f"{base}-grainori.txt has {self.ori.shape[0]} lines but the mesh "
+                f"has {n_grain} face# sets; they must be the same raster"
+            )
+        q = _rodrigues_to_quat(self.ori)
+        theta = np.zeros(n_edge)
+        inner = sides == 2
+        a, b = pair[inner, 0] - 1, pair[inner, 1] - 1
+        theta[inner] = cubic_disorientation_angle(qmul(qconj(q[a]), q[b]))
+
+        self.edges = EdgeTable(
+            {
+                "domtype": domtype,
+                "theta": theta,
+                "length": length,
+                "ymin": ymin,
+                "ymax": ymax,
+                "grain_a": pair[:, 0].astype(float),
+                "grain_b": pair[:, 1].astype(float),
+            }
+        )
+
+        # junctions: owned vertices where 3+ distinct edge ids meet, off the box
+        n_v = vmap.size_local
+        verts = np.arange(n_v, dtype=np.int32)
+        xv = dolfinx.mesh.compute_midpoints(mesh, 0, verts)
+        lx, ly = extent
+        tol = 1e-9 * max(lx, ly)
+        on_box = (
+            (np.abs(xv[:, 0]) < tol)
+            | (np.abs(xv[:, 0] - lx) < tol)
+            | (np.abs(xv[:, 1]) < tol)
+            | (np.abs(xv[:, 1] - ly) < tol)
+        )
+        edgenb = np.fromiter(
+            (len(set(facet_edge[v2f.links(v)].tolist()) - {0}) for v in verts),
+            dtype=int,
+            count=n_v,
+        )
+        self.triple_junctions = comm.allreduce(
+            int(((edgenb >= 3) & ~on_box).sum()), op=MPI.SUM
+        )
+        self.surface_edges = int((sides == 1).sum())
 
     @property
     def interior_mask(self):
@@ -393,7 +467,7 @@ class Microstructure:
 
     @property
     def network_edge_ids(self):
-        return StatFile.ids(self.network_mask)
+        return _ids(self.network_mask)
 
     @property
     def network_length(self):
@@ -403,56 +477,39 @@ class Microstructure:
         """Deepest point reached by a boundary that touches the charged edge.
 
         Below this depth no boundary is fed directly, so whatever the network
-        holds there has crossed at least one triple junction. ``ymin``/``ymax``
-        are edge keys, so Neper reports it rather than it being scanned for.
+        holds there has crossed at least one triple junction.
         """
         touching = self.network_mask & (self.edges["ymax"] > y_top - tol)
         if not touching.any():
             return y_top
         return float(self.edges["ymin"][touching].min())
 
-    # A triple junction is an interior vertex meeting three or more edges. In
-    # 3D the same object is an interior *edge* meeting three or more faces, and
-    # the 3D script's quadruple-point count has no 2D counterpart at all: four
-    # grains meeting at a point is not a generic configuration in the plane.
-    @property
-    def triple_junctions(self):
-        m = (self.vertices["domtype"] < 0) & (self.vertices["edgenb"] >= 3)
-        return int(m.sum())
-
-    def check_orientations(self, base):
+    def check_orientations(self):
         """Fail loudly if theta is not a real disorientation distribution.
 
-        The failure mode this guards against is quiet: if the orientation file
-        did not reach the tessellation, or the crystal symmetry was never set,
-        every cell keeps the identity orientation, `theta` comes out zero or
-        uniform-random, THETA_MIN filters the wrong edges, and the geometry
-        looks flawless throughout.
+        With theta computed here rather than by Neper the failure modes move:
+        an all-zero orientation file, or one that does not belong to this
+        raster, are what would make every boundary look alike.
         """
-        ori = np.loadtxt(str(base) + "-grainori.txt", ndmin=2)
         theta = self.edges["theta"][self.interior_mask]
         problems = []
-        if np.allclose(ori, 0.0):
+        if np.allclose(self.ori, 0.0):
             problems.append("every grain orientation in the tesr readout is zero")
         if theta.size and np.allclose(theta, 0.0):
             problems.append("every interior edge has theta = 0")
-        if theta.size and CRYSYM == "cubic" and theta.max() > 63.0:
-            # the maximum disorientation is ~62.8 deg for cubic symmetry;
-            # exceeding it means the symmetry was not applied
+        if theta.size and theta.max() > 63.0:
+            # the maximum disorientation is ~62.8 deg for cubic symmetry
             problems.append(
-                f"max theta = {theta.max():.1f} deg exceeds the cubic bound, "
-                "so CRYSYM did not reach the tessellation"
+                f"max theta = {theta.max():.1f} deg exceeds the cubic bound"
             )
         if problems:
             raise RuntimeError(
-                "the orientations did not survive the tessellation fit: "
+                "the orientations are not usable: "
                 + "; ".join(problems)
-                + ". Check that -ori from_morpho and -morphooptiini ori:file() "
-                "are both present in ebsd_to_mesh.sh, that the descriptor "
-                f"({ORIDES}) matches the tesr, and that the orientation file "
-                f"has one line per grain ({ori.shape[0]} lines read)."
+                + ". Check that -grainori.txt was written from the same tesr "
+                "that was meshed."
             )
-        return ori.shape[0]
+        return self.n_grains
 
     def check_units(self, extent, n_grains, delta, d_b, d_gb, t_end):
         """Three ways a physical domain breaks parameters written for a unit square.
@@ -491,9 +548,10 @@ class Microstructure:
         kept, total = int(self.network_mask.sum()), int(self.interior_mask.sum())
         theta = self.edges["theta"][self.network_mask]
         lx, ly = extent
-        print(f"microstructure: {n_grains} grains from {TESR} (2D)")
+        print(f"microstructure: {n_grains} grains from {TESR} (2D, raster mesh)")
         print(f"  domain                          : {lx:g} x {ly:g}")
         print(f"  edges                           : {self.edges.n}")
+        print(f"  on the specimen surface         : {self.surface_edges}")
         print(f"  grain boundaries (interior)     : {total}")
         print(f"  kept above {THETA_MIN:g} deg          : {kept}")
         if kept:
@@ -510,10 +568,11 @@ class Microstructure:
 def read_mesh(base, comm=MPI.COMM_WORLD, rank=0):
     """Read the Neper mesh into dolfinx.
 
-    ``cell_tags`` carry the face (grain) id and ``facet_tags`` the tessellation
-    edge id, because Neper writes every tessellation entity as an element set.
-    In a 2D mesh the facets are line segments, so the tags that matter come from
-    the 1D element sets -- the 3D script's 2D element sets, one dimension down.
+    ``cell_tags`` carry the grain id (2D element set ``face#`` = raster cell)
+    and ``facet_tags`` the reconstructed boundary edge id (1D element set
+    ``edge#``); neper -M writes every entity of the topology it reconstructed
+    from the raster as an element set. In a 2D mesh the facets are line
+    segments, so the tags that matter come from the 1D element sets.
     """
     result = gmshio.read_from_msh(str(base) + ".msh4", comm, rank, gdim=2)
     if hasattr(result, "mesh"):
@@ -594,11 +653,11 @@ def gb_diffusivity_field(network, micro, d_low, d_high, theta_c=15.0):
 
 # build
 base = run_ebsd_pipeline()
-micro = Microstructure(base)
 LX, LY = domain_extent(base)
-N_GRAINS = micro.check_orientations(base)
-micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
 mesh, cell_tags, facet_tags = read_mesh(base)
+micro = Microstructure(base, mesh, cell_tags, facet_tags, (LX, LY))
+N_GRAINS = micro.check_orientations()
+micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
 
 grains = F.VolumeSubdomain(
     id=1,
