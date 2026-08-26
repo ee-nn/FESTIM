@@ -67,7 +67,7 @@ ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 # cheap by 3D standards -- three optimization degrees of freedom per grain
 # rather than four, and polygons rather than polyhedra -- but the cost is still
 # superlinear, so a few hundred grains is a comfortable working size.
-TESR_CROP = None  # e.g. "square(0,60e-6,0,60e-6)"
+TESR_CROP = "square(0,0.000159,0,0.000159)"  # e.g. "square(0,60e-6,0,60e-6)"
 OBJ_RES = 8  # control points per grain per direction in the fit objective
 MORPHO_STOP = "val<1e-6||iter>=20000||time>=3600"
 
