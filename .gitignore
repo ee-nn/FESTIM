@@ -139,3 +139,6 @@ docs/source/_build/
 
 # Visual Studio Code settings
 .vscode/
+
+# Patch files
+*.patch

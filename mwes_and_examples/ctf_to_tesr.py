@@ -22,18 +22,34 @@ then point the transport pipeline at the result:
 
 What is written
 ---------------
-**general   dimension, XCells/YCells, XStep/YStep (scaled to metres)
+**general   dimension, XCells/YCells, XStep/YStep (in microns by default)
 **cell      grain count, ids, crysym, and one mean orientation per grain
 **data      grain id of every pixel, contiguous from 1, 0 where unindexed
 **oridata   per-pixel orientation (optional; large, but needed for -V and GOS)
 **oridef    per-pixel indexing flag, 0 where the point was rejected
+
+Length unit
+-----------
+The tesr is written in the .ctf's own unit (microns) unless --scale is given.
+This is deliberate: Neper's tesr-fitting objective is `avdiameq * rms(dist)` in
+the tesr's absolute length unit (net_tess_opt_comp_objective_fval_tesr2.c), so
+its `val` and `eps` stopping criteria are not dimensionless. In metres the
+initial objective of a ~100 um map is ~1e-10 and any `val<1e-6` or `eps<1e-6`
+criterion is met before the first iteration, i.e. the "fit" returned is the
+initial Laguerre guess. Gmsh's absolute geometric tolerances are also marginal
+for 1e-6-sized elements. The transport driver converts to metres after reading
+the mesh (TESR_UNIT in ebsd_gb_diffusion.py).
 
 Orientation convention
 ----------------------
 Euler angles in a .ctf are Bunge (phi1, Phi, phi2) in degrees, referred to the
 sample frame. They are converted to Rodrigues vectors under Neper's default
 `passive` convention -- the rotation of the sample coordinate system into the
-crystal one. The conversion is verified against Neper's own convention table,
+crystal one. The file is written as tesr format 2.2: Neper 4.10.0 swapped the
+meaning of `active` and `passive` and bumped the tesr version to 2.2, and a
+file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
+(neut_tesr_fscanf2.c, "Fixing orientation convention") while `**oridata` is
+taken literally, leaving the two sections in opposite conventions. The conversion is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
 (0.965925826, 0.258819045, 0, 0); see the self-test at the bottom, which runs
 on every invocation.
@@ -504,17 +520,9 @@ def write_tesr(path, cellids, ori_cell, ori_vox, oridef, voxsize, crysym, precis
     ny, nx = cellids.shape
     fmt = f"%.{precision}f"
 
-    def fmt_rows(arr, per_line):
-        return "\n".join(
-            " ".join(
-                f"{v:g}" if isinstance(v, (int, np.integer)) else fmt % v for v in row
-            )
-            for row in arr.reshape(-1, per_line)
-        )
-
     with open(path, "w") as fh:
         fh.write("***tesr\n")
-        fh.write(" **format\n   2.1\n")
+        fh.write(" **format\n   2.2\n")
         fh.write(" **general\n   2\n")
         fh.write(f"   {nx} {ny}\n")
         fh.write(f"   {voxsize[0]:.12g} {voxsize[1]:.12g}\n")
@@ -619,9 +627,12 @@ def main(argv=None):
     p.add_argument(
         "--scale",
         type=float,
-        default=1e-6,
+        default=1.0,
         help="multiply step sizes by this to get the tesr length unit "
-        "(default 1e-6: .ctf steps are microns, tesr is written in metres)",
+        "(default 1: keep the .ctf's microns). Do not write metres: Neper's "
+        "fit objective and its val/eps stopping criteria are in absolute "
+        "length units, so a metre-scale map stops the fit at iteration 1. "
+        "The driver rescales to metres after meshing (TESR_UNIT)",
     )
     p.add_argument(
         "--flip-y",
@@ -762,9 +773,9 @@ def main(argv=None):
         side = grain_size * np.sqrt(250)
         print(
             f"\n{ncells} grains is a long tessellation fit. Crop to ~250 by "
-            f"setting, in festim_ebsd_gb_diffusion.py:"
+            f"re-running with a window about {side:.3g} x {side:.3g} in the "
+            ".ctf's units, e.g. --crop xmin,xmax,ymin,ymax"
         )
-        print(f'  TESR_CROP = "square(0,{side:.3g},0,{side:.3g})"')
     return 0
 
 

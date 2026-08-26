@@ -50,9 +50,13 @@ set -euo pipefail
 # skipping this avoids Neper's tesr write path (see stage 0).
 : "${TESR_TRANSFORM:=}"
 
-# tessellation fitting
+# tessellation fitting. The objective is `avdiameq * rms(distance)` in the
+# tesr's absolute length unit, so `val` and `eps` are dimensional: keep the
+# raster in microns (ctf_to_tesr.py's default) and never use `val<1e-6` with a
+# metre-scale raster, where the initial objective (~1e-10) already satisfies it
+# and Neper returns the initial Laguerre guess after one iteration.
 : "${OBJ_RES:=8}"                     # control points per grain per direction
-: "${MORPHO_STOP:=val<1e-6||iter>=20000||time>=3600}"
+: "${MORPHO_STOP:=eps<1e-6||val<1e-12||iter>=20000||time>=3600}"
 : "${RSEL:=0.8}"                      # small-edge length for regularization
 
 # meshing. In 2D the cells are faces, so -rcl sets the element size inside the
@@ -115,6 +119,8 @@ fi
 
 read -r DIM LX LY VSX VSY < "${STEM}.sttesr"
 echo "  raster: dim=$DIM  extent=${LX} x ${LY}  pixel=${VSX} x ${VSY}"
+# Everything below runs in the raster's unit; the Python driver converts the
+# mesh and the .st* lengths to metres (TESR_UNIT) after reading them.
 
 if [ "$DIM" != "2" ]; then
     echo "ERROR: this pipeline expects a 2D EBSD map, got a ${DIM}D tesr." >&2
@@ -157,6 +163,9 @@ echo "  grains: $NCELL"
 # is silent -- the geometry is unaffected and only `theta` goes wrong -- so the
 # Python driver cross-checks the count and the disorientation distribution.
 # -----------------------------------------------------------------------------
+# Check `Initial solution: f = ...` and the iteration count in the log: at
+# micron scale the initial value is O(10-100) and the fit should run for
+# minutes. A one-iteration exit on `val' means the raster unit is wrong.
 if need "${STEM}-fit.tess"; then
     "$NEPER_BIN" -T -n from_morpho \
         -dim 2 \

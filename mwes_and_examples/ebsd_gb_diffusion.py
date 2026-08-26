@@ -73,12 +73,30 @@ ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 # carries **oridata (Neper 5.0.0).
 TESR_TRANSFORM = None
 OBJ_RES = 8  # control points per grain per direction in the fit objective
-MORPHO_STOP = "val<1e-6||iter>=20000||time>=3600"
+
+# Stopping criterion for the tessellation fit. Neper's tesr objective is
+# `avdiameq * rms(distance)` in the tesr's absolute length unit, so `val` and
+# `eps` are dimensional: with the map in microns the initial value is O(10-100)
+# and the default `eps<1e-6||val<1e-12` drives a real optimization. Do not put
+# `val<1e-6` back in: for the earlier metre-scale tesr the initial objective was
+# ~1e-10, the criterion was met before the first iteration, and the "fit" that
+# came out was the initial Laguerre guess (seeds at centroids, weights radeq),
+# which is what the network-through-the-grains picture was. `reps` would be
+# the scale-free alternative if the unit ever changes again.
+MORPHO_STOP = "eps<1e-6||val<1e-12||iter>=20000||time>=3600"
+
+# Metres per tesr length unit. ctf_to_tesr.py keeps the .ctf's microns so that
+# Neper's fit tolerances and Gmsh's absolute geometric tolerances are exercised
+# at O(1-100) rather than O(1e-6). Everything Neper writes -- the mesh, the
+# raster extent and the edge lengths/positions in .stedge -- is converted here,
+# once, so the transport parameters below stay in SI.
+TESR_UNIT = 1e-6
 
 # --- transport ---------------------------------------------------------------
 # CHECK these against the domain size printed at startup. They are written for a
-# specimen tens of microns across with metres as the length unit; if the tesr
-# pixel size is in microns, all four need rescaling together.
+# specimen tens of microns across with metres as the length unit. The mesh and
+# the tessellation statistics are converted from the tesr's microns to metres
+# by TESR_UNIT above, so these stay in SI regardless of the tesr's unit.
 D_B = 1e-16  # lattice diffusivity              [m^2/s]
 D_GB = 1e-12  # grain-boundary diffusivity       [m^2/s]
 DELTA = 5e-10  # grain-boundary width             [m]
@@ -268,7 +286,7 @@ def domain_extent(base):
     their lengths from here.
     """
     cols = np.loadtxt(str(base) + ".sttesr", ndmin=2)[0]
-    return float(cols[1]), float(cols[2])
+    return float(cols[1]) * TESR_UNIT, float(cols[2]) * TESR_UNIT
 
 
 class StatFile:
@@ -311,6 +329,10 @@ class Microstructure:
     def __init__(self, base):
         self.edges = StatFile(str(base) + ".stedge", EDGE_KEYS)
         self.vertices = StatFile(str(base) + ".stver", VER_KEYS)
+        # Neper reports lengths and coordinates in the tesr's unit (microns);
+        # theta, domtype, domedge and edgenb are unit-free
+        for key in ("length", "ymin", "ymax"):
+            self.edges.values[key] = self.edges.values[key] * TESR_UNIT
         self._check_interior_conventions()
 
     # In 2D the domain boundary is made of edges, so a tessellation edge is a
@@ -464,6 +486,9 @@ def read_mesh(base, comm=MPI.COMM_WORLD, rank=0):
             "no facet tags were read: the 1D element sets did not survive the "
             "msh4 round trip. Check that -dim all reached neper -M."
         )
+    # Neper meshed in the tesr's unit; put the geometry in metres before any
+    # locator, submesh or dof coordinate is derived from it
+    mesh.geometry.x[:] *= TESR_UNIT
     return mesh, cell_tags, facet_tags
 
 
