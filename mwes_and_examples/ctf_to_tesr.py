@@ -321,6 +321,46 @@ def build_grid(ctf, phase, max_mad, require_zero_error, min_bands):
     return qgrid, ok
 
 
+def crop_grid(qgrid, ok, spec, xstep, ystep):
+    """Cut a rectangular window out of the map, before segmentation.
+
+    Cropping here rather than in Neper matters for two reasons.
+
+    First, sliver cells. `neper -T -transform crop(...)` clips whatever grains
+    straddle the window, leaving cells one or two voxels wide that no
+    `--min-pixels` prune ever saw, because the prune ran on the uncropped map.
+    Those degenerate cells are what make `-n from_morpho` abort partway through
+    "Listing cell voxels". Cropping first means the segmentation, the prune and
+    the cell ids all describe the same region, and a clipped grain is either big
+    enough to keep or dropped like any other.
+
+    Second, per-voxel orientations. Neper 5.0.0 writes a raster it cannot read
+    back when the file carries a `**oridata` section and has been through
+    crop/autocrop. Cropping upstream keeps the file small enough to leave the
+    orientations in, so -V colouring and -S intragranular measures still work.
+
+    Bounds are in the .ctf's own length units (microns for a Channel file) and
+    refer to the map as acquired, i.e. before any --flip-y.
+    """
+    try:
+        x0, x1, y0, y1 = (float(v) for v in spec.split(","))
+    except ValueError:
+        raise SystemExit(
+            f"--crop {spec!r}: expected four comma-separated numbers, "
+            "xmin,xmax,ymin,ymax, in the same units as XStep"
+        )
+    ny, nx = ok.shape
+    ix0, ix1 = max(int(round(x0 / xstep)), 0), min(int(round(x1 / xstep)), nx)
+    iy0, iy1 = max(int(round(y0 / ystep)), 0), min(int(round(y1 / ystep)), ny)
+    if ix1 - ix0 < 2 or iy1 - iy0 < 2:
+        raise SystemExit(
+            f"--crop {spec} keeps {max(ix1 - ix0, 0)} x {max(iy1 - iy0, 0)} "
+            f"pixels. The map is {nx} x {ny} pixels of {xstep} x {ystep}, "
+            f"i.e. {nx * xstep:g} x {ny * ystep:g} in those units."
+        )
+    return qgrid[iy0:iy1, ix0:ix1], ok[iy0:iy1, ix0:ix1]
+
+
 def segment_grains(qgrid, ok, threshold, sym):
     """Flood-fill across neighbours whose disorientation is below `threshold`.
 
@@ -363,6 +403,35 @@ def segment_grains(qgrid, ok, threshold, sym):
     labels = labels.reshape(ny, nx)
     labels[~ok] = -1
     return labels
+
+
+def fill_holes(cellids):
+    """Assign every empty voxel to its nearest cell.
+
+    Rejected points and pruned grains leave holes in `**data`, and a hole is an
+    interior surface as far as the fit's `pts(region=surf)` control points are
+    concerned -- so a map that is half holes has the objective function chasing
+    the boundaries of the noise rather than the boundaries of the grains.
+
+    Neper's own `grow` transform does this, but reaching it means putting the
+    file back through `neper -T -transform`, which is the write path that
+    produces an unreadable raster when the file carries `**oridata` (Neper
+    5.0.0). Doing it here keeps the orientations and avoids that entirely.
+
+    `**oridef` is deliberately left alone: it still records which points were
+    actually indexed, so the provenance of a filled voxel is not lost.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    empty = cellids == 0
+    n = int(empty.sum())
+    if n == 0 or n == empty.size:
+        return cellids, n
+    # distance_transform_edt measures distance to the nearest zero element, so
+    # feeding it the empty mask returns, for each empty voxel, the index of the
+    # nearest non-empty one
+    _, idx = distance_transform_edt(empty, return_indices=True)
+    return cellids[tuple(idx)], n
 
 
 def relabel_and_prune(labels, ok, min_pixels):
@@ -517,6 +586,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("ctf", help="input Channel Text File")
     p.add_argument("-o", "--output", default=None, help="output .tesr")
+    p.add_argument(
+        "--crop",
+        default=None,
+        help="xmin,xmax,ymin,ymax in the .ctf's own units (microns), applied "
+        "before segmentation. Prefer this to Neper's -transform crop: cropping "
+        "afterwards clips grains into 1-2 pixel slivers that no --min-pixels "
+        "prune has seen, and those degenerate cells abort the tessellation fit",
+    )
     p.add_argument("--phase", type=int, default=1, help="phase to keep (default 1)")
     p.add_argument(
         "--threshold",
@@ -559,6 +636,13 @@ def main(argv=None):
         help="write orientations under the active convention instead of passive",
     )
     p.add_argument(
+        "--no-fill",
+        action="store_true",
+        help="leave unassigned voxels empty instead of growing the cells into "
+        "them. Holes act as interior surfaces in the tessellation fit, so this "
+        "is only useful for inspecting how much of the map was rejected",
+    )
+    p.add_argument(
         "--no-voxel-ori",
         action="store_true",
         help="omit **oridata/**oridef. Much smaller file; keeps the grain "
@@ -593,6 +677,12 @@ def main(argv=None):
     qgrid, ok = build_grid(
         ctf, args.phase, args.max_mad, not args.allow_error, args.min_bands
     )
+    if args.crop:
+        qgrid, ok = crop_grid(
+            qgrid, ok, args.crop, ctf.header["XStep"], ctf.header["YStep"]
+        )
+        ny, nx = ok.shape
+        print(f"  cropped to {nx} x {ny} pixels ({args.crop})")
     frac = ok.mean()
     print(
         f"  indexed and above quality cutoffs: {ok.sum()} of {ok.size} ({100 * frac:.1f} %)"
@@ -611,6 +701,34 @@ def main(argv=None):
     )
     if ncells == 0:
         raise SystemExit("no grains survived; lower --min-pixels or --threshold")
+
+    # Degenerate cells are what abort `neper -T -n from_morpho` partway through
+    # "Listing cell voxels", and the objective function cannot place
+    # pts(res=N) control points on a cell two pixels across either. Report the
+    # bottom of the distribution so the failure is visible here, not there.
+    empty_before = int((cellids == 0).sum())
+    print(
+        f"  unassigned voxels: {empty_before} of {cellids.size} "
+        f"({100 * empty_before / cellids.size:.1f} %)"
+    )
+    if not args.no_fill:
+        cellids, filled = fill_holes(cellids)
+        print(f"  filled {filled} voxels from the nearest cell")
+    elif empty_before > 0.05 * cellids.size:
+        print(
+            "  WARNING: the raster has substantial holes and --no-fill was "
+            "given. The tessellation fit will treat hole boundaries as grain "
+            "boundaries"
+        )
+
+    counts = np.bincount(cellids.ravel())[1:]
+    print(f"  smallest grains (px): {', '.join(str(c) for c in np.sort(counts)[:8])}")
+    if counts.min() < 10:
+        print(
+            f"  WARNING: {int((counts < 10).sum())} grains under 10 px. Neper's "
+            "tessellation fit is liable to abort on these -- raise "
+            "--min-pixels (20 is a reasonable floor)"
+        )
 
     qfz = to_fundamental_zone(qgrid.reshape(-1, 4), sym).reshape(ny, nx, 4)
     ori_cell = quat_to_rodrigues(grain_mean_orientations(qgrid, cellids, ncells, sym))
@@ -632,7 +750,7 @@ def main(argv=None):
     write_tesr(out, cellids, ori_cell, ori_vox, ok, vox, crysym)
 
     lx, ly = nx * vox[0], ny * vox[1]
-    mean_px = np.bincount(cellids.ravel())[1:].mean()
+    mean_px = counts.mean()
     grain_size = np.sqrt(mean_px) * vox[0]
     print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
     print(f"  domain      : {lx:.4g} x {ly:.4g}")

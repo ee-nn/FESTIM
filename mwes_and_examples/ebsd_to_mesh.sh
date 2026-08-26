@@ -45,9 +45,10 @@ set -euo pipefail
 : "${CRYSYM:=cubic}"
 : "${ORIDES:=rodrigues:passive}"      # must match how the tesr stores them
 
-# raster cleanup, applied before anything else
-: "${TESR_CROP:=}"                    # e.g. square(0,60e-6,0,60e-6)
-: "${RMSAT:=1}"
+# Optional Neper transformation chain applied to the input raster. Empty by
+# default: the converter is expected to have done the cropping and cleanup, and
+# skipping this avoids Neper's tesr write path (see stage 0).
+: "${TESR_TRANSFORM:=}"
 
 # tessellation fitting
 : "${OBJ_RES:=8}"                     # control points per grain per direction
@@ -75,21 +76,33 @@ need() {  # need <output> -> 0 if the stage must run
 }
 
 # -----------------------------------------------------------------------------
-# 0. Clean the raster.
+# 0. Stage the raster.
 #
-# autocrop trims the empty surround, resetorigin puts the corner at (0,0) so the
-# fitted domain can be a plain square(Lx,Ly), renumber/resetcellid make the cell
-# ids contiguous from 1 (which -n from_morpho and the orientation file both
-# assume), rmsat drops pixel islands disconnected from their grain -- which on
-# real EBSD data is mostly mis-indexed points inside a grain.
+# By default nothing is done to it: ctf_to_tesr.py already crops, fills holes,
+# and writes cell ids contiguously from 1 with the origin at (0,0), and its
+# grains are connected components so `rmsat` has nothing to remove. Copying
+# rather than passing the file through `neper -T -transform` is deliberate --
+# Neper 5.0.0 writes a raster tessellation it cannot read back when the file
+# carries a `**oridata` section, so any transform here yields a poly-raw.tesr
+# that stalls forever on the next parse.
+#
+# Set TESR_TRANSFORM to a Neper transformation chain if the input needs work
+# that the converter did not do, e.g.
+#   TESR_TRANSFORM="crop(square(...)),rmsat,autocrop,resetorigin,renumber,resetcellid"
+# and expect to need --no-voxel-ori on the converter for the reason above.
 # -----------------------------------------------------------------------------
-TRANSFORM=""
-[ -n "$TESR_CROP" ] && TRANSFORM="crop($TESR_CROP),"
-[ "$RMSAT" = "1" ] && TRANSFORM="${TRANSFORM}rmsat,"
-TRANSFORM="${TRANSFORM}autocrop,resetorigin,renumber,resetcellid"
-
 if need "${STEM}-raw.tesr"; then
-    "$NEPER_BIN" -T -loadtesr "$TESR" -transform "$TRANSFORM" -o "${STEM}-raw"
+    if [ -n "$TESR_TRANSFORM" ]; then
+        echo "  transforming: $TESR_TRANSFORM"
+        "$NEPER_BIN" -T -loadtesr "$TESR" -transform "$TESR_TRANSFORM" -o "${STEM}-raw"
+        if grep -q '^ \*\*oridata' "${STEM}-raw.tesr" 2>/dev/null; then
+            echo "  WARNING: ${STEM}-raw.tesr was written by neper -T and contains" >&2
+            echo "  **oridata. Neper 5.0.0 may not be able to read it back; if the" >&2
+            echo "  next command stalls, regenerate the input with --no-voxel-ori." >&2
+        fi
+    else
+        cp "$TESR" "${STEM}-raw.tesr"
+    fi
 fi
 
 # Geometry of the cleaned raster, one line, columns in the order given.

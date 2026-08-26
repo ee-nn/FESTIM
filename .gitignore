@@ -117,6 +117,8 @@ venv.bak/
 *.png
 *.mp4
 *.msh
+
+# Neper input/output files
 *.msh4
 *.geo
 *.stedge
@@ -126,6 +128,10 @@ venv.bak/
 *.ctf
 *.tesr
 *.vtk
+*.sttesr
+*.stcell
+*.stmesh
+*.logval
 
 # Docs files
 docs/source/_build/

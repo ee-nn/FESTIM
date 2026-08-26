@@ -58,7 +58,7 @@ import festim as F
 # read .ang/.ctf/.h5 -- see https://neper.info/doc/tutorials/ebsd_process.html
 # for the sections a tesr needs (**general, **cell, **data, **oridata). A single
 # map is exactly the right input here; no serial sectioning required.
-TESR = "ebsd.tesr"
+TESR = "ebsd-centre.tesr"
 
 CRYSYM = "cubic"
 ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
@@ -67,7 +67,11 @@ ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 # cheap by 3D standards -- three optimization degrees of freedom per grain
 # rather than four, and polygons rather than polyhedra -- but the cost is still
 # superlinear, so a few hundred grains is a comfortable working size.
-TESR_CROP = "square(0,0.000159,0,0.000159)"  # e.g. "square(0,60e-6,0,60e-6)"
+# Optional Neper transformation chain for the raster. Leave as None: cropping
+# and hole-filling are done by ctf_to_tesr.py, and skipping the Neper pass
+# avoids its tesr write path, which produces an unreadable file when the input
+# carries **oridata (Neper 5.0.0).
+TESR_TRANSFORM = None
 OBJ_RES = 8  # control points per grain per direction in the fit objective
 MORPHO_STOP = "val<1e-6||iter>=20000||time>=3600"
 
@@ -181,7 +185,7 @@ def run_interruptible(cmd, cwd=None, env=None):
         raise subprocess.CalledProcessError(code, cmd)
 
 
-def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=False):
+def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
     """Fit and mesh the EBSD map. Returns the base path (no extension).
 
     All the Neper invocations live in ebsd_to_mesh.sh; this only marshals the
@@ -243,8 +247,8 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=False):
             "PL": str(PL),
         }
     )
-    if TESR_CROP:
-        env["TESR_CROP"] = TESR_CROP
+    if TESR_TRANSFORM:
+        env["TESR_TRANSFORM"] = TESR_TRANSFORM
     if RCL_VER is not None:
         env["RCL_VER"] = str(RCL_VER)
     if MESH_QUAL_MIN:
