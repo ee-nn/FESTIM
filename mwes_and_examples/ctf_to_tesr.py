@@ -609,8 +609,13 @@ def ipf_z_colours(q):
     which is what makes them comparable.
     """
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    # third column of the rotation matrix = image of e_z
-    d = np.stack((2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)), 1)
+    # The sample Z axis in crystal coordinates is g e_z with g the Bunge
+    # sample->crystal matrix. For this quaternion convention the standard
+    # quaternion->matrix formula gives R(q) = g^T (self_test checks it), so the
+    # vector wanted is the third *row* of R(q). The third column would be the
+    # crystal [001] axis in sample coordinates -- a valid colouring, but not
+    # an IPF-Z, and not what neper -V's ipf scheme shows.
+    d = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), 1)
     d = np.sort(np.abs(d), axis=1)  # k <= h <= l
     k, h, l = d[:, 0], d[:, 1], d[:, 2]
     rgb = np.stack((l - h, h - k, k), 1)
@@ -933,6 +938,13 @@ def self_test():
     # the reason not to compare disorientations to exact zero anywhere.
     q90 = np.array([[np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)]])
     assert cubic_disorientation_angle(q90)[0] < 1e-4
+    # R(q) = g^T for Bunge (0, 30, 0): the IPF-Z direction is the third row
+    w, x, y, z = q[0]
+    third_row = np.array(
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]
+    )
+    assert np.allclose(third_row, [0.0, np.sin(np.radians(30)), np.cos(np.radians(30))])
+
     # 60 degrees about <111> is the Sigma-3 twin -> disorientation 60
     v = np.sin(np.pi / 6) / np.sqrt(3)
     q60 = np.array([[np.cos(np.pi / 6), v, v, v]])
