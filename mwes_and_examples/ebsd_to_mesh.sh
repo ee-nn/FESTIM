@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # =============================================================================
 # A single EBSD map -> triangular mesh conforming to the raster's own grain
 # boundaries, for the FESTIM codim-1 grain-boundary transport script.
@@ -91,10 +90,7 @@ done
 # meshing. Only -rcl acts on a raster input: in nem_meshing_para_cl1.c the
 # tesr branch derives the edge and vertex characteristic lengths from the face
 # value and never consults -rcledge / -rclver, and the 1D element count is
-# unchanged by them (804 segments on the D5 crop with or without -rcledge 0.2).
-# The rcl -> cl conversion also differs from the tess path: rcl 0.8 gave
-# cl = 1.045 um on the fitted tess and cl = 4.044 um here, so the default is
-# lowered to keep the element size near what the fitted mesh had.
+# unchanged by them
 : "${RCL:=0.25}"
 : "${MESH_QUAL_MIN:=0.7}"
 : "${MESH_MAX_TIME:=}"
@@ -114,16 +110,11 @@ need() {  # need <output> -> 0 if the stage must run
 #
 # By default nothing is done to it: ctf_to_tesr.py already crops, fills holes,
 # and writes cell ids contiguously from 1 with the origin at (0,0), and its
-# grains are connected components so `rmsat` has nothing to remove. Copying
-# rather than passing the file through `neper -T -transform` is deliberate --
-# Neper 5.0.0 writes a raster tessellation it cannot read back when the file
-# carries a `**oridata` section, so any transform here yields a poly-raw.tesr
-# that stalls forever on the next parse.
-#
-# Set TESR_TRANSFORM to a Neper transformation chain if the input needs work
+# grains are connected components so `rmsat` has nothing to remove. 
+#Set TESR_TRANSFORM to a Neper transformation chain if the input needs work
 # that the converter did not do, e.g.
 #   TESR_TRANSFORM="crop(square(...)),rmsat,autocrop,resetorigin,renumber,resetcellid"
-# and expect to need --no-voxel-ori on the converter for the reason above.
+# and expect to need --no-voxel-ori due to the readback bug in Neper 5.0.0.
 # -----------------------------------------------------------------------------
 if need "${STEM}-raw.tesr"; then
     if [ -n "$TESR_TRANSFORM" ]; then
@@ -140,9 +131,8 @@ if need "${STEM}-raw.tesr"; then
 fi
 
 # Geometry of the cleaned raster, one line, columns in the order given.
-# `rastersize*` is voxnb* x voxsize*, i.e. the physical extent. There is no
-# cell-count key for a tesr, so the grain count is the line count of the
-# orientation file below.
+# `rastersize*` is voxnb* x voxsize*, i.e. the physical extent. 
+# Grain count = line count of the orientation file below.
 "$NEPER_BIN" -T -loadtesr "${STEM}-raw.tesr" \
     -stattesr dim,rastersizex,rastersizey,voxsizex,voxsizey \
     -o "${STEM}"
@@ -178,9 +168,7 @@ echo "  grains: $NCELL"
 # 0b. Check images. Look at these before trusting anything downstream: an
 #     inverted orientation convention shows up as IPF colours that disagree
 #     with AZtec/MTEX, and a bad segmentation shows up as speckle or as grains
-#     that are obviously back-filled. neper -V renders through POV-Ray
-#     (POVRAY_BIN, else `povray` on PATH); the conda neper package does not
-#     pull it in, so a missing renderer only costs the pictures.
+#     that are obviously back-filled. 
 # -----------------------------------------------------------------------------
 if [ "$CHECK_IMAGES" = "1" ]; then
     for img in check-ori check-grains; do
@@ -206,8 +194,8 @@ fi
 # -----------------------------------------------------------------------------
 # 1. Mesh the raster. Linear triangles, Gmsh v4, all dimensions, because the
 #    FESTIM side reads it with dolfinx.io.gmshio and needs the 1D element sets
-#    intact -- they carry the edge ids of the reconstructed boundary topology,
-#    and those ids are what select the network and index theta.
+#    intact (they carry the edge ids of the reconstructed boundary topology,
+#    which select the network and index theta).
 #
 #    Neper reconstructs the interfaces, smooths them, then meshes the edges
 #    and faces with the -rcl-derived length. -tmp must exist beforehand.
@@ -251,8 +239,6 @@ rmdir tmp 2>/dev/null || echo "  note: $WORKDIR/tmp is not empty (stale gmsh scr
 echo "ok: ${STEM}.msh4  (${NCELL} grains, domain ${LX} x ${LY})"
 
 # -----------------------------------------------------------------------------
-# What 2D costs, so it is a choice rather than an accident
-#
 # The misorientations are exact: they come from the two grain orientations, and
 # a section measures those as well as a volume does. What a section cannot see
 # is the boundary plane normal (only its trace) and the out-of-plane paths.

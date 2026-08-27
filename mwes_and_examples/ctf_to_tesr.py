@@ -1,10 +1,7 @@
 """Convert an Oxford/Channel .ctf EBSD map into a Neper Raster Tessellation
 File (.tesr), including the grain segmentation that a .ctf does not contain.
 
-Neper cannot read .ctf, .ang or .h5. The entry point is a .tesr, and there is no
-official converter -- the documented workflow is simply "write the EBSD data as
-a tesr file", after which -V, -T and -M all work on it. This script is that
-step, for the Channel Text File format.
+There is no official converter, one simply needs to do this by hand.
 
 The part that is not a transcription is the segmentation. A .ctf holds an
 orientation per pixel and nothing else; `neper -T -morpho tesr` fits its cells
@@ -12,6 +9,8 @@ to the *cells* of the raster, so the file needs a `**cell` section and a
 `**data` section assigning every pixel to a grain. Grains are found here by
 flood-filling across neighbouring pixels whose disorientation is below a
 threshold, with cubic crystal symmetry taken into account.
+
+Example usage:
 
     python ctf_to_tesr.py map.ctf -o ebsd.tesr
 
@@ -30,13 +29,7 @@ What is written
 Length unit
 -----------
 The tesr is written in the .ctf's own unit (microns) unless --scale is given.
-This is deliberate: Neper's tesr-fitting objective is `avdiameq * rms(dist)` in
-the tesr's absolute length unit (net_tess_opt_comp_objective_fval_tesr2.c), so
-its `val` and `eps` stopping criteria are not dimensionless. In metres the
-initial objective of a ~100 um map is ~1e-10 and any `val<1e-6` or `eps<1e-6`
-criterion is met before the first iteration, i.e. the "fit" returned is the
-initial Laguerre guess. Gmsh's absolute geometric tolerances are also marginal
-for 1e-6-sized elements. The transport driver converts to metres after reading
+The transport driver converts to metres after reading
 the mesh (TESR_UNIT in ebsd_gb_diffusion.py).
 
 Orientation convention
@@ -51,8 +44,7 @@ file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
 taken literally, leaving the two sections in opposite conventions. The
 conversion is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
-(0.965925826, 0.258819045, 0, 0); see the self-test at the bottom, which runs
-on every invocation.
+(0.965925826, 0.258819045, 0, 0); see the self-test at the bottom.
 
 Rodrigues is used rather than passing the Euler angles through unchanged
 because it removes any degrees-versus-radians ambiguity in the tesr reader.
@@ -71,8 +63,7 @@ wrong in a way that looks like an inversion, re-run with --active.
 Limitations
 -----------
 * Cubic symmetry only. The disorientation uses a closed form specific to the
-  cubic group; for hexagonal or lower, segment in MTEX and write the grain ids
-  out instead.
+  cubic group. For hex or lower, segment in MTEX and write out grain ids instead.
 * Square grids only, which is what JobMode Grid with XStep == YStep gives. A
   hexagonal acquisition must be resampled first (MTEX's `gridify`).
 """
@@ -90,13 +81,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
-
-try:
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
-except ImportError:  # pragma: no cover
-    sys.exit("this script needs scipy (conda install scipy)")
-
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 # --- Channel conventions -----------------------------------------------------
 # Field 4 of a .ctf phase line is the Channel Laue group index. Mapped onto the
@@ -197,10 +183,7 @@ def crystal_equivalents(q, sym):
     the left, S * q, would instead rotate the sample frame and yield a
     physically different orientation. Checked against Neper: for a cell pair
     (q, q*S) `-statedge theta` under -crysym cubic is 0; for (q, S*q) it is
-    17 degrees. The same fact is what makes `qconj(a) * b` in
-    segment_grains the right misorientation product: symmetry-equivalents of
-    a and b move to the outside of it, (a S2)^-1 (b S1) = S2^-1 (a^-1 b) S1,
-    which is where cubic_disorientation_angle minimises over them.
+    17 degrees.
     """
     return qmul(q[:, None, :], sym[None, :, :])
 
@@ -373,23 +356,18 @@ def build_grid(ctf, phase, max_mad, require_zero_error, min_bands):
 def crop_grid(qgrid, ok, spec, xstep, ystep):
     """Cut a rectangular window out of the map, before segmentation.
 
-    Cropping here rather than in Neper matters for two reasons.
+    Cropping here rather than in Neper matters for two reasons:
+     1. The segmentation, the prune and the cell ids all describe
+        the same region, and a clipped grain is either big enough
+        to keep or dropped like any other.
 
-    First, sliver cells. `neper -T -transform crop(...)` clips whatever grains
-    straddle the window, leaving cells one or two voxels wide that no
-    `--min-pixels` prune ever saw, because the prune ran on the uncropped map.
-    Those degenerate cells are what make `-n from_morpho` abort partway through
-    "Listing cell voxels". Cropping first means the segmentation, the prune and
-    the cell ids all describe the same region, and a clipped grain is either big
-    enough to keep or dropped like any other.
+     2. Per-voxel orientations. Possible bug is that Neper 5.0.0 cannot read
+        back a raster when the file carries a `**oridata` section and has
+        been through (auto)crop. Cropping upstream keeps the file small enough
+        to keep orientations, so -V colouring & -S intragranular measures still work.
 
-    Second, per-voxel orientations. Neper 5.0.0 writes a raster it cannot read
-    back when the file carries a `**oridata` section and has been through
-    crop/autocrop. Cropping upstream keeps the file small enough to leave the
-    orientations in, so -V colouring and -S intragranular measures still work.
-
-    Bounds are in the .ctf's own length units (microns for a Channel file) and
-    refer to the map as acquired, i.e. before any --flip-y.
+    Bounds are in the .ctf's own 'as- acquired' length units,
+    i.e. before any --flip-y.
     """
     try:
         x0, x1, y0, y1 = (float(v) for v in spec.split(","))
@@ -801,11 +779,9 @@ def write_quality_png(
     Neper paints a voxel grey when `**oridef` is 0, and this script writes
     `**oridef` from the quality mask `ok` -- so a grey pixel is a point the
     .ctf's own columns failed: Error != 0 (unless --allow-error), MAD above
-    --max-mad, Bands below --min-bands, or the wrong phase. No orientation is
-    dropped in conversion: `**oridata` still carries the point's Euler angles
-    (Neper requires a placeholder anyway). The panels show, in order, the
-    Error column, the MAD column, the rejection reason, and which pixels of
-    the final cell map were back-filled from the nearest surviving cell
+    --max-mad, Bands below --min-bands, or the wrong phase. The panels show:
+    Error column, MAD column, rejection reason, and which pixels of the
+    final cell map were back-filled from the nearest surviving cell
     because they were rejected or belonged to a pruned grain.
     """
 
