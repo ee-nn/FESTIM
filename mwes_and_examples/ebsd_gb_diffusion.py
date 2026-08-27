@@ -37,17 +37,25 @@ from mpi4py import MPI
 
 import dolfinx
 import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import ufl
 from dolfinx.io import gmsh as gmshio
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from mesh_overlay import draw_raster, read_tesr
 from micrograph import scale_bar_ax
 
 import festim as F
+
+plt.rcParams.update(
+    {
+        "font.size": 16,  # Baseline text, labels, ticks, and legends
+        "axes.titlesize": 16,  # Subplot titles
+        "figure.titlesize": 16,  # Global figure super title
+    }
+)
 
 # --- input map ---------------------------------------------------------------
 # The .tesr is the EBSD map written as a raster tessellation. Neper does not
@@ -73,7 +81,7 @@ UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr 
 # --- transport ---------------------------------------------------------------
 D_B = 1e-14  # lattice diffusivity              [m^2/s]
 D_GB = 1e-8  # GB diffusivity       [m^2/s]
-DELTA = 5e-10  # GB width             [m]
+DELTA = 5e-9  # GB width             [m]
 K_EX = 1e-4  # bulk <-> GB exchange  [m/s]
 C0 = 1.0  # surface concentration
 

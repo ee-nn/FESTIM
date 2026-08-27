@@ -54,17 +54,6 @@ def trim(img, tol=6, margin=0):
     return img.crop((x0, y0, x1, y1))
 
 
-def _font(size):
-    from PIL import ImageFont
-
-    try:
-        from matplotlib import font_manager
-
-        return ImageFont.truetype(font_manager.findfont("DejaVu Sans"), size)
-    except Exception:
-        return ImageFont.load_default()
-
-
 def scale_bar_image(img, width_units, unit="um", length=None, inset=0.03):
     """Draw a scale bar (white on a translucent dark box) in the lower right."""
     from PIL import Image, ImageDraw
@@ -73,10 +62,10 @@ def scale_bar_image(img, width_units, unit="um", length=None, inset=0.03):
     w, h = img.size
     px_per_unit = w / width_units
     length = nice_length(width_units) if length is None else length
-    bar_px = int(round(length * px_per_unit))
-    thick = max(int(round(0.012 * h)), 3)
-    pad = max(int(round(inset * w)), 6)
-    font = _font(max(int(round(0.04 * h)), 10))
+    bar_px = round(length * px_per_unit)
+    thick = max(round(0.012 * h), 3)
+    pad = max(round(inset * w), 6)
+    font = 16
     label = format_length(length, unit)
 
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -111,7 +100,7 @@ def scale_bar_ax(ax, width_units, unit="um", length=None, color="white"):
         color=color,
         frameon=True,
         size_vertical=0.012 * width_units,
-        fontproperties={"size": 10},
+        fontproperties={"size": 16},
     )
     bar.patch.set_facecolor("black")
     bar.patch.set_alpha(0.45)

@@ -84,6 +84,14 @@ from matplotlib.patches import Rectangle
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+plt.rcParams.update(
+    {
+        "font.size": 16,  # Baseline text, labels, ticks, and legends
+        "axes.titlesize": 16,  # Subplot titles
+        "figure.titlesize": 16,  # Global figure super title
+    }
+)
+
 # --- Channel conventions -----------------------------------------------------
 # Field 4 of a .ctf phase line is the Channel Laue group index. Mapped onto the
 # crystal symmetry keys Neper accepts (https://neper.info/doc/exprskeys.html).
@@ -767,8 +775,8 @@ def ipf_legend_ax(ax, n=500):
     d = np.stack((2 * gx, 2 * gy, 1 - r2), -1) / (1 + r2)[..., None]
     inside = (d[..., 1] <= d[..., 0] + 1e-9) & (d[..., 0] <= d[..., 2] + 1e-9)
 
-    rgba = np.ones(gx.shape + (4,))
-    rgba[..., :3] = _ipf_triangle_rgb(d.reshape(-1, 3)).reshape(gx.shape + (3,))
+    rgba = np.ones((*gx.shape, 4))
+    rgba[..., :3] = _ipf_triangle_rgb(d.reshape(-1, 3)).reshape((*gx.shape, 3))
     rgba[..., 3] = inside
     ax.imshow(
         rgba,
@@ -795,7 +803,7 @@ def ipf_legend_ax(ax, n=500):
             xytext=(0, -6 if va == "top" else 6),
             ha=ha,
             va=va,
-            fontsize=9,
+            fontsize=14,
         )
     ax.set_aspect("equal")
     ax.set_xlim(-0.03, xmax + 0.03)
@@ -920,8 +928,7 @@ def write_raw_png(
         )
     )
     ax.set_title(
-        f"whole .ctf: {NX} x {NY} px, {ctf.npoints} rows read of {NX * NY}\n"
-        f"grey = rejected ({100 * (~ok_full).mean():.1f} %), box = window"
+        f"whole .ctf: {NX} x {NY} px \ngrey = rejected ({100 * (~ok_full).mean():.1f}%)"
     )
     _scale_bar(ax, NX * xs, unit)
 
@@ -941,7 +948,7 @@ def write_raw_png(
         ax.set_yticks([])
 
     ipf_legend_ax(axes[2])
-    axes[2].set_title("IPF-Z key", fontsize=10)
+    axes[2].set_title("IPF-Z key", fontsize=16)
 
     fig.savefig(path, dpi=150)
     plt.close(fig)
