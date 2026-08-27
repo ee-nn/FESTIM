@@ -51,9 +51,16 @@ from pathlib import Path
 from mpi4py import MPI
 
 import dolfinx
+import matplotlib
 import numpy as np
 import ufl
 from dolfinx.io import gmsh as gmshio
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from mesh_overlay import draw_raster, read_tesr
+from micrograph import scale_bar_ax
 
 import festim as F
 
@@ -63,15 +70,8 @@ import festim as F
 # for the sections a tesr needs (**general, **cell, **data, **oridata). A single
 # map is exactly the right input here; no serial sectioning required.
 TESR = "ebsd-centre.tesr"
-
 CRYSYM = "cubic"
 ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
-
-# Optional Neper transformation chain for the raster. Leave as None: cropping
-# and hole-filling are done by ctf_to_tesr.py, and skipping the Neper pass
-# avoids its tesr write path, which produces an unreadable file when the input
-# carries **oridata (Neper 5.0.0).
-TESR_TRANSFORM = None
 
 # Interface smoothing applied by neper -M before meshing (Neper's defaults,
 # neper_m.html "Raster Tessellation Meshing Options"). The reconstructed
@@ -88,18 +88,9 @@ TESR_SMOOTH_ITER = 5
 TESR_UNIT = 1e-6
 UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr units")
 
-# Check images. The shell script writes check-ori/check-grains (neper -V) and
-# check-mesh (every reconstructed edge over the raster); with CHECK_PNG the
-# driver adds check-network.png, the same overlay after THETA_MIN: kept edges
-# coloured by theta, dropped ones dashed white, specimen surface grey. Serial
-# only; needs matplotlib in this environment.
-CHECK_PNG = True
-
 # --- transport ---------------------------------------------------------------
 # CHECK these against the domain size printed at startup. They are written for a
-# specimen tens of microns across with metres as the length unit. The mesh and
-# the tessellation statistics are converted from the tesr's microns to metres
-# by TESR_UNIT above, so these stay in SI regardless of the tesr's unit.
+# specimen tens of microns across with metres as the length unit.
 D_B = 1e-16  # lattice diffusivity              [m^2/s]
 D_GB = 1e-12  # grain-boundary diffusivity       [m^2/s]
 DELTA = 5e-10  # grain-boundary width             [m]
@@ -108,37 +99,30 @@ C0 = 1.0  # surface concentration
 
 T_END, DT = 3600.0, 60.0
 
-# Hydrogen is charged on the top edge of the map, y = LY, and diffuses in -y.
-# The in-plane x direction is periodic in nobody's sense here: the left and
-# right edges are simply free surfaces of the section.
-CHARGED_EDGE = "y1"
-
 # Keep only boundaries above this disorientation. 15 deg is the usual high-angle
 # threshold and it is the reason to have gone to EBSD at all -- a synthetic
 # tessellation has no meaningful theta distribution to filter on. Expect it to
-# fragment the network more readily than the same threshold would in 3D;
-# component_count() reports that, and in 2D it is a result rather than a bug.
+# fragment the network more readily than the same threshold would in 3D
 THETA_MIN = 15.0
 THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 
 # --- meshing -----------------------------------------------------------------
-# RCL is the only size control Neper honours for a raster input: the tesr
-# branch of nem_meshing_para_cl1.c derives the edge and vertex lengths from the
-# face value and never reads -rcledge / -rclver, and the 1D element count does
-# not respond to them. Its rcl -> cl conversion also differs from the tess
-# path (rcl 0.8: cl = 1.045 um on the fitted tess, 4.044 um here), hence the
-# lower value; 0.25 gives ~1.3 um elements on the D5 crop.
+# RCL means "relative characteristic length" and is passed to Neper as -rcl.
+# Neper uses it relative to the average raster cell size to choose a target
+# element edge length. Smaller values request a finer mesh (more triangles
+# and more 1D boundary segments); larger values request a coarser mesh. It
+# doesn't change raster geometry r smoothed interfaces. For a raster input
+# RCL is the only size control Neper allows. Its rcl -> cl conversion also
+# differs from the tess path (rcl 0.8: cl = 1.045 um on the fitted tess,
+# 4.044 um here), hence the lower value; 0.25 gives ~1.3 um elements on the D5 crop.
 RCL = 0.25
 
 # Multimeshing retries each face with several algorithms until MESH_QUAL_MIN is
 # reached, so quality target and meshing time trade off directly; 0.9 is Neper's
-# default and 0.7 is reasonable while iterating. MESH_MAX_TIME caps the
-# per-entity budget: the default is 1000 s, long enough for one pathological
-# cell to stall a run without saying so.
+# default and 0.7 is reasonable while iterating.
 MESH_QUAL_MIN = 0.7
-MESH_MAX_TIME = None  # seconds per face; try 30 when diagnosing
+MESH_MAX_TIME = None  # seconds per face; try 30 when diagnosing (default = 1000)
 
-STEM = "poly"
 try:
     _HERE = Path(__file__).resolve().parent
 except NameError:  # interactive session: no __file__
@@ -149,7 +133,7 @@ MESH_SCRIPT = _HERE / "ebsd_to_mesh.sh"
 # Neper is a command-line program, so it does not have to live in the same conda
 # environment as FESTIM -- it only has to be a path. Keeping it in its own
 # environment avoids letting the solver rearrange a working dolfinx install over
-# a dependency (GSL, scotch) that has nothing to do with FESTIM.
+# an irrelevant dependency.
 #
 # GMSH_BIN is the *executable*, which Neper calls for 2D meshing. The
 # conda-forge package providing it is `gmsh`; `python-gmsh` is only the
@@ -158,11 +142,7 @@ NEPER_ENV = "/home/fenna/anaconda3/envs/neper-env/bin"
 NEPER_BIN = os.path.join(NEPER_ENV, "neper")
 GMSH_BIN = os.path.join(NEPER_ENV, "gmsh")
 
-# neper -V renders PNGs through a separate `povray` process that it looks up on
-# PATH unless told otherwise (-povray <binary>, default `povray`), which is why
-# the check images only appeared with neper-env active. Resolve it like gmsh;
-# the shell script also prepends NEPER_ENV to PATH for anything else Neper
-# spawns. If POV-Ray is not in NEPER_ENV, fall back to whatever PATH has.
+# neper -V renders PNGs through a separate `povray` process
 POVRAY_BIN = os.path.join(NEPER_ENV, "povray")
 if not Path(POVRAY_BIN).is_file():
     POVRAY_BIN = "povray"
@@ -201,13 +181,13 @@ def run_interruptible(cmd, cwd=None, env=None):
         raise subprocess.CalledProcessError(code, cmd)
 
 
-def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
+def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
     """Mesh the EBSD map. Returns the base path (no extension).
 
-    All the Neper invocations live in ebsd_to_mesh.sh; this only marshals the
+    All Neper invocations live in ebsd_to_mesh.sh; this only marshals the
     parameters and checks the binaries. Caching is per stage inside the script.
     """
-    base = (Path(workdir) / stem).resolve()
+    base = (Path(workdir) / "poly").resolve()
     base.parent.mkdir(parents=True, exist_ok=True)
     print(f"neper outputs -> {base.parent}")
 
@@ -216,31 +196,26 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
         tesr_path = (_HERE / tesr_path).resolve()
     if not tesr_path.is_file():
         raise FileNotFoundError(
-            f"no EBSD map at {tesr_path}. Neper cannot read .ang/.ctf/.h5 -- "
-            "the map has to be written as a raster tessellation first; see "
-            "https://neper.info/doc/tutorials/ebsd_process.html"
+            f"no EBSD map .tesr file at {tesr_path}. Map must be written as a"
+            + "raster tessellation first."
         )
 
     if shutil.which(NEPER_BIN) is None and not Path(NEPER_BIN).is_file():
         raise FileNotFoundError(
             f"neper not found at {NEPER_BIN!r}. Install it with "
-            "`conda install conda-forge::neper`, ideally into its own "
-            "environment, and set NEPER_BIN to the binary's path."
+            "conda and set NEPER_BIN to the binary's path."
         )
     if shutil.which(GMSH_BIN) is None and not Path(GMSH_BIN).is_file():
         raise FileNotFoundError(
-            f"no gmsh executable at {GMSH_BIN!r}. Neper calls it for 2D "
-            "meshing; the conda-forge package that provides the command is "
-            "`gmsh` (`python-gmsh` is only the bindings)."
+            f"no gmsh executable at {GMSH_BIN!r}. Neper calls it for 2D meshing."
         )
     for p in (GMSH_BIN, NEPER_BIN, str(tesr_path)):
         if any(c.isspace() for c in str(p)):
             raise ValueError(
-                f"the path {str(p)!r} contains whitespace. Neper re-tokenizes "
-                "its arguments -- the input-file argument is a structured field "
-                "supporting comma-separated files and colon-separated "
-                "transformations -- so a path with a space in it arrives as "
-                "several unusable fragments. Move or symlink it."
+                f"the path {str(p)!r} contains whitespace. Neper's input-file"
+                "argument is a structured field supporting .csv files and "
+                "colon-separated transformations, so a path with whitespace"
+                " arrives as several unusable fragments."
             )
 
     env = dict(os.environ)
@@ -255,7 +230,7 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "GMSH_BIN": GMSH_BIN,
             "POVRAY_BIN": POVRAY_BIN,
             "NEPER_ENV": NEPER_ENV,
-            "STEM": stem,
+            "STEM": "poly",
             "WORKDIR": str(base.parent),
             "FORCE": "1" if force else "0",
             "CRYSYM": CRYSYM,
@@ -264,13 +239,11 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
             "TESR_SMOOTH": TESR_SMOOTH,
             "TESR_SMOOTH_FACT": str(TESR_SMOOTH_FACT),
             "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
-            "CHECK_IMAGES": "1" if CHECK_PNG else "0",
+            "CHECK_IMAGES": "1",
             "PYTHON_BIN": sys.executable,
             "UNIT_NAME": UNIT_NAME,
         }
     )
-    if TESR_TRANSFORM:
-        env["TESR_TRANSFORM"] = TESR_TRANSFORM
     if MESH_QUAL_MIN:
         env["MESH_QUAL_MIN"] = str(MESH_QUAL_MIN)
     if MESH_MAX_TIME:
@@ -278,34 +251,6 @@ def run_ebsd_pipeline(tesr=TESR, stem=STEM, workdir=WORKDIR, force=True):
 
     run_interruptible(["bash", str(MESH_SCRIPT)], cwd=str(base.parent), env=env)
     return base
-
-
-def domain_extent(base):
-    """(Lx, Ly) of the meshed domain, from the raster geometry.
-
-    The specimen is not a unit square, so nothing downstream may assume L = 1:
-    the charged edge, the depth scan and the boundary area fraction all read
-    their lengths from here.
-    """
-    cols = np.loadtxt(str(base) + ".sttesr", ndmin=2)[0]
-    return float(cols[1]) * TESR_UNIT, float(cols[2]) * TESR_UNIT
-
-
-def fisher_length(delta, d_gb, d_b, t):
-    """Decay length of the boundary concentration, c_gb ~ exp(-y/L).
-
-    Fisher's quasi-steady model (J. Appl. Phys. 22 (1951) 74): the boundary is
-    in local equilibrium with the adjacent lattice, which drains it at
-    c sqrt(D_b / (pi t)) per unit area on each side, so along the boundary
-    D_gb delta c'' = 2 c sqrt(D_b / (pi t)) and
-
-        L = [ delta D_gb sqrt(pi t) / (2 sqrt(D_b)) ]^(1/2).
-
-    L scales as (delta D_gb)^(1/2) t^(1/4) D_b^(-1/4); shortening the run does
-    not lengthen the tail. Local equilibrium holds whenever K_EX is large
-    against D_b / sqrt(D_b t), which it is by many orders of magnitude here.
-    """
-    return float(np.sqrt(delta * d_gb * np.sqrt(np.pi * t) / (2.0 * np.sqrt(d_b))))
 
 
 def _ids(mask):
@@ -361,8 +306,7 @@ class Microstructure:
 
     The adjacency is gathered across ranks because a facet on a partition
     boundary sees only one of its two cells locally; lengths and extrema are
-    reduced. The junction count is exact in serial and a lower bound in
-    parallel, like component_count().
+    reduced. The junction count is exact in serial and a lower bound in parallel
     """
 
     def __init__(self, base, mesh, cell_tags, facet_tags, extent):
@@ -547,15 +491,6 @@ class Microstructure:
         """
         lx, ly = extent
         grain_size = np.sqrt(lx * ly / max(n_grains, 1))
-        l_f = fisher_length(delta, d_gb, d_b, t_end)
-        if l_f < grain_size:
-            print(
-                f"  WARNING: Fisher tail length L = {l_f:.3g} is shorter than a "
-                f"grain (~{grain_size:.3g}). Past the first grain the network "
-                "carries nothing, the inventory enhancement will be ~1 and the "
-                "junction-transport numbers below will be solver noise. L grows "
-                "as sqrt(delta D_gb) t^1/4 D_b^-1/4, so raise delta*D_gb"
-            )
         if delta > 0.05 * grain_size:
             print(
                 f"  WARNING: delta = {delta:g} is not small against the grain "
@@ -600,17 +535,6 @@ def write_network_png(base, mesh, micro, tesr_path):
     see how far interface smoothing moved the boundaries off the pixels.
     """
     if mesh.comm.size > 1:
-        return
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import LineCollection
-        from mesh_overlay import draw_raster, read_tesr
-        from micrograph import scale_bar_ax
-    except ImportError as exc:
-        print(f"  check-network.png skipped ({exc})")
         return
 
     cells, vox = read_tesr(tesr_path)
@@ -740,14 +664,15 @@ def gb_diffusivity_field(network, micro, d_low, d_high, theta_c=15.0):
 
 # build
 base = run_ebsd_pipeline()
-LX, LY = domain_extent(base)
+cols = np.loadtxt(str(base) + ".sttesr", ndmin=2)[0]
+LX, LY = float(cols[1]) * TESR_UNIT, float(cols[2]) * TESR_UNIT
+
 mesh, cell_tags, facet_tags = read_mesh(base)
 micro = Microstructure(base, mesh, cell_tags, facet_tags, (LX, LY))
 N_GRAINS = micro.check_orientations()
 micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
-if CHECK_PNG:
-    # the staged raster is the one that was meshed, transform or not
-    write_network_png(base, mesh, micro, base.parent / f"{STEM}-raw.tesr")
+
+write_network_png(base, mesh, micro, base.parent / "poly-raw.tesr")
 
 grains = F.VolumeSubdomain(
     id=1,
@@ -762,8 +687,7 @@ network = GrainBoundaryNetwork(
 )
 # the charged surface is the top edge of the map, wherever that now is
 top = F.SurfaceSubdomain(id=3, locator=lambda x: np.isclose(x[1], LY))
-# every point where a grain boundary meets the charged edge, in one object: the
-# locator runs on the network itself, so dim = mesh dimension - 2 = 0
+# every point where a grain boundary meets the charged edge, in one object
 mouths = F.SurfaceSubdomain(id=4, dim=0, locator=lambda x: np.isclose(x[1], LY))
 
 c_b = F.Species("c_b", subdomains=[grains])
@@ -771,10 +695,8 @@ c_gb = F.Species("c_gb", subdomains=[network])
 
 
 def solve(d_gb):
-    """Run the problem, returning the model and the two solutions.
-
-    ``d_gb == D_B`` is the reference case in which the boundaries are not short
-    circuits at all.
+    """
+    Run the problem, returning the model and the solution.
     """
     network.material = F.Material(D_0=d_gb, E_D=0.0)
     fast = d_gb != D_B
@@ -887,14 +809,8 @@ def component_count(subdomain):
 micro.report((LX, LY), N_GRAINS)
 len_mesh, len_tess = submesh_length(network), micro.network_length
 n_comp = component_count(network)
-print(
-    f"  mesh                            : "
-    f"{mesh.topology.index_map(2).size_global} triangles"
-)
-print(
-    f"  network captured by the submesh : {len_mesh:.4g} of {len_tess:.4g}"
-    f" ({100 * len_mesh / len_tess:.2f} %)"
-)
+print(f"mesh : {mesh.topology.index_map(2).size_global} triangles")
+print(f"Fraction of network captured by the submesh: {100 * len_mesh / len_tess:.2f}%")
 if n_comp is not None:
     print(f"  connected components            : {n_comp}")
 print(f"  interior facets                 : {model.manifold_is_interior(network)}")
@@ -915,8 +831,6 @@ def inventory(cb, cgb):
     return mesh.comm.allreduce(total, op=MPI.SUM)
 
 
-fast = inventory(cb_fast, cgb_fast)
-
 # Below this depth no boundary is fed directly from the charged edge, so
 # everything the network holds there has crossed at least one triple junction.
 # This is a property of the tessellation, not of the partitioned mesh, so it is
@@ -927,37 +841,12 @@ gb_y = cgb_fast.function_space.tabulate_dof_coordinates()[:, 1]
 deep = gb_y < junction_only_below
 c_deep = cgb_fast.x.array[deep].max() if deep.any() else 0.0
 
-_, cb_ref, cgb_ref = solve(D_B)
-ref = inventory(cb_ref, cgb_ref)
-
-print(
-    f"\nafter t = {T_END} (lattice diffusion alone reaches "
-    f"~{2 * np.sqrt(D_B * T_END):.3g})"
-)
-print(f"  inventory with fast boundaries : {fast:.4e}")
-print(f"  inventory with D_gb = D_b      : {ref:.4e}")
-print(f"  enhancement                    : x {fast / ref:.1f}")
-
 # For scale only: Hart's effective diffusivity is the upper bound you would get
-# if every boundary ran straight along the gradient. A real network is tortuous
-# and only partly connected to the source, so the observed enhancement is well
-# below it -- and with THETA_MIN filtering, the network carrying the flux is
-# smaller than the total boundary length anyway. In 2D f is a length fraction
+# if every boundary ran straight along the gradient. In 2D f is a length fraction
 # times delta rather than an area fraction times delta.
-f_gb = DELTA * len_tess / (LX * LY)
-print(f"  boundary area fraction f       : {f_gb:.3e}")
-print(
-    f"  Hart bound f D_gb + (1-f) D_b  : {f_gb * D_GB + (1 - f_gb) * D_B:.3e}"
-    f"  (vs D_b = {D_B:.3e})"
-)
-
 beta = DELTA * (D_GB / D_B - 1) / (2 * np.sqrt(D_B * T_END))
 print(f"  type-B parameter beta          : {beta:.0f}  (short circuit needs beta >> 1)")
-l_fisher = fisher_length(DELTA, D_GB, D_B, T_END)
-print(
-    f"  Fisher tail length L           : {l_fisher:.3g}  "
-    f"(grain ~{np.sqrt(LX * LY / N_GRAINS):.3g}; a visible tail needs L >~ grain)"
-)
+print(f"(grain ~{np.sqrt(LX * LY / N_GRAINS):.3g}; a visible tail needs L >~ grain)")
 
 bulk_y = cb_fast.function_space.tabulate_dof_coordinates()[:, 1]
 c_grain_deep = cb_fast.x.array[bulk_y < junction_only_below].mean()
@@ -972,10 +861,7 @@ print(f"  mean c in the grains there     : {c_grain_deep:.4e}")
 if c_grain_deep > 1e-12 * C0:
     print(f"  ratio                          : x {c_deep / c_grain_deep:.0f}")
 else:
-    print(
-        "  ratio                          : n/a -- nothing has reached this "
-        "depth on either path (see the Fisher tail length above)"
-    )
+    print("ratio: n/a - nothing has reached this depth on either path")
 print(
     "\nconnectivity in 2D is not 3D connectivity: percolation thresholds are "
     "far lower in the plane, so read the enhancement as a lower bound unless "

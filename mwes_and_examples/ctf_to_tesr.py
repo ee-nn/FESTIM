@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Convert an Oxford/Channel .ctf EBSD map into a Neper Raster Tessellation
 File (.tesr), including the grain segmentation that a .ctf does not contain.
 
@@ -49,7 +48,8 @@ crystal one. The file is written as tesr format 2.2: Neper 4.10.0 swapped the
 meaning of `active` and `passive` and bumped the tesr version to 2.2, and a
 file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
 (neut_tesr_fscanf2.c, "Fixing orientation convention") while `**oridata` is
-taken literally, leaving the two sections in opposite conventions. The conversion is verified against Neper's own convention table,
+taken literally, leaving the two sections in opposite conventions. The
+conversion is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
 (0.965925826, 0.258819045, 0, 0); see the self-test at the bottom, which runs
 on every invocation.
@@ -83,7 +83,13 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Rectangle
 
 try:
     from scipy.sparse import coo_matrix
@@ -393,8 +399,8 @@ def crop_grid(qgrid, ok, spec, xstep, ystep):
             "xmin,xmax,ymin,ymax, in the same units as XStep"
         )
     ny, nx = ok.shape
-    ix0, ix1 = max(int(round(x0 / xstep)), 0), min(int(round(x1 / xstep)), nx)
-    iy0, iy1 = max(int(round(y0 / ystep)), 0), min(int(round(y1 / ystep)), ny)
+    ix0, ix1 = max(round(x0 / xstep), 0), min(round(x1 / xstep), nx)
+    iy0, iy1 = max(round(y0 / ystep), 0), min(round(y1 / ystep), ny)
     if ix1 - ix0 < 2 or iy1 - iy0 < 2:
         raise SystemExit(
             f"--crop {spec} keeps {max(ix1 - ix0, 0)} x {max(iy1 - iy0, 0)} "
@@ -617,14 +623,17 @@ def ipf_z_colours(q):
     # an IPF-Z, and not what neper -V's ipf scheme shows.
     d = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), 1)
     d = np.sort(np.abs(d), axis=1)  # k <= h <= l
-    k, h, l = d[:, 0], d[:, 1], d[:, 2]
+    k, h, l = d[:, 0], d[:, 1], d[:, 2]  # noqa: E741
     rgb = np.stack((l - h, h - k, k), 1)
     rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1e-12)
     return rgb
 
 
 def read_tesr_back(path):
-    """Minimal reader for what this script writes: header, **data, **oridata, **oridef."""
+    """
+    Minimal reader for what this script writes:
+    header, **data, **oridata, **oridef.
+    """
     with open(path) as fh:
         tok = fh.read().split()
     i = tok.index("**general")
@@ -672,7 +681,8 @@ def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
         same_def = np.array_equal(back["oridef"], exp_ok)
         result["oridef_ok"] = same_def
         report.append(
-            f"read-back: **oridef {'identical' if same_def else 'DIFFERS'} to the quality mask"
+            f"read-back: **oridef \
+                {'identical' if same_def else 'DIFFERS'} to the quality mask"
         )
         dis = cubic_disorientation_angle(
             qmul(qconj(exp_q.reshape(-1, 4)), back["quat"].reshape(-1, 4))
@@ -699,14 +709,6 @@ def write_raw_png(
     quantitative statement that nothing was lost or altered in the reading
     and writing -- it should be ~1e-12 degrees everywhere.
     """
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-    except ImportError:
-        return
 
     NY, NX = ok_full.shape
     ny, nx = ok.shape
@@ -759,7 +761,8 @@ def write_raw_png(
         back_rgb[~def_back] = 0.6
         ax.imshow(back_rgb, **kw)
         ax.set_title(
-            f"window read back from {Path(args.output).name if args.output else 'tesr'} ({back['orides']})"
+            f"window read back from \
+                {Path(args.output).name if args.output else 'tesr'} ({back['orides']})"
         )
     else:
         ax.set_title("no **oridata in the tesr (--no-voxel-ori)")
@@ -776,7 +779,8 @@ def write_raw_png(
             "disorientation raw vs read back (deg)"
         )
         ax.set_title(
-            f"max {check['dis'].max():.1e} deg: {'round trip exact' if check['dis'].max() < 1e-3 else 'MISMATCH'}"
+            f"max {check['dis'].max():.1e} deg: \
+                {'round trip exact' if check['dis'].max() < 1e-3 else 'MISMATCH'}"
         )
     _scale_bar(ax, nx * vox[0], unit)
 
@@ -804,15 +808,6 @@ def write_quality_png(
     the final cell map were back-filled from the nearest surviving cell
     because they were rejected or belonged to a pruned grain.
     """
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import ListedColormap
-    except ImportError:
-        print("  --diagnostics: matplotlib not available, no PNG written")
-        return
 
     def orient(a):
         return a[::-1] if flip_y else a
@@ -907,7 +902,8 @@ def write_quality_png(
         ax.set_yticks([])
         _scale_bar(ax, nx * vox[0], unit)
     fig.suptitle(
-        f"{Path(args.ctf).name}: {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
+        f"{Path(args.ctf).name}: \
+            {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
     )
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -1090,7 +1086,7 @@ def main(argv=None):
         print(f"  cropped to {nx} x {ny} pixels ({args.crop})")
     frac = ok.mean()
     print(
-        f"  indexed and above quality cutoffs: {ok.sum()} of {ok.size} ({100 * frac:.1f} %)"
+        f"indexed & above quality cutoffs: {ok.sum()} of {ok.size} ({100 * frac:.1f}%)"
     )
     if frac < 0.8:
         print(
