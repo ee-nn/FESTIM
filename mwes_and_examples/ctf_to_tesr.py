@@ -462,6 +462,140 @@ def fill_holes(cellids):
     return cellids[tuple(idx)], n
 
 
+STRUCT4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+
+
+def _absorb_enclosed(cellids):
+    """Absorb every group of cells fully enclosed by one grain into that grain.
+
+    A grain containing an island has a boundary made of two loops. Neper's
+    walk (see `make_meshable`) finishes the outer one and then has edges left
+    over. The island itself is degenerate too: the ring around it carries no
+    triple junction, so no vertex is created on it and its edge ends up with
+    none.
+    """
+    from scipy.ndimage import label
+
+    absorbed = []
+    for cell in range(1, int(cellids.max()) + 1):
+        # the complement of one grain, in the 4-connectivity of the voxel faces
+        # the reconstruction works with; a component of it that does not reach
+        # the map border is enclosed by that grain
+        comp, n = label(cellids != cell, structure=STRUCT4)
+        if n <= 1:
+            continue
+        border = set(comp[0]) | set(comp[-1]) | set(comp[:, 0]) | set(comp[:, -1])
+        inside = [k for k in range(1, n + 1) if k not in border]
+        if inside:
+            mask = np.isin(comp, inside)
+            absorbed += sorted(set(cellids[mask].tolist()))
+            cellids[mask] = cell
+    return absorbed
+
+
+def _pinch_nodes(cellids):
+    """Nodes where one grain occupies both pixels of a diagonal and neither of
+    the other two, i.e. it touches itself at a point.
+
+    Its boundary is then a figure-eight through that node rather than a loop,
+    which breaks the same walk. The grain need not be in two pieces for this:
+    an arm folding back on itself pinches while staying connected elsewhere.
+    Pairs of pixels are returned, one pair per node.
+    """
+    a, b = cellids[:-1, :-1], cellids[:-1, 1:]
+    c, d = cellids[1:, :-1], cellids[1:, 1:]
+    out = []
+    for mask, off in (
+        ((a == d) & (a != b) & (a != c), ((0, 0), (1, 1))),
+        ((b == c) & (b != a) & (b != d), ((0, 1), (1, 0))),
+    ):
+        ys, xs = np.nonzero(mask)
+        out += [
+            ((y + off[0][0], x + off[0][1]), (y + off[1][0], x + off[1][1]))
+            for y, x in zip(ys.tolist(), xs.tolist())
+        ]
+    return out
+
+
+def _unpinch(cellids):
+    """Hand one pixel of each corner-only self-contact to a neighbouring grain.
+
+    The pixel taken is whichever of the two is least attached to its own grain
+    (a one-pixel spur left by the back-fill, usually), and it goes to whichever
+    grain holds most of its four neighbours, so the change is one pixel per
+    node and always in favour of an already-adjacent grain.
+    """
+    ny, nx = cellids.shape
+    fixed = 0
+    for p, q in _pinch_nodes(cellids):
+        cell = cellids[p]
+        if cellids[q] != cell:  # already resolved by an earlier fix
+            continue
+
+        def neighbours(pixel):
+            y, x = pixel
+            return [
+                (y + dy, x + dx)
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                if 0 <= y + dy < ny and 0 <= x + dx < nx
+            ]
+
+        victim = min(
+            (p, q), key=lambda t: sum(cellids[n] == cell for n in neighbours(t))
+        )
+        others = [cellids[n] for n in neighbours(victim) if cellids[n] != cell]
+        if not others:
+            continue
+        vals, counts = np.unique(others, return_counts=True)
+        cellids[victim] = vals[np.argmax(counts)]
+        fixed += 1
+    return fixed
+
+
+def make_meshable(cellids):
+    """Remove the two raster configurations `neper -M` cannot reconstruct.
+
+    Neper reconstructs the raster's interfaces into a vertex/edge/face topology
+    and then orders each face's edges by walking them as a single closed loop
+    (neut_tess_init_facetopo_fromver, in neut_tess_op1.c). Anything whose
+    boundary is not one loop makes the walk run out of edges, and Neper aborts
+    with `ut_print_neperbug()` right after "Reconstructing 0D mesh... 100%".
+    Two things do that: a grain enclosing another (two loops) and a grain
+    touching itself at a corner (a figure-eight).
+
+    Both are fixed in one loop because each fix can create the other: absorbing
+    an island can leave the host touching itself where the island had separated
+    two arms, and handing away a pinched pixel can close a ring around a
+    neighbour.
+
+    What is lost is small and inert. An enclosed grain's boundary is a closed
+    ring that meets nothing else, i.e. an isolated component of the grain
+    boundary network (an enclosed pair gives a ring with one chord, likewise
+    isolated), so removing it changes no connected path and leaves percolation
+    untouched; a pinch is a one-pixel spur. The ids and counts are returned so
+    the loss stays on the record.
+    """
+    cellids = cellids.copy()
+    absorbed, pinches = [], 0
+    for _ in range(20):
+        n = _unpinch(cellids)
+        new = _absorb_enclosed(cellids)
+        pinches += n
+        absorbed += new
+        if not n and not new:
+            break
+    else:
+        print(
+            "  WARNING: enclosure/pinch cleanup did not converge; `neper -M` "
+            "may still abort in neut_tess_init_facetopo_fromver"
+        )
+
+    ids = np.unique(cellids[cellids > 0])
+    remap = np.zeros(int(cellids.max()) + 1, dtype=np.int64)
+    remap[ids] = np.arange(1, len(ids) + 1)
+    return remap[cellids], sorted(absorbed), pinches
+
+
 def relabel_and_prune(labels, ok, min_pixels):
     """Drop tiny grains, then renumber what survives contiguously from 1.
 
@@ -1006,6 +1140,14 @@ def main(argv=None):
         "is only useful for inspecting how much of the map was rejected",
     )
     p.add_argument(
+        "--no-topology-fix",
+        action="store_true",
+        help="leave enclosed grains and corner-only self-contacts in place. "
+        "They are cleaned up by default because `neper -M` aborts on a face "
+        "whose boundary is not a single loop; keep them only for a consumer "
+        "that can handle it",
+    )
+    p.add_argument(
         "--no-voxel-ori",
         action="store_true",
         help="omit **oridata/**oridef. Much smaller file; keeps the grain "
@@ -1099,6 +1241,19 @@ def main(argv=None):
             "boundaries"
         )
 
+    if not args.no_topology_fix:
+        cellids, absorbed, pinches = make_meshable(cellids)
+        ncells = int(cellids.max())
+        if absorbed:
+            print(
+                f"  absorbed {len(absorbed)} enclosed grain(s) into their "
+                f"surrounding grain: {', '.join(map(str, absorbed))}"
+            )
+        if pinches:
+            print(f"  unpinched {pinches} corner-only self-contact(s), 1 px each")
+        if absorbed or pinches:
+            print(f"  grains: {ncells}")
+
     counts = np.bincount(cellids.ravel())[1:]
     print(f"  smallest grains (px): {', '.join(str(c) for c in np.sort(counts)[:8])}")
     if counts.min() < 10:
@@ -1156,9 +1311,6 @@ def main(argv=None):
     print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
     print(f"  domain      : {lx:.4g} x {ly:.4g}")
     print(f"  grain size  : ~{grain_size:.4g} (equivalent square)")
-    print("\ncheck it before meshing (ebsd_to_mesh.sh does the first two itself):")
-    print(f"  neper -V {out} -datavoxcol ori -datavoxcolscheme ipf -print check-ori")
-    print(f"  neper -V {out} -print check-grains")
     if not args.diagnostics:
         print("  re-run with --diagnostics to see why pixels are grey in check-ori")
     if ncells > 400:

@@ -52,7 +52,7 @@ import festim as F
 # --- input map ---------------------------------------------------------------
 # The .tesr is the EBSD map written as a raster tessellation. Neper does not
 # read .ang/.ctf/.h5
-TESR = "ebsd-centre.tesr"
+TESR = "d7.tesr"
 CRYSYM = "cubic"
 ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 
@@ -71,10 +71,10 @@ TESR_UNIT = 1e-6
 UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr units")
 
 # --- transport ---------------------------------------------------------------
-D_B = 1e-16  # lattice diffusivity              [m^2/s]
-D_GB = 1e-12  # GB diffusivity       [m^2/s]
+D_B = 1e-14  # lattice diffusivity              [m^2/s]
+D_GB = 1e-9  # GB diffusivity       [m^2/s]
 DELTA = 5e-10  # GB width             [m]
-K_EX = 1e-6  # bulk <-> GB exchange  [m/s]
+K_EX = 1e-3  # bulk <-> GB exchange  [m/s]
 C0 = 1.0  # surface concentration
 
 T_END, DT = 3600.0, 60.0
