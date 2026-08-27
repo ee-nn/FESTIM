@@ -1,29 +1,16 @@
-"""Short-circuit diffusion through the grain-boundary network of a polycrystal
+"""Short-circuit diffusion through the GB network of a polycrystal
 measured by EBSD, in 2D.
 
-Same formulation as the 3D version: the whole network is **one** codim-1
-subdomain carrying **one** species, so the submesh built from all the
-grain-boundary facets is topologically connected and hydrogen crosses from one
-boundary to another with no junction condition to write. In 2D "codim-1" means
-a 1D manifold inside a 2D mesh -- line segments inside triangles -- which is
-just as much codimension 1, and the formulation is unchanged.
+Whole network is a single codim-1 subdomain carrying 1 species, so
+the submesh built from all the GB facets is topologically connected
+and hydrogen crosses from one boundary to another with no junction
+condition.
 
-What moves down a dimension is the bookkeeping. In a 2D tessellation the cells
-*are* the faces, so:
-
-    3D                                  2D
-    grain boundary  = face              = edge
-    triple line     = interior edge     = interior vertex, 3+ edges
-    quadruple node  = interior vertex   = does not exist
-    theta lives on  faces               edges
-    mesh tags from  2D element sets     1D element sets
-
-Nothing about a disorientation requires three dimensions -- it is computed
+Nothing about a disorientation requires three dimensions, it is computed
 from the two grain orientations either way.
 
 The mesh is Neper's direct meshing of the raster (`neper -M map.tesr`, 2D
-only), so the grain boundaries are the measured ones, non-convex shapes
-included, rather than a convex-cell tessellation fitted to them. Neper writes
+only), so the grain boundaries are the measured ones. Neper writes
 no .tess for that route (`-format tess` segfaults in 5.0.0), so the
 tessellation-level bookkeeping -- which grains an edge separates, whether it
 lies on the specimen surface, theta, length, junctions -- is rebuilt here from
@@ -34,12 +21,10 @@ symmetry using the same disorientation function that segmented the map.
 
 The one thing 2D genuinely costs is connectivity, which is what this script
 measures. See the note at the end of ebsd_to_mesh.sh: percolation thresholds
-for grain-boundary networks are far lower in 2D than in 3D, so a THETA_MIN that
+for GB networks are far lower in 2D than in 3D, so a THETA_MIN that
 fragments this network may leave the corresponding 3D one connected. Treat the
 enhancement factor as a lower bound unless the microstructure is columnar, in
 which case 2D is exact.
-
-All extensive quantities below are per unit thickness out of plane.
 """
 
 import os
@@ -66,15 +51,12 @@ import festim as F
 
 # --- input map ---------------------------------------------------------------
 # The .tesr is the EBSD map written as a raster tessellation. Neper does not
-# read .ang/.ctf/.h5 -- see https://neper.info/doc/tutorials/ebsd_process.html
-# for the sections a tesr needs (**general, **cell, **data, **oridata). A single
-# map is exactly the right input here; no serial sectioning required.
+# read .ang/.ctf/.h5
 TESR = "ebsd-centre.tesr"
 CRYSYM = "cubic"
 ORIDES = "rodrigues:passive"  # must match the descriptor in the tesr
 
-# Interface smoothing applied by neper -M before meshing (Neper's defaults,
-# neper_m.html "Raster Tessellation Meshing Options"). The reconstructed
+# Interface smoothing applied by neper -M before meshing. The reconstructed
 # boundaries are pixel staircases; Laplacian smoothing with factor A for N
 # iterations rounds them off. "none" keeps the staircase.
 TESR_SMOOTH = "laplacian"
@@ -89,20 +71,16 @@ TESR_UNIT = 1e-6
 UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr units")
 
 # --- transport ---------------------------------------------------------------
-# CHECK these against the domain size printed at startup. They are written for a
-# specimen tens of microns across with metres as the length unit.
 D_B = 1e-16  # lattice diffusivity              [m^2/s]
-D_GB = 1e-12  # grain-boundary diffusivity       [m^2/s]
-DELTA = 5e-10  # grain-boundary width             [m]
-K_EX = 1e-6  # bulk <-> grain-boundary exchange  [m/s]
+D_GB = 1e-12  # GB diffusivity       [m^2/s]
+DELTA = 5e-10  # GB width             [m]
+K_EX = 1e-6  # bulk <-> GB exchange  [m/s]
 C0 = 1.0  # surface concentration
 
 T_END, DT = 3600.0, 60.0
 
 # Keep only boundaries above this disorientation. 15 deg is the usual high-angle
-# threshold and it is the reason to have gone to EBSD at all -- a synthetic
-# tessellation has no meaningful theta distribution to filter on. Expect it to
-# fragment the network more readily than the same threshold would in 3D
+# threshold. Expect it to fragment the network more readily in 2D than 3D
 THETA_MIN = 15.0
 THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 
@@ -111,10 +89,7 @@ THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 # Neper uses it relative to the average raster cell size to choose a target
 # element edge length. Smaller values request a finer mesh (more triangles
 # and more 1D boundary segments); larger values request a coarser mesh. It
-# doesn't change raster geometry r smoothed interfaces. For a raster input
-# RCL is the only size control Neper allows. Its rcl -> cl conversion also
-# differs from the tess path (rcl 0.8: cl = 1.045 um on the fitted tess,
-# 4.044 um here), hence the lower value; 0.25 gives ~1.3 um elements on the D5 crop.
+# doesn't change raster geometry or smoothed interfaces.
 RCL = 0.25
 
 # Multimeshing retries each face with several algorithms until MESH_QUAL_MIN is
@@ -131,9 +106,7 @@ WORKDIR = _HERE / "results"
 MESH_SCRIPT = _HERE / "ebsd_to_mesh.sh"
 
 # Neper is a command-line program, so it does not have to live in the same conda
-# environment as FESTIM -- it only has to be a path. Keeping it in its own
-# environment avoids letting the solver rearrange a working dolfinx install over
-# an irrelevant dependency.
+# environment as FESTIM. Keeping a separate environment avoids depdendency issues.
 #
 # GMSH_BIN is the *executable*, which Neper calls for 2D meshing. The
 # conda-forge package providing it is `gmsh`; `python-gmsh` is only the
@@ -159,9 +132,7 @@ def run_interruptible(cmd, cwd=None, env=None):
     Neper treats SIGINT as "stop optimizing, keep the current solution and write
     the output" -- which matters here, because the tessellation fit is the long
     stage and a partially converged fit is a perfectly usable microstructure.
-    But Ctrl+C goes to the whole foreground process group, so the Python parent
-    gets it too, and if the parent exits immediately the child is killed
-    part-way through writing. Catching it here and waiting lets the pipeline
+    Catching it here and waiting lets the pipeline
     land its output; a second Ctrl+C still gets you out.
     """
     proc = subprocess.Popen(cmd, cwd=cwd, env=env)
@@ -282,7 +253,7 @@ class EdgeTable:
 
 
 class Microstructure:
-    """The grain-boundary topology, rebuilt from the mesh Neper wrote.
+    """The GB topology, rebuilt from the mesh Neper wrote.
 
     With route A there is no tessellation file to take statistics from, but the
     msh4 carries the reconstructed topology: every 1D element set ``edge#`` is
@@ -484,7 +455,7 @@ class Microstructure:
     def check_units(self, extent, n_grains, delta, d_b, d_gb, t_end):
         """Three ways a physical domain breaks parameters written for a unit square.
 
-        The grain-boundary width has to be small compared with a grain, the
+        The GB width has to be small compared with a grain, the
         diffusion distance small compared with the specimen, and the boundary
         tail long compared with a grain -- none of which is automatic once the
         domain is 160 microns instead of 1.
