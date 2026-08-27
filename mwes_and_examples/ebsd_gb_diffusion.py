@@ -72,16 +72,16 @@ UNIT_NAME = {1e-9: "nm", 1e-6: "um", 1e-3: "mm", 1.0: "m"}.get(TESR_UNIT, "tesr 
 
 # --- transport ---------------------------------------------------------------
 D_B = 1e-14  # lattice diffusivity              [m^2/s]
-D_GB = 1e-9  # GB diffusivity       [m^2/s]
+D_GB = 1e-8  # GB diffusivity       [m^2/s]
 DELTA = 5e-10  # GB width             [m]
-K_EX = 1e-3  # bulk <-> GB exchange  [m/s]
+K_EX = 1e-4  # bulk <-> GB exchange  [m/s]
 C0 = 1.0  # surface concentration
 
-T_END, DT = 3600.0, 60.0
+T_END, DT = 36000.0, 600.0
 
 # Keep only boundaries above this disorientation. 15 deg is the usual high-angle
 # threshold. Expect it to fragment the network more readily in 2D than 3D
-THETA_MIN = 15.0
+THETA_MIN = 10.0
 THETA_DEPENDENT_D = False  # see gb_diffusivity_field, CHECK before enabling
 
 # --- meshing -----------------------------------------------------------------

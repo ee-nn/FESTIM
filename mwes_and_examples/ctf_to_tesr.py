@@ -715,16 +715,29 @@ def _scale_bar(ax, width, unit):
     scale_bar_ax(ax, width, unit)
 
 
+def _ipf_triangle_rgb(d):
+    """RGB for crystal directions (n, 3): [001] red, [101] green, [111] blue.
+
+    The direction is taken to the standard triangle by |components| sorted so
+    that k <= h <= l, then coloured (l - h, h - k, k) normalised to unit
+    maximum. Shared by the map colouring and its legend so the two cannot
+    drift apart.
+    """
+    d = np.sort(np.abs(d), axis=1)  # k <= h <= l
+    k, h, l = d[:, 0], d[:, 1], d[:, 2]  # noqa: E741
+    rgb = np.stack((l - h, h - k, k), 1)
+    rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1e-12)
+    return rgb
+
+
 def ipf_z_colours(q):
     """Simplified IPF-Z colouring of quaternions (n, 4), cubic symmetry.
 
-    The crystal-frame direction of the sample z axis is taken to the standard
-    triangle by |components| sorted so that k <= h <= l, and coloured
-    (l - h, h - k, k) normalised to unit maximum: [001] red, [101] green,
-    [111] blue, as in the usual IPF key. It is a simplified scheme -- AZtec and
-    neper -V use their own angle-based interpolations, so shades differ from
-    check-ori.png -- but the raw and read-back panels use the *same* scheme,
-    which is what makes them comparable.
+    The crystal-frame direction of the sample z axis is coloured by
+    `_ipf_triangle_rgb`. It is a simplified scheme -- AZtec and neper -V use
+    their own angle-based interpolations, so shades differ from check-ori.png
+    -- but the raw and read-back panels use the *same* scheme, which is what
+    makes them comparable.
     """
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     # The sample Z axis in crystal coordinates is g e_z with g the Bunge
@@ -734,11 +747,61 @@ def ipf_z_colours(q):
     # crystal [001] axis in sample coordinates -- a valid colouring, but not
     # an IPF-Z, and not what neper -V's ipf scheme shows.
     d = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), 1)
-    d = np.sort(np.abs(d), axis=1)  # k <= h <= l
-    k, h, l = d[:, 0], d[:, 1], d[:, 2]  # noqa: E741
-    rgb = np.stack((l - h, h - k, k), 1)
-    rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1e-12)
-    return rgb
+    return _ipf_triangle_rgb(d)
+
+
+def ipf_legend_ax(ax, n=500):
+    """Draw the cubic IPF colour key (001-101-111) into `ax`.
+
+    The standard stereographic triangle, coloured pixel by pixel with the same
+    `_ipf_triangle_rgb` the maps use, so the key is the legend of what is
+    actually plotted rather than a stock image. A direction d projects to
+    (dx, dy) / (1 + dz), and the triangle is the set with 0 <= dy <= dx <= dz,
+    whose corners land at (0, 0), (sqrt(2) - 1, 0) and (sqrt(3) - 1) / 2 twice
+    over.
+    """
+    xmax, ymax = np.sqrt(2) - 1, (np.sqrt(3) - 1) / 2
+    gx, gy = np.meshgrid(np.linspace(0, xmax * 1.02, n), np.linspace(0, ymax * 1.02, n))
+    # inverse stereographic projection
+    r2 = gx**2 + gy**2
+    d = np.stack((2 * gx, 2 * gy, 1 - r2), -1) / (1 + r2)[..., None]
+    inside = (d[..., 1] <= d[..., 0] + 1e-9) & (d[..., 0] <= d[..., 2] + 1e-9)
+
+    rgba = np.ones(gx.shape + (4,))
+    rgba[..., :3] = _ipf_triangle_rgb(d.reshape(-1, 3)).reshape(gx.shape + (3,))
+    rgba[..., 3] = inside
+    ax.imshow(
+        rgba,
+        origin="lower",
+        extent=(0, xmax * 1.02, 0, ymax * 1.02),
+        interpolation="bilinear",
+    )
+    # outline: the 001-101 and 001-111 edges are straight, 101-111 is an arc
+    ax.plot([0, xmax], [0, 0], color="0.25", lw=1.0)
+    ax.plot([0, ymax], [0, ymax], color="0.25", lw=1.0)
+    t = np.linspace(0, 1, 200)
+    dx = np.stack((np.ones_like(t), t, np.ones_like(t)), 1)  # dx = dz, dy free
+    dx /= np.linalg.norm(dx, axis=1, keepdims=True)
+    ax.plot(dx[:, 0] / (1 + dx[:, 2]), dx[:, 1] / (1 + dx[:, 2]), color="0.25", lw=1.0)
+    for (px, py), label, ha, va in (
+        ((0, 0), "001", "center", "top"),
+        ((xmax, 0), "101", "center", "top"),
+        ((ymax, ymax), "111", "center", "bottom"),
+    ):
+        ax.annotate(
+            label,
+            (px, py),
+            textcoords="offset points",
+            xytext=(0, -6 if va == "top" else 6),
+            ha=ha,
+            va=va,
+            fontsize=9,
+        )
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.03, xmax + 0.03)
+    ax.set_ylim(-0.06, ymax + 0.06)
+    ax.axis("off")
+    return ax
 
 
 def read_tesr_back(path):
@@ -812,14 +875,14 @@ def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
 def write_raw_png(
     path, qgrid_full, ok_full, window, qgrid, ok, check, ctf, args, vox, unit
 ):
-    """<output>-raw.png: the .ctf as read, the window as written, and their difference.
+    """<output>-raw.png: the .ctf as read, and the window that was written.
 
     (a) the whole map, IPF-Z from the raw Euler angles, with the crop window
-    drawn; (b) the window from the raw Euler angles; (c) the window as read
-    back from the .tesr just written, same colouring, `**oridef` = 0 in grey;
-    (d) the per-voxel disorientation between (b) and (c), which is the
-    quantitative statement that nothing was lost or altered in the reading
-    and writing -- it should be ~1e-12 degrees everywhere.
+    drawn; (b) the window from the raw Euler angles; and the IPF colour key
+    beside them. The read-back and round-trip panels that used to sit below
+    are gone; the round-trip number itself is still computed by
+    verify_readback, printed in the report, and repeated under panel (b), so
+    a convention flip or a mangled write is still visible here.
     """
 
     NY, NX = ok_full.shape
@@ -831,7 +894,10 @@ def write_raw_png(
     win_rgb = ipf_z_colours(qgrid.reshape(-1, 4)).reshape(ny, nx, 3)
     win_rgb[~ok] = 0.6
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 5.5 + 5.5 * ny / nx))
+    aspect = max(NY / NX, ny / nx)
+    fig = plt.figure(figsize=(13.5, 1.2 + 5.9 * aspect), layout="constrained")
+    grid = fig.add_gridspec(1, 3, width_ratios=(1, 1, 0.3))
+    axes = [fig.add_subplot(grid[0, i]) for i in range(3)]
     kw_full = dict(
         interpolation="nearest", origin="lower", extent=(0, NX * xs, 0, NY * ys)
     )
@@ -839,7 +905,7 @@ def write_raw_png(
         interpolation="nearest", origin="lower", extent=(0, nx * vox[0], 0, ny * vox[1])
     )
 
-    ax = axes[0, 0]
+    ax = axes[0]
     ax.imshow(full_rgb, **kw_full)
     y0, y1 = window[0].start, window[0].stop
     x0, x1 = window[1].start, window[1].stop
@@ -859,47 +925,24 @@ def write_raw_png(
     )
     _scale_bar(ax, NX * xs, unit)
 
-    ax = axes[0, 1]
+    ax = axes[1]
     ax.imshow(win_rgb, **kw)
     ax.set_title("window, raw Euler angles (simplified IPF-Z)")
-    _scale_bar(ax, nx * vox[0], unit)
-
-    ax = axes[1, 0]
     if check["dis"] is not None:
-        back = read_tesr_back(args.output or str(Path(args.ctf).with_suffix(".tesr")))
-        q_back = back["quat"][::-1] if args.flip_y else back["quat"]
-        def_back = back["oridef"][::-1] if args.flip_y else back["oridef"]
-        back_rgb = ipf_z_colours(q_back.reshape(-1, 4)).reshape(ny, nx, 3)
-        back_rgb[~def_back] = 0.6
-        ax.imshow(back_rgb, **kw)
-        ax.set_title(
-            f"window read back from \
-                {Path(args.output).name if args.output else 'tesr'} ({back['orides']})"
-        )
+        worst = check["dis"].max()
+        verdict = "round trip exact" if worst < 1e-3 else "MISMATCH"
+        ax.set_xlabel(f"read back from the .tesr: max {worst:.1e} deg, {verdict}")
     else:
-        ax.set_title("no **oridata in the tesr (--no-voxel-ori)")
+        ax.set_xlabel("no **oridata in the tesr (--no-voxel-ori), not read back")
     _scale_bar(ax, nx * vox[0], unit)
 
-    ax = axes[1, 1]
-    if check["dis"] is not None:
-        # floor the scale at 1e-3 deg so an exact round trip shows as a flat
-        # black panel and any real discrepancy stands out
-        im = ax.imshow(
-            check["dis"], cmap="magma", vmin=0, vmax=max(check["dis"].max(), 1e-3), **kw
-        )
-        fig.colorbar(im, ax=ax, fraction=0.046).set_label(
-            "disorientation raw vs read back (deg)"
-        )
-        ax.set_title(
-            f"max {check['dis'].max():.1e} deg: \
-                {'round trip exact' if check['dis'].max() < 1e-3 else 'MISMATCH'}"
-        )
-    _scale_bar(ax, nx * vox[0], unit)
-
-    for ax in axes.ravel():
+    for ax in axes[:2]:
         ax.set_xticks([])
         ax.set_yticks([])
-    fig.tight_layout()
+
+    ipf_legend_ax(axes[2])
+    axes[2].set_title("IPF-Z key", fontsize=10)
+
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  wrote {path}")
