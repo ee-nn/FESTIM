@@ -67,15 +67,8 @@ that carries current deeper in. A saturated boundary carries no net flux, so
 the max-occupancy sweep is not a detail -- it is the controlling physics, and
 it is why the paper's own permeability rises with the occupancy limit.
 
-RUN
----
-    NX=10  python3 diaz_columnar.py      # 1 x 1 x 2 um, ~4e5 tets, laptop
-    NX=100 python3 diaz_columnar.py      # 10 x 10 x 2 um as requested, cluster
-
 Outputs diaz-flux-fraction.png, diaz-permeability.png and a CSV.
 """
-
-import os
 
 from mpi4py import MPI
 
@@ -94,22 +87,18 @@ import festim as F
 # ----------------------------------------------------------------------------
 L = 100e-9  # column side, m                     (their L, 100 nm case)
 D_THICK = 2e-6  # layer thickness, m             (the experimental 2 um)
-NX = 100  # columns per side; 100 -> 10 um x 10 um
+NX = 7  # columns per side; 100 -> 10 um x 10 um
 NY = NX
 CPG = 3  # mesh cells across one column, per axis
 NZ = 80  # mesh cells through the thickness
 
 # CPG >= 2 is required for the facet locator below: with one cell per column a
 # tetrahedron can have vertices on two different column planes and would be
-# mislabelled as a boundary facet.
+# mislabelled as a boundary facet. However, it can be only a few across because
+# is very fast. At 705 K, D_bulk ~ 7e-9 m^2/s, so (L/2)^2/D ~
+# 4e-7 s across the column against d^2/D ~ 6e-4 s along it.
 
 LX, LY = NX * L, NY * L
-
-# Why CPG can be this small: lateral equilibration inside a column is far
-# faster than axial transport. At 705 K, D_bulk ~ 7e-9 m^2/s, so (L/2)^2/D ~
-# 4e-7 s across the column against d^2/D ~ 6e-4 s along it -- three orders.
-# c_b is essentially flat across a column at every depth, and the mesh only has
-# to resolve the axial profile and place nodes exactly on the GB planes.
 
 # ----------------------------------------------------------------------------
 # material and coupling parameters
@@ -122,8 +111,8 @@ E_FORWARD = 0.145  # eV, bulk->GB approach barrier; Zhou 2010 gives 0.13-0.16
 D0_BULK = 1.9e-7  # m^2/s, assumed (see header)
 D0_GB = 1.5 * D0_BULK  # m^2/s, assumed: 2D vs 3D random-walk prefactor
 
-DELTA = float(os.environ.get("DELTA", 0.5e-9))  # GB slab width, m, assumed
-N_GB_AREAL = float(os.environ.get("N_GB", 6.25e18))  # m^-2, their max occupancy
+DELTA = 5e-10  # GB slab width, m, assumed
+N_GB_AREAL = 6.25e18  # m^-2, their max occupancy
 N_GB = N_GB_AREAL / DELTA  # m^-3, volumetric capacity
 
 LAMBDA_JUMP = 1.12e-10  # m, tetrahedral-site hop in bcc W, for K
@@ -132,10 +121,10 @@ NU_ATTEMPT = 1e13  # s^-1
 C_SURF = 5.6e27  # m^-3, their 5.6 H/nm^3 charged-surface concentration
 
 TEMPERATURES = [520.0, 570.0, 615.0, 660.0, 705.0]  # their experimental range
-T_END = float(os.environ.get("T_END", 1.0))  # s; steady state is reached in
-DT0 = float(os.environ.get("DT0", 1e-6))  # ~d^2/D ~ 6e-4 s at 705 K
+T_END = 1.0  # s; steady state is reached in
+DT0 = 1e-6  # ~d^2/D ~ 6e-4 s at 705 K
 
-DISORDER = bool(int(os.environ.get("DISORDER", 0)))
+DISORDER = 0
 E_M_GB_RANGE = (0.191, 0.547)  # eV, Wei et al. 2026, eight tungsten GBs
 SEED = 0
 
@@ -343,7 +332,7 @@ def run(T):
             transient=True,
             final_time=T_END,
             stepsize=F.Stepsize(
-                initial_value=DT0, growth_factor=1.2, target_nb_iterations=6
+                initial_value=DT0, growth_factor=1.2, target_nb_iterations=5
             ),
         ),
         exports=[],
