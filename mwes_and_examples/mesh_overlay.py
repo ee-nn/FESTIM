@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Overlay the grain boundaries of a `neper -M map.tesr` mesh on the raster.
 
     python mesh_overlay.py map.tesr poly.msh4 -o check-mesh.png
@@ -19,7 +18,19 @@ The msh4 is parsed directly (no gmsh/meshio dependency), and the two functions
 import argparse
 import sys
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+plt.rcParams.update(
+    {
+        "font.size": 16,  # Baseline text, labels, ticks, and legends
+        "axes.titlesize": 16,  # Subplot titles
+        "figure.titlesize": 16,  # Global figure super title
+    }
+)
 
 
 def read_tesr(path):

@@ -31,7 +31,7 @@ def nice_length(width, fraction=0.25):
 
 
 def unit_label(unit):
-    return {"um": "µm", "micron": "µm", "microns": "µm"}.get(unit, unit)
+    return {"um": "um", "micron": "um", "microns": "um"}.get(unit, unit)
 
 
 def format_length(value, unit):
@@ -56,8 +56,9 @@ def trim(img, tol=6, margin=0):
 
 def scale_bar_image(img, width_units, unit="um", length=None, inset=0.03):
     """Draw a scale bar (white on a translucent dark box) in the lower right."""
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
 
+    font = ImageFont.load_default(24)
     img = img.convert("RGBA")
     w, h = img.size
     px_per_unit = w / width_units
@@ -65,7 +66,6 @@ def scale_bar_image(img, width_units, unit="um", length=None, inset=0.03):
     bar_px = round(length * px_per_unit)
     thick = max(round(0.012 * h), 3)
     pad = max(round(inset * w), 6)
-    font = 16
     label = format_length(length, unit)
 
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
