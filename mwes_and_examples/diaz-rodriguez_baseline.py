@@ -82,25 +82,22 @@ import matplotlib.pyplot as plt
 
 import festim as F
 
-# ----------------------------------------------------------------------------
 # geometry
 # ----------------------------------------------------------------------------
 L = 100e-9  # column side, m                     (their L, 100 nm case)
 D_THICK = 2e-6  # layer thickness, m             (the experimental 2 um)
-NX = 7  # columns per side; 100 -> 10 um x 10 um
+NX = 2  # columns per side; 100 -> 10 um x 10 um
 NY = NX
-CPG = 3  # mesh cells across one column, per axis
-NZ = 80  # mesh cells through the thickness
+CPG = 6  # mesh cells across one column, per axis
+NZ = 50  # mesh cells through the thickness
 
 # CPG >= 2 is required for the facet locator below: with one cell per column a
 # tetrahedron can have vertices on two different column planes and would be
 # mislabelled as a boundary facet. However, it can be only a few across because
 # is very fast. At 705 K, D_bulk ~ 7e-9 m^2/s, so (L/2)^2/D ~
 # 4e-7 s across the column against d^2/D ~ 6e-4 s along it.
-
 LX, LY = NX * L, NY * L
 
-# ----------------------------------------------------------------------------
 # material and coupling parameters
 # ----------------------------------------------------------------------------
 E_M_BULK = 0.20  # eV, DFT, their Fig. 3
@@ -121,8 +118,9 @@ NU_ATTEMPT = 1e13  # s^-1
 C_SURF = 5.6e27  # m^-3, their 5.6 H/nm^3 charged-surface concentration
 
 TEMPERATURES = [520.0, 570.0, 615.0, 660.0, 705.0]  # their experimental range
-T_END = 1.0  # s; steady state is reached in
-DT0 = 1e-6  # ~d^2/D ~ 6e-4 s at 705 K
+T_END = 1e-2  # s; end of simulation
+
+DT0 = 1e-11  # ~d^2/D ~ 6e-4 s at 705 K
 
 DISORDER = 0
 E_M_GB_RANGE = (0.191, 0.547)  # eV, Wei et al. 2026, eight tungsten GBs
@@ -139,9 +137,7 @@ def k_forward(T):
     return LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * T))
 
 
-# ----------------------------------------------------------------------------
 # mesh: a structured box whose node planes fall exactly on the column walls
-# ----------------------------------------------------------------------------
 comm = MPI.COMM_WORLD
 mesh = dolfinx.mesh.create_box(
     comm,
@@ -149,22 +145,14 @@ mesh = dolfinx.mesh.create_box(
     [NX * CPG, NY * CPG, NZ],
     cell_type=dolfinx.mesh.CellType.tetrahedron,
 )
-if comm.rank == 0:
-    ntet = NX * CPG * NY * CPG * NZ * 6
-    print(f"domain {LX * 1e6:.1f} x {LY * 1e6:.1f} x {D_THICK * 1e6:.1f} um")
-    print(f"{NX * NY} columns, L = {L * 1e9:.0f} nm, ~{ntet:.3e} tetrahedra")
-    if ntet > 2e7:
-        print("  WARNING: this is a cluster-sized problem. Reduce NX or CPG.")
+
+ntet = NX * CPG * NY * CPG * NZ * 6
+print(f"domain {LX * 1e6:.1f} x {LY * 1e6:.1f} x {D_THICK * 1e6:.1f} um")
+print(f"{NX * NY} columns, L = {L * 1e9:.0f} nm, ~{ntet:.3e} tetrahedra")
 
 
 class ColumnWalls(F.VolumeSubdomain):
     """The whole GB network as one codim-1 subdomain: interior facets, dim=2.
-
-    Same construction as GrainBoundaryNetwork in ebsd_gb_diffusion.py -- one
-    connected submesh carrying one species, so hydrogen crosses from one wall
-    to another with no junction condition. Here the facets are found
-    geometrically rather than from tags, because the geometry is a regular
-    tiling and there is no tessellation to read.
 
     The x-normal and y-normal wall sets are located separately and unioned.
     Locating them with a single predicate would also catch facets that have
@@ -257,7 +245,6 @@ def outlet_flux(c, D, z_out, weight=1.0):
         m, fdim, np.sort(facets), np.ones(facets.size, dtype=np.int32)
     )
     ds = ufl.Measure("ds", domain=m, subdomain_data=tags)
-    n = ufl.FacetNormal(m)
     # the submesh of a plane set has no meaningful outward normal in 3D, so
     # take the axial component of the gradient directly rather than dot(.., n)
     form = -weight * D * ufl.grad(c)[2] * ds(1)
@@ -265,9 +252,7 @@ def outlet_flux(c, D, z_out, weight=1.0):
     return m.comm.allreduce(local, op=MPI.SUM)
 
 
-# ----------------------------------------------------------------------------
-# one temperature
-# ----------------------------------------------------------------------------
+# Parameterize as a function of temperature
 def run(T):
     D_b = D0_BULK * np.exp(-E_M_BULK / (F.k_B * T))
     D_g = D0_GB * np.exp(-E_M_GB / (F.k_B * T))
