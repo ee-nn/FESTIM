@@ -460,30 +460,6 @@ class Microstructure:
             )
         return self.n_grains
 
-    def check_units(self, extent, n_grains, delta, d_b, d_gb, t_end):
-        """Three ways a physical domain breaks parameters written for a unit square.
-
-        The GB width has to be small compared with a grain, the
-        diffusion distance small compared with the specimen, and the boundary
-        tail long compared with a grain -- none of which is automatic once the
-        domain is 160 microns instead of 1.
-        """
-        lx, ly = extent
-        grain_size = np.sqrt(lx * ly / max(n_grains, 1))
-        if delta > 0.05 * grain_size:
-            print(
-                f"  WARNING: delta = {delta:g} is not small against the grain "
-                f"size (~{grain_size:g}); the slab idealisation is being "
-                "stretched and the area fraction below is not a small number"
-            )
-        depth = 2 * np.sqrt(d_b * t_end)
-        if depth > 0.5 * ly:
-            print(
-                f"  WARNING: lattice diffusion alone reaches {depth:g} in a "
-                f"specimen only {ly:g} deep; there is no short-circuit regime "
-                "to observe -- shorten T_END or lower D_B"
-            )
-
     def report(self, extent, n_grains):
         kept, total = int(self.network_mask.sum()), int(self.interior_mask.sum())
         theta = self.edges["theta"][self.network_mask]
@@ -493,7 +469,7 @@ class Microstructure:
         print(f"  edges                           : {self.edges.n}")
         print(f"  on the specimen surface         : {self.surface_edges}")
         print(f"  grain boundaries (interior)     : {total}")
-        print(f"  kept above {THETA_MIN:g} deg          : {kept}")
+        print(f"  kept above {THETA_MIN:g} deg    : {kept}")
         if kept:
             print(
                 f"  disorientation                  : "
@@ -649,7 +625,6 @@ LX, LY = float(cols[1]) * TESR_UNIT, float(cols[2]) * TESR_UNIT
 mesh, cell_tags, facet_tags = read_mesh(base)
 micro = Microstructure(base, mesh, cell_tags, facet_tags, (LX, LY))
 N_GRAINS = micro.check_orientations()
-micro.check_units((LX, LY), N_GRAINS, DELTA, D_B, D_GB, T_END)
 
 write_network_png(base, mesh, micro, base.parent / "poly-raw.tesr")
 
@@ -678,7 +653,6 @@ def solve(d_gb):
     Run the problem, returning the model and the solution.
     """
     network.material = F.Material(D_0=d_gb, E_D=0.0)
-    fast = d_gb != D_B
     model = F.HydrogenTransportProblemDiscontinuous(
         mesh=F.Mesh(mesh),
         species=[c_b, c_gb],
@@ -716,18 +690,9 @@ def solve(d_gb):
             F.VTXSpeciesExport(
                 str(base.parent / "ebsd_network.bp"), field=c_gb, subdomain=network
             ),
-        ]
-        if fast
-        else [],
+        ],
     )
     model.initialise()
-    if fast and THETA_DEPENDENT_D:
-        # after initialise() the submesh exists; see the CHECK in the helper
-        network.material = F.Material(
-            D_0=gb_diffusivity_field(network, micro, D_B, D_GB, theta_c=THETA_MIN),
-            E_D=0.0,
-        )
-        model.initialise()
     model.run()
     return (
         model,
@@ -736,7 +701,7 @@ def solve(d_gb):
     )
 
 
-model, cb_fast, cgb_fast = solve(D_GB)
+model, cb, cgb = solve(D_GB)
 
 
 # what we built
@@ -790,18 +755,12 @@ len_mesh, len_tess = submesh_length(network), micro.network_length
 n_comp = component_count(network)
 print(f"mesh : {mesh.topology.index_map(2).size_global} triangles")
 print(f"Fraction of network captured by the submesh: {100 * len_mesh / len_tess:.2f}%")
-if n_comp is not None:
-    print(f"  connected components            : {n_comp}")
-print(f"  interior facets                 : {model.manifold_is_interior(network)}")
 
 
 # effect of the network
 def inventory(cb, cgb):
-    """Total hydrogen per unit out-of-plane thickness.
-
-    The grains contribute an area integral and the boundaries a line integral
-    weighted by the slab width -- one dimension down from the 3D version, where
-    it was a volume integral plus delta times an area integral.
+    """
+    Total hydrogen per unit out-of-plane thickness.
     """
     dx_bulk = ufl.Measure("dx", domain=cb.function_space.mesh)
     dx_gb = ufl.Measure("dx", domain=cgb.function_space.mesh)
@@ -816,19 +775,18 @@ def inventory(cb, cgb):
 # the same on every rank with no reduction needed.
 junction_only_below = micro.junction_only_below(LY)
 
-gb_y = cgb_fast.function_space.tabulate_dof_coordinates()[:, 1]
+gb_y = cgb.function_space.tabulate_dof_coordinates()[:, 1]
 deep = gb_y < junction_only_below
-c_deep = cgb_fast.x.array[deep].max() if deep.any() else 0.0
+c_deep = cgb.x.array[deep].max() if deep.any() else 0.0
 
 # For scale only: Hart's effective diffusivity is the upper bound you would get
 # if every boundary ran straight along the gradient. In 2D f is a length fraction
 # times delta rather than an area fraction times delta.
 beta = DELTA * (D_GB / D_B - 1) / (2 * np.sqrt(D_B * T_END))
 print(f"  type-B parameter beta          : {beta:.0f}  (short circuit needs beta >> 1)")
-print(f"(grain ~{np.sqrt(LX * LY / N_GRAINS):.3g}; a visible tail needs L >~ grain)")
 
-bulk_y = cb_fast.function_space.tabulate_dof_coordinates()[:, 1]
-c_grain_deep = cb_fast.x.array[bulk_y < junction_only_below].mean()
+bulk_y = cb.function_space.tabulate_dof_coordinates()[:, 1]
+c_grain_deep = cb.x.array[bulk_y < junction_only_below].mean()
 
 print("\njunction transport: no boundary touching the charged edge reaches below")
 print(f"y = {junction_only_below:.4g}, so everything the network holds there has")
@@ -841,8 +799,3 @@ if c_grain_deep > 1e-12 * C0:
     print(f"  ratio                          : x {c_deep / c_grain_deep:.0f}")
 else:
     print("ratio: n/a - nothing has reached this depth on either path")
-print(
-    "\nconnectivity in 2D is not 3D connectivity: percolation thresholds are "
-    "far lower in the plane, so read the enhancement as a lower bound unless "
-    "the microstructure is columnar."
-)
