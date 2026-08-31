@@ -117,6 +117,8 @@ venv.bak/
 *.png
 *.mp4
 *.msh
+*.csv
+*.json
 
 # Neper input/output files
 *.msh4

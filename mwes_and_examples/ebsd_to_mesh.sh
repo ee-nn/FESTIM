@@ -33,6 +33,16 @@
 #   check-grains.png      raster coloured by cell id, likewise
 #   check-mesh.png        raster cells with every reconstructed boundary edge
 #                         of the mesh drawn on top (mesh_overlay.py)
+#   ${STEM}-areachange.csv  per-grain area, rastered vs meshed, and the percent
+#                         change between them (grain_area_change.py)
+#   check-area.png        the grains coloured by that change, and its
+#                         distribution
+#
+# The area table is the quality number for this stage: -tesrsmooth and the
+# meshing both move the boundary, and the change in a grain's area is what that
+# motion does to the bulk term of the transport problem. Stage 1's equivalent
+# is printed by ctf_to_tesr.py (the RMS disorientation between a pixel and the
+# single orientation its grain is given).
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
@@ -228,6 +238,30 @@ if [ "$CHECK_IMAGES" = "1" ] && need "check-mesh.png"; then
     "$PYTHON_BIN" "$(dirname "$0")/mesh_overlay.py" \
         "${STEM}-raw.tesr" "${STEM}.msh4" -o check-mesh.png --unit "$UNIT_NAME" \
         || echo "  WARNING: check-mesh.png not written (matplotlib missing?)" >&2
+fi
+
+# -----------------------------------------------------------------------------
+# 3. How much the grains changed size. Compares the voxel count of every raster
+#    cell with the summed triangle area of the corresponding mesh face, so it
+#    measures -tesrsmooth and the meshing together -- there is no intermediate
+#    file to separate them from. Set TESR_SMOOTH=none and a different STEM to
+#    get the discretisation on its own, then difference the two csv files.
+#
+#    It also re-derives the face -> cell correspondence from triangle
+#    centroids, which is the only check anywhere in the pipeline that Neper's
+#    face k really is raster cell k. Everything downstream indexes theta by
+#    face id, so a failure here is fatal rather than cosmetic; the script says
+#    so and exits non-zero, and that is deliberately not swallowed.
+# -----------------------------------------------------------------------------
+AREA_PNG=()
+if [ "$CHECK_IMAGES" = "1" ]; then
+    AREA_PNG=(-o check-area.png)
+fi
+if need "${STEM}-areachange.csv"; then
+    "$PYTHON_BIN" "$(dirname "$0")/grain_area_change.py" \
+        "${STEM}-raw.tesr" "${STEM}.msh4" \
+        --csv "${STEM}-areachange.csv" --unit "$UNIT_NAME" \
+        ${AREA_PNG[@]+"${AREA_PNG[@]}"}
 fi
 
 # Neper writes one .geo/.msh pair per tessellation entity into -tmp and deletes

@@ -83,6 +83,12 @@ from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from segmentation_error import (
+    format_report,
+    segmentation_error,
+)
+from segmentation_error import write_csv as write_segerr_csv
+from segmentation_error import write_png as write_segerr_png
 
 plt.rcParams.update(
     {
@@ -712,6 +718,42 @@ def write_tesr(path, cellids, ori_cell, ori_vox, oridef, voxsize, crysym, precis
         fh.write("***end\n")
 
 
+def write_provenance(path, args, seg, vox):
+    """Everything needed to line the .tesr back up with the .ctf, plus the
+    segmentation error, as json.
+
+    The window, the mirror and the orientation convention are choices made here
+    and are not recoverable from the .tesr itself, so segmentation_error.py
+    cannot re-measure the conversion without them (`--provenance`). The
+    statistics are copied in so that a later stage can quote stage 1's error
+    without re-reading the .ctf.
+    """
+    import json
+
+    rec = {
+        "ctf": str(args.ctf),
+        "crop": args.crop,
+        "flip_y": bool(args.flip_y),
+        "active": bool(args.active),
+        "phase": args.phase,
+        "threshold": args.threshold,
+        "max_mad": args.max_mad,
+        "min_bands": args.min_bands,
+        "allow_error": bool(args.allow_error),
+        "min_pixels": args.min_pixels,
+        "scale": args.scale,
+        "voxsize": list(vox),
+        "unit": "um" if np.isclose(args.scale, 1.0) else f"x{args.scale:g} um",
+        "ncells": int(seg["ncells"]),
+        "segmentation_error_deg": {
+            k: seg[k] for k in ("all", "indexed", "backfilled") if k in seg
+        },
+    }
+    with open(path, "w") as fh:
+        json.dump(rec, fh, indent=1)
+    print(f"  wrote {path}")
+
+
 # --- diagnostics -------------------------------------------------------------
 def _scale_bar(ax, width, unit):
     """Scale bar from micrograph.py if it sits next to this script; else none."""
@@ -1314,8 +1356,28 @@ def main(argv=None):
         )
 
     qfz = to_fundamental_zone(qgrid.reshape(-1, 4), sym).reshape(ny, nx, 4)
-    ori_cell = quat_to_rodrigues(grain_mean_orientations(qgrid, cellids, ncells, sym))
+    qcell = grain_mean_orientations(qgrid, cellids, ncells, sym)
+    ori_cell = quat_to_rodrigues(qcell)
     ori_vox = None if args.no_voxel_ori else quat_to_rodrigues(qfz)
+    vox = (ctf.header["XStep"] * args.scale, ctf.header["YStep"] * args.scale)
+
+    # What the segmentation cost. Computed here, before --active flips the sign
+    # and --flip-y mirrors the arrays, so everything is still in the .ctf's own
+    # frame; neither transformation changes a disorientation. This is the
+    # headline quality number for stage 1 of the pipeline: the RMS angle
+    # between a pixel's measured orientation and the single orientation its
+    # grain will carry from here on.
+    seg = segmentation_error(
+        qgrid,
+        cellids,
+        qcell,
+        vox,
+        ok=ok,
+        threshold=args.threshold,
+        backfilled=unassigned,
+    )
+    for line in format_report(seg):
+        print("  " + line)
 
     if args.active:  # active is the opposite rotation, i.e. -r
         ori_cell = -ori_cell
@@ -1328,12 +1390,22 @@ def main(argv=None):
         if ori_vox is not None:
             ori_vox = ori_vox[::-1]
 
-    vox = (ctf.header["XStep"] * args.scale, ctf.header["YStep"] * args.scale)
     out = Path(args.output or Path(args.ctf).with_suffix(".tesr"))
     write_tesr(out, cellids, ori_cell, ori_vox, ok, vox, crysym)
+    write_provenance(out.with_name(out.stem + "-provenance.json"), args, seg, vox)
 
     if args.diagnostics:
         unit = "um" if np.isclose(args.scale, 1.0) else f"x{args.scale:g} um"
+        write_segerr_png(
+            out.with_name(out.stem + "-segerror.png"),
+            seg,
+            # back to the .ctf's row order: `cellids` was mirrored in place
+            # above, while seg["theta"] was measured before that
+            cellids[::-1] if args.flip_y else cellids,
+            unit=unit,
+            threshold=args.threshold,
+        )
+        write_segerr_csv(out.with_name(out.stem + "-segerror.csv"), seg)
         png = out.with_name(out.stem + "-quality.png")
         write_quality_png(
             png, diag, ok, unassigned, cellids, args, vox, unit, flip_y=args.flip_y
