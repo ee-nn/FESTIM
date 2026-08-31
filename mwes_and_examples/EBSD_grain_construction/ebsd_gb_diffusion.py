@@ -46,7 +46,7 @@ mpl.use("Agg")
 from grain_area_change import measure
 from matplotlib.collections import LineCollection
 from mesh_overlay import draw_raster, overlay, read_tesr
-from micrograph import annotate_png, append_key, scale_bar_ax
+from micrograph import scale_bar_ax
 from orientation import cubic_disorientation_angle, qconj, qmul, rodrigues_to_quat
 
 import festim as F
@@ -125,7 +125,9 @@ NEPER_ENV = "/home/fenna/anaconda3/envs/neper-env/bin"
 NEPER_BIN = os.path.join(NEPER_ENV, "neper")
 GMSH_BIN = os.path.join(NEPER_ENV, "gmsh")
 
-# neper -V renders PNGs through a separate `povray` process
+# neper -V renders PNGs through a separate `povray` process. Only the
+# conversion stage renders anything, so this is here to be passed to
+# ctf_to_tesr.Settings(povray=...), not to the mesh script.
 POVRAY_BIN = os.path.join(NEPER_ENV, "povray")
 if not Path(POVRAY_BIN).is_file():
     POVRAY_BIN = "povray"
@@ -133,8 +135,8 @@ if not Path(POVRAY_BIN).is_file():
 # The pipeline modules sit next to this file and are imported, not run:
 # orientation.py owns the cubic disorientation function used to segment the map,
 # so a boundary's theta here means the same thing as the threshold that created
-# it, and micrograph / mesh_overlay / grain_area_change supply the diagnostics
-# that ebsd_to_mesh.sh used to shell out for.
+# it, and mesh_overlay / grain_area_change supply the two diagnostics that need
+# the mesh.
 sys.path.insert(0, str(_HERE))
 
 
@@ -211,7 +213,6 @@ def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
             "TESR": str(tesr_path),
             "NEPER_BIN": NEPER_BIN,
             "GMSH_BIN": GMSH_BIN,
-            "POVRAY_BIN": POVRAY_BIN,
             "NEPER_ENV": NEPER_ENV,
             "STEM": "poly",
             "WORKDIR": str(base.parent),
@@ -222,8 +223,6 @@ def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
             "TESR_SMOOTH": TESR_SMOOTH,
             "TESR_SMOOTH_FACT": str(TESR_SMOOTH_FACT),
             "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
-            "CHECK_IMAGES": "1",
-            "UNIT_NAME": UNIT_NAME,
         }
     )
     if MESH_QUAL_MIN:
@@ -232,66 +231,36 @@ def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
         env["MESH_MAX_TIME"] = str(MESH_MAX_TIME)
 
     run_interruptible(["bash", str(MESH_SCRIPT)], cwd=str(base.parent), env=env)
-    finish_diagnostics(base)
+    mesh_diagnostics(base)
     return base
 
 
-def raster_extent(base):
-    """(Lx, Ly, voxel x, voxel y) out of the .sttesr the mesh script wrote."""
-    dim, lx, ly, vsx, vsy = Path(f"{base}.sttesr").read_text().split()
-    if int(dim) != 2:
-        raise ValueError(f"{base}.sttesr: expected a 2D raster, got {dim}D")
-    return float(lx), float(ly), float(vsx), float(vsy)
+def mesh_diagnostics(base, unit=UNIT_NAME, check_images=True):
+    """The two diagnostics that need the mesh, run once the shell script is done.
 
+    ebsd_to_mesh.sh drives Neper and Gmsh only; these come from the pipeline's
+    library modules and are done here so those modules stay importable rather
+    than needing a command line:
 
-def finish_diagnostics(base, unit=UNIT_NAME, check_images=True, keep_key=False):
-    """The Python half of the meshing stage, run once the shell script is done.
-
-    ebsd_to_mesh.sh drives Neper and Gmsh only; these four outputs come from the
-    pipeline's library modules and are done here so that those modules stay
-    importable rather than needing a command line:
-
-      check-ori.png, check-grains.png  the neper -V renders, border trimmed and
-                                       a scale bar added; check-ori also gets
-                                       ipf-key.png pasted beside it, after
-                                       which the key is deleted unless
-                                       `keep_key` -- it is an intermediate, and
-                                       the shell rebuilds it whenever it
-                                       re-renders check-ori
-      check-mesh.png                   the reconstructed boundary edges over the
-                                       raster cells
+      check-mesh.png         the reconstructed boundary edges over the raster
       <stem>-areachange.csv, check-area.png
-                                       how much each grain changed size between
-                                       the raster and the mesh
+                             how much each grain changed size between the
+                             raster and the mesh
 
-    A missing check image is reported and skipped, since neper -V needs POV-Ray
-    and may have failed upstream. The area table is not optional: it also checks
-    that mesh face k is raster cell k, which every theta downstream depends on,
-    and grain_area_change.measure raises if it is not.
+    Anything that depends only on the .tesr -- the rendered maps, the quality
+    and segmentation-error figures -- belongs to the conversion and is written
+    by ctf_to_tesr.convert(diagnostics=True) instead.
+
+    The area table is not optional: it also checks that mesh face k is raster
+    cell k, which every theta downstream depends on, and
+    grain_area_change.measure raises if it is not.
     """
-
     base = Path(base)
     work = base.parent
-    lx, _ly, _vx, _vy = raster_extent(base)
     tesr, msh4 = f"{base}-raw.tesr", f"{base}.msh4"
 
     if check_images:
-        for name in ("check-ori", "check-grains"):
-            png = work / f"{name}.png"
-            if not png.is_file():
-                print(f"  note: {png.name} was not rendered, skipping")
-                continue
-            try:
-                annotate_png(png, lx, unit, trim_border=True)
-                key = work / "ipf-key.png"
-                if name == "check-ori" and key.is_file():
-                    append_key(png, key)
-                    if not keep_key:
-                        key.unlink()
-            except Exception as exc:  # Pillow missing, or a zero-size render
-                print(f"  WARNING: {png.name} left untrimmed ({exc})")
         overlay(tesr, msh4, output=str(work / "check-mesh.png"), unit=unit)
-
     measure(
         tesr,
         msh4,

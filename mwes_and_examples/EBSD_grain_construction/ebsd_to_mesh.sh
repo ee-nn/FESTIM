@@ -13,18 +13,21 @@
 #   triple junction : mesh vertex where 3+ distinct edge ids meet
 #
 # Outputs: ${STEM}.msh4 (Gmsh v4, linear triangles, all dimensions),
-# ${STEM}.sttesr (raster geometry), ${STEM}-grainori.txt (one orientation per
-# grain), the untrimmed check-ori.png / check-grains.png renders, and
-# ipf-key.png, the colour key for the first of those.
+# ${STEM}.sttesr (raster geometry) and ${STEM}-grainori.txt (one orientation
+# per grain).
 #
 # This script runs Neper and Gmsh only. The Python side of the pipeline is a
-# set of library modules with no command line, so the check images are trimmed
-# and the diagnostics written by ebsd_gb_diffusion.finish_diagnostics(), which
-# runs straight after this returns, and which also pastes ipf-key.png beside
-# check-ori.png: check-mesh.png, check-area.png and
-# ${STEM}-areachange.csv, the per-grain area change between raster and mesh.
-# That table is this stage's quality number, as the RMS disorientation out of
-# ctf_to_tesr.convert() is stage 1's.
+# set of library modules with no command line, so the two diagnostics that need
+# the mesh are written by ebsd_gb_diffusion.mesh_diagnostics(), which runs
+# straight after this returns: check-mesh.png (the reconstructed boundary edges
+# over the raster cells) and check-area.png / ${STEM}-areachange.csv, the
+# per-grain area change between raster and mesh. That table is this stage's
+# quality number, as the RMS disorientation out of ctf_to_tesr.convert() is
+# stage 1's.
+#
+# The renders of the raster itself -- <stem>-ori.png and <stem>-grains.png --
+# depend on the .tesr and nothing here, so ctf_to_tesr.convert(diagnostics=True)
+# makes them at conversion time. Nothing in this script calls neper -V.
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
@@ -34,10 +37,9 @@ set -euo pipefail
 : "${TESR:?set TESR to the EBSD raster tessellation (.tesr)}"
 : "${NEPER_BIN:=neper}"
 : "${GMSH_BIN:=gmsh}"
-: "${POVRAY_BIN:=povray}"            # neper -V renders through this
 : "${NEPER_ENV:=}"                   # bin dir of the neper environment, if any
 # Make the neper environment's helper programs visible without activating it:
-# neper -V spawns `povray` (and -M spawns gmsh) by name unless given a path.
+# neper -M spawns gmsh by name unless given a path.
 if [ -n "$NEPER_ENV" ]; then
     export PATH="$NEPER_ENV:$PATH"
 fi
@@ -52,10 +54,6 @@ fi
 # default: the converter is expected to have done the cropping and cleanup, and
 # skipping this avoids Neper's tesr write path (see stage 0).
 : "${TESR_TRANSFORM:=}"
-
-# check images. neper -V needs POV-Ray; a failure here is reported, not fatal.
-# The images land untrimmed and without a scale bar, which the caller adds.
-: "${CHECK_IMAGES:=1}"
 
 # interface smoothing before meshing (Neper's defaults). The reconstructed
 # boundaries are pixel staircases; Laplacian smoothing rounds them off.
@@ -133,56 +131,6 @@ if need "${STEM}-grainori.txt"; then
 fi
 NCELL=$(wc -l < "${STEM}-grainori.txt")
 echo "  grains: $NCELL"
-
-# -----------------------------------------------------------------------------
-# 0b. Check images. Look at these before trusting anything downstream: an
-#     inverted orientation convention shows up as IPF colours that disagree
-#     with AZtec/MTEX, and a bad segmentation as speckle or back-filled grains.
-# -----------------------------------------------------------------------------
-ORI_RENDERED=0
-if [ "$CHECK_IMAGES" = "1" ]; then
-    for img in check-ori check-grains; do
-        need "$img.png" || continue
-        if [ "$img" = check-ori ]; then
-            opts="-datavoxcol ori -datavoxcolscheme ipf"
-        else
-            opts=""
-        fi
-        # neper -V frames the flat map in the middle of a 3D canvas; the caller
-        # trims that border away and adds a scale bar, the trimmed width being LX
-        if "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img"
-        then
-            if [ "$img" = check-ori ]; then
-                ORI_RENDERED=1   # explicit if: `[ ] && x=1` returns 1 under set -e
-            fi
-        else
-            echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
-        fi
-    done
-fi
-
-# -----------------------------------------------------------------------------
-# 0c. IPF colour key. `-V` colours by orientation but does not print the key
-#     (neper.info/tutorials/orientation_color_key.html), so it is built the way
-#     that page documents: tessellate the standard stereographic triangle, mesh
-#     it, read the node colours out with `-statnode col_stdtriangle`, and render
-#     that. Cubic symmetry, as everywhere else here. It does not depend on the
-#     map, so it is built only when check-ori is: the driver trims it, labels
-#     the corners, pastes it beside check-ori.png and then deletes it, and a
-#     check-ori.png reused from an earlier run already has the key in it.
-# -----------------------------------------------------------------------------
-if [ "$ORI_RENDERED" = "1" ]; then
-    if "$NEPER_BIN" -T -n 1 -domain "stdtriangle(20)" -dim 2 -o stdtriangle \
-        && "$NEPER_BIN" -M stdtriangle.tess -cl 0.02 -statnode col_stdtriangle \
-        && "$NEPER_BIN" -V stdtriangle.msh -povray "$POVRAY_BIN" \
-            -datanodecol "col:file(stdtriangle.stnode)" -dataeltcol from_nodes \
-            -dataelt2dedgerad 0 -dataelt1drad 0.001 -showelt1d all \
-            -imagesize 800:400 -print ipf-key; then
-        rm -f stdtriangle.tess stdtriangle.msh stdtriangle.stnode
-    else
-        echo "  WARNING: could not build ipf-key.png; check-ori will have no key" >&2
-    fi
-fi
 
 # -----------------------------------------------------------------------------
 # 1. Mesh the raster. Gmsh v4 because FESTIM reads it with dolfinx.io.gmshio and

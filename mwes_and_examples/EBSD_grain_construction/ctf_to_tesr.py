@@ -19,6 +19,12 @@ keyword arguments or accepts ready-made. It is dumped to
 `settings_from_provenance`, because the crop window, the y mirror and the
 orientation convention cannot be recovered from the .tesr itself.
 
+With diagnostics=True the conversion also writes, beside the .tesr:
+<output>-quality.png (why each rejected pixel was rejected), -segerror.png/.csv
+(the per-voxel cost of segmenting), and, when the `neper` binary resolves,
+-ori.png and -grains.png, the rendered maps. Everything that depends only on
+this stage is produced here; the mesh diagnostics live with the mesh.
+
 What is written
 ---------------
 **general   dimension, XCells/YCells, XStep/YStep (microns unless `scale`)
@@ -57,13 +63,15 @@ square grids only (a hexagonal acquisition needs MTEX's `gridify` first).
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 import numpy as np
 from mesh_overlay import use_agg
-from micrograph import scale_bar_ax
+from micrograph import annotate_png, append_key, scale_bar_ax
 from orientation import (
     crystal_equivalents,
     cubic_disorientation_angle,
@@ -135,7 +143,14 @@ class Settings:
     #: `neper -M` aborts on a face whose boundary is not a single loop.
     topology_fix: bool = True
     voxel_ori: bool = True  #: write **oridata/**oridef (large; needed by -V)
-    diagnostics: bool = False  #: also write <output>-quality.png, -segerror.*
+    #: also write <output>-quality.png, -segerror.png/.csv, and, if `neper`
+    #: resolves, the two rendered maps -ori.png and -grains.png
+    diagnostics: bool = False
+    #: neper binary for the rendered check images, or None to skip them. They
+    #: are the only part of this module that shells out, and a missing binary
+    #: is a warning, not an error.
+    neper: str | None = "neper"
+    povray: str = "povray"  #: neper -V renders through this
 
     @property
     def unit(self):
@@ -649,6 +664,124 @@ def settings_from_provenance(path):
     return Settings(**{k: v for k, v in rec.items() if k in known})
 
 
+# --- rendered check images ---------------------------------------------------
+def _run(cmd, cwd, log):
+    """Run a Neper command, returning True on success and reporting on failure."""
+    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if out.returncode:
+        tail = (out.stderr or out.stdout).strip().splitlines()[-3:]
+        log(f"  WARNING: {Path(cmd[0]).name} {cmd[1]} failed: {' / '.join(tail)}")
+    return out.returncode == 0
+
+
+def render_checks(tesr, width, unit="um", neper="neper", povray="povray", log=print):
+    """Render the written raster with neper -V. Returns the paths written.
+
+    Two images, both of the .tesr this module just wrote and of nothing else,
+    which is why they belong here rather than in the meshing stage:
+
+      <stem>-ori.png     per-voxel orientation, IPF-Z, with the colour key
+      <stem>-grains.png  cell ids in Neper's integer palette
+
+    Look at these before trusting anything downstream: an inverted orientation
+    convention shows up as IPF colours that disagree with AZtec or MTEX, and a
+    bad segmentation as speckle or as obviously back-filled grains.
+
+    -V colours by orientation but does not print the key
+    (neper.info/tutorials/orientation_color_key.html), so the key is built the
+    way that page documents -- tessellate the standard stereographic triangle,
+    mesh it, read the node colours out with `-statnode col_stdtriangle` -- then
+    pasted beside the map and deleted.
+
+    Needs the neper binary and POV-Ray. A missing one is reported and skipped,
+    since everything else the conversion produces is pure Python.
+    """
+    tesr = Path(tesr)
+    work, stem = tesr.parent, tesr.stem
+    if shutil.which(neper) is None and not Path(neper).is_file():
+        log(f"  note: {neper!r} not found, skipping the rendered check images")
+        return []
+
+    written = []
+    for name, opts in (
+        ("ori", ["-datavoxcol", "ori", "-datavoxcolscheme", "ipf"]),
+        ("grains", []),
+    ):
+        png = work / f"{stem}-{name}.png"
+        cmd = [neper, "-V", tesr.name, "-povray", povray, *opts, "-print", png.stem]
+        if not _run(cmd, work, log):
+            continue
+        # neper -V frames the flat map in the middle of a 3D canvas, so the
+        # border comes off first; after that the image width *is* `width`
+        annotate_png(png, width, unit, trim_border=True, log=log)
+        written.append(png)
+
+    ori = work / f"{stem}-ori.png"
+    if ori in written:
+        tri, key = f"{stem}-stdtriangle", work / f"{stem}-ipfkey.png"
+        if (
+            _run(
+                [
+                    neper,
+                    "-T",
+                    "-n",
+                    "1",
+                    "-domain",
+                    "stdtriangle(20)",
+                    "-dim",
+                    "2",
+                    "-o",
+                    tri,
+                ],
+                work,
+                log,
+            )
+            and _run(
+                [
+                    neper,
+                    "-M",
+                    f"{tri}.tess",
+                    "-cl",
+                    "0.02",
+                    "-statnode",
+                    "col_stdtriangle",
+                ],
+                work,
+                log,
+            )
+            and _run(
+                [
+                    neper,
+                    "-V",
+                    f"{tri}.msh",
+                    "-povray",
+                    povray,
+                    "-datanodecol",
+                    f"col:file({tri}.stnode)",
+                    "-dataeltcol",
+                    "from_nodes",
+                    "-dataelt2dedgerad",
+                    "0",
+                    "-dataelt1drad",
+                    "0.001",
+                    "-showelt1d",
+                    "all",
+                    "-imagesize",
+                    "800:400",
+                    "-print",
+                    key.stem,
+                ],
+                work,
+                log,
+            )
+        ):
+            append_key(ori, key, log=log)
+            key.unlink()
+        for ext in (".tess", ".msh", ".stnode"):
+            (work / (tri + ext)).unlink(missing_ok=True)
+    return written
+
+
 # --- diagnostics -------------------------------------------------------------
 def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
     """Re-read the written tesr, compare with what was meant, return a report.
@@ -965,13 +1098,17 @@ def convert(ctf_path=None, output=None, *, settings=None, log=print, **kwargs):
             log(f"  {line}")
 
     lx, ly = nx * vox[0], ny * vox[1]
+    if opt.diagnostics and opt.neper:
+        render_checks(
+            out, lx, unit=opt.unit, neper=opt.neper, povray=opt.povray, log=log
+        )
     mean_px = counts.mean()
     grain_size = np.sqrt(mean_px) * vox[0]
     log(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
     log(f"  domain      : {lx:.4g} x {ly:.4g}")
     log(f"  grain size  : ~{grain_size:.4g} (equivalent square)")
     if not opt.diagnostics:
-        log("  set diagnostics=True to see why pixels are grey in check-ori")
+        log(f"  set diagnostics=True for {out.stem}-quality.png and the rest")
     if ncells > 400:
         side = grain_size * np.sqrt(250)
         log(
