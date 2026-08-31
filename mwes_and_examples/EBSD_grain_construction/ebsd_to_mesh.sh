@@ -2,20 +2,8 @@
 # A single EBSD map -> triangular mesh conforming to the raster's own grain
 # boundaries, for the FESTIM codim-1 grain-boundary transport script.
 #
-# This is "route A": `neper -M map.tesr` meshes the raster directly, which
-# Neper supports in 2D only (neper_m.html: "Free meshing of raster
-# tessellations works for 2D tessellations only"). Neper reconstructs the
-# interfaces of the raster into a vertex/edge/face topology, smooths them
-# (-tesrsmooth) and meshes that, so the mesh conforms to the measured
-# boundaries, non-convex ones included. Route B (fitting a convex-cell Laguerre
-# tessellation with -T -morpho tesr) was abandoned because its objective has a
-# floor set by grain convexity: with a median grain solidity of ~0.8 it left
-# ~17 % of the voxels in the wrong cell however long it ran.
-#
-# What route A does not give is a .tess, so there is no -statedge / -statver:
-# `-format tess` on a raster input segfaults in Neper 5.0.0 while "Writing
-# geometry results". Everything the transport script needs is recovered from
-# the mesh instead. The msh4 carries the reconstructed topology as physical
+# `neper -M map.tesr` meshes the raster directly, which is supported in 2D only.
+# The msh4 carries the reconstructed topology as physical
 # groups named ver#, edge#, face#, and face k is raster cell k, so:
 #
 #   grain boundary  : 1D element set "edge#", touching two "face#" sets
@@ -31,7 +19,7 @@
 #   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
 #   check-grains.png      raster coloured by cell id
 #
-# This script runs Neper and Gmsh and nothing else. The Python side of the
+# This script only runs Neper and Gmsh. The Python side of the
 # pipeline is a set of library modules with no command line, so the diagnostics
 # and the trimming of the two check images above are done by the caller --
 # ebsd_gb_diffusion.finish_diagnostics(), which runs straight after this script
@@ -54,9 +42,6 @@
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
 #
-# Docs: -T https://neper.info/doc/neper_t.html
-#       -M https://neper.info/doc/neper_m.html
-#       keys https://neper.info/doc/exprskeys.html
 # =============================================================================
 set -euo pipefail
 
@@ -116,10 +101,6 @@ need() {  # need <output> -> 0 if the stage must run
 # By default nothing is done to it: ctf_to_tesr.py already crops, fills holes,
 # and writes cell ids contiguously from 1 with the origin at (0,0), and its
 # grains are connected components so `rmsat` has nothing to remove. 
-#Set TESR_TRANSFORM to a Neper transformation chain if the input needs work
-# that the converter did not do, e.g.
-#   TESR_TRANSFORM="crop(square(...)),rmsat,autocrop,resetorigin,renumber,resetcellid"
-# and expect to need --no-voxel-ori due to the readback bug in Neper 5.0.0.
 # -----------------------------------------------------------------------------
 if need "${STEM}-raw.tesr"; then
     if [ -n "$TESR_TRANSFORM" ]; then
@@ -183,7 +164,6 @@ if [ "$CHECK_IMAGES" = "1" ]; then
         else
             opts=""
         fi
-        # shellcheck disable=SC2086
         # neper -V frames the flat map in the middle of a 3D canvas; the caller
         # trims that border away and adds a scale bar, the trimmed width being LX
         "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img" \
@@ -192,10 +172,8 @@ if [ "$CHECK_IMAGES" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 1. Mesh the raster. Linear triangles, Gmsh v4, all dimensions, because the
-#    FESTIM side reads it with dolfinx.io.gmshio and needs the 1D element sets
-#    intact (they carry the edge ids of the reconstructed boundary topology,
-#    which select the network and index theta).
+# 1. Mesh the raster with Gmsh v4, because FESTIM reads it with dolfinx.io.gmshio 
+#    & needs the 1D element sets to access edge ids of the reconstructed boundary topology
 #
 #    Neper reconstructs the interfaces, smooths them, then meshes the edges
 #    and faces with the -rcl-derived length. -tmp must exist beforehand.
@@ -219,26 +197,7 @@ if need "${STEM}.msh4"; then
 fi
 
 # Neper writes one .geo/.msh pair per tessellation entity into -tmp and deletes
-# them as it goes; anything left after a successful run is debris from an
-# earlier failure. Worth looking at if it was -M that failed -- running gmsh on
-# the offending .geo by hand is the usual way to find out why.
+# them as it goes. Nothing should be left there after a successful run. 
 rmdir tmp 2>/dev/null || echo "  note: $WORKDIR/tmp is not empty (stale gmsh scratch)"
 
 echo "ok: ${STEM}.msh4  (${NCELL} grains, domain ${LX} x ${LY})"
-
-# -----------------------------------------------------------------------------
-# The misorientations are exact: they come from the two grain orientations, and
-# a section measures those as well as a volume does. What a section cannot see
-# is the boundary plane normal (only its trace) and the out-of-plane paths.
-#
-# The consequence lands on connectivity, which is what the transport script
-# measures. Percolation thresholds differ sharply between the two: the fraction
-# of special boundaries needed to break up the random-boundary network is around
-# 0.35 in 2D and 0.775-0.85 in 3D (Schuh, Minich & Kumar, Phil. Mag. 83 (2003)
-# 711; Frary & Schuh, Phil. Mag. 85 (2005) 1123). So a THETA_MIN filter that
-# fragments this network may well leave the corresponding 3D one intact, and the
-# error is one-sided.
-#
-# The exception is a genuinely columnar microstructure -- thin films,
-# electrodeposits -- where the 2D treatment is not an approximation at all.
-# -----------------------------------------------------------------------------

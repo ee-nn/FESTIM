@@ -53,7 +53,11 @@ transport driver) would then be attached to the wrong grain.
 from __future__ import annotations
 
 import numpy as np
-from mesh_overlay import read_msh4, read_tesr, use_agg
+from mesh_overlay import (
+    read_msh4,
+    read_tesr,
+    use_agg,
+)
 from micrograph import scale_bar_ax
 
 

@@ -262,9 +262,9 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
     that mesh face k is raster cell k, which every theta downstream depends on,
     and grain_area_change.measure raises if it is not.
     """
-    from grain_area_change import measure
-    from mesh_overlay import overlay
-    from micrograph import annotate_png
+    from mwes_and_examples.EBSD_grain_construction.grain_area_change import measure
+    from mwes_and_examples.EBSD_grain_construction.mesh_overlay import overlay
+    from mwes_and_examples.EBSD_grain_construction.micrograph import annotate_png
 
     base = Path(base)
     work = base.parent
@@ -349,7 +349,11 @@ class Microstructure:
     """
 
     def __init__(self, base, mesh, cell_tags, facet_tags, extent):
-        from orientation import cubic_disorientation_angle, qconj, qmul
+        from mwes_and_examples.EBSD_grain_construction.orientation import (
+            cubic_disorientation_angle,
+            qconj,
+            qmul,
+        )
 
         if CRYSYM != "cubic":
             raise NotImplementedError(

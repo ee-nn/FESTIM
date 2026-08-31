@@ -7,5 +7,6 @@ res = convert(
     diagnostics=True,
     max_mad=1.5,
     allow_error=True,
+    crop="0,306,0,306",
 )
 res["segmentation_error"]["indexed"]["rms"]  # degrees
