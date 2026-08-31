@@ -244,7 +244,7 @@ def raster_extent(base):
     return float(lx), float(ly), float(vsx), float(vsy)
 
 
-def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
+def finish_diagnostics(base, unit=UNIT_NAME, check_images=True, keep_key=False):
     """The Python half of the meshing stage, run once the shell script is done.
 
     ebsd_to_mesh.sh drives Neper and Gmsh only; these four outputs come from the
@@ -253,7 +253,11 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
 
       check-ori.png, check-grains.png  the neper -V renders, border trimmed and
                                        a scale bar added; check-ori also gets
-                                       ipf-key.png pasted beside it
+                                       ipf-key.png pasted beside it, after
+                                       which the key is deleted unless
+                                       `keep_key` -- it is an intermediate, and
+                                       the shell rebuilds it whenever it
+                                       re-renders check-ori
       check-mesh.png                   the reconstructed boundary edges over the
                                        raster cells
       <stem>-areachange.csv, check-area.png
@@ -282,6 +286,8 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
                 key = work / "ipf-key.png"
                 if name == "check-ori" and key.is_file():
                     append_key(png, key)
+                    if not keep_key:
+                        key.unlink()
             except Exception as exc:  # Pillow missing, or a zero-size render
                 print(f"  WARNING: {png.name} left untrimmed ({exc})")
         overlay(tesr, msh4, output=str(work / "check-mesh.png"), unit=unit)

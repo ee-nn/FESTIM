@@ -139,6 +139,7 @@ echo "  grains: $NCELL"
 #     inverted orientation convention shows up as IPF colours that disagree
 #     with AZtec/MTEX, and a bad segmentation as speckle or back-filled grains.
 # -----------------------------------------------------------------------------
+ORI_RENDERED=0
 if [ "$CHECK_IMAGES" = "1" ]; then
     for img in check-ori check-grains; do
         need "$img.png" || continue
@@ -149,8 +150,14 @@ if [ "$CHECK_IMAGES" = "1" ]; then
         fi
         # neper -V frames the flat map in the middle of a 3D canvas; the caller
         # trims that border away and adds a scale bar, the trimmed width being LX
-        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img" \
-            || echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
+        if "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img"
+        then
+            if [ "$img" = check-ori ]; then
+                ORI_RENDERED=1   # explicit if: `[ ] && x=1` returns 1 under set -e
+            fi
+        else
+            echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
+        fi
     done
 fi
 
@@ -160,10 +167,11 @@ fi
 #     that page documents: tessellate the standard stereographic triangle, mesh
 #     it, read the node colours out with `-statnode col_stdtriangle`, and render
 #     that. Cubic symmetry, as everywhere else here. It does not depend on the
-#     map, so it is only built once; the driver trims it, labels the corners and
-#     pastes it beside check-ori.png.
+#     map, so it is built only when check-ori is: the driver trims it, labels
+#     the corners, pastes it beside check-ori.png and then deletes it, and a
+#     check-ori.png reused from an earlier run already has the key in it.
 # -----------------------------------------------------------------------------
-if [ "$CHECK_IMAGES" = "1" ] && need "ipf-key.png"; then
+if [ "$ORI_RENDERED" = "1" ]; then
     if "$NEPER_BIN" -T -n 1 -domain "stdtriangle(20)" -dim 2 -o stdtriangle \
         && "$NEPER_BIN" -M stdtriangle.tess -cl 0.02 -statnode col_stdtriangle \
         && "$NEPER_BIN" -V stdtriangle.msh -povray "$POVRAY_BIN" \
