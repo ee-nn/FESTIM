@@ -38,9 +38,9 @@ def use_agg():
     Called by every function here that writes a PNG. Kept out of module scope
     so that importing this file does not reach into a caller's matplotlib.
     """
-    import matplotlib
+    import matplotlib as mpl
 
-    matplotlib.use("Agg")
+    mpl.use("Agg")
     import matplotlib.pyplot as plt
 
     plt.rcParams.update(RCPARAMS)

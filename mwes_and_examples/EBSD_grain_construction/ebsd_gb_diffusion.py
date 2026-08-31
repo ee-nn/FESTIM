@@ -36,16 +36,18 @@ from pathlib import Path
 from mpi4py import MPI
 
 import dolfinx
-import matplotlib
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import ufl
 from dolfinx.io import gmsh as gmshio
 
-matplotlib.use("Agg")
+mpl.use("Agg")
+from grain_area_change import measure
 from matplotlib.collections import LineCollection
-from mesh_overlay import draw_raster, read_tesr
-from micrograph import scale_bar_ax
+from mesh_overlay import draw_raster, overlay, read_tesr
+from micrograph import annotate_png, scale_bar_ax
+from orientation import cubic_disorientation_angle, qconj, qmul
 
 import festim as F
 
@@ -110,7 +112,7 @@ try:
     _HERE = Path(__file__).resolve().parent
 except NameError:  # interactive session: no __file__
     _HERE = Path.cwd()
-WORKDIR = _HERE / "results"
+WORKDIR = Path(__file__).resolve().parent.parent / "results"
 MESH_SCRIPT = _HERE / "ebsd_to_mesh.sh"
 
 # Neper is a command-line program, so it does not have to live in the same conda
@@ -262,9 +264,6 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
     that mesh face k is raster cell k, which every theta downstream depends on,
     and grain_area_change.measure raises if it is not.
     """
-    from mwes_and_examples.EBSD_grain_construction.grain_area_change import measure
-    from mwes_and_examples.EBSD_grain_construction.mesh_overlay import overlay
-    from mwes_and_examples.EBSD_grain_construction.micrograph import annotate_png
 
     base = Path(base)
     work = base.parent
@@ -349,12 +348,6 @@ class Microstructure:
     """
 
     def __init__(self, base, mesh, cell_tags, facet_tags, extent):
-        from mwes_and_examples.EBSD_grain_construction.orientation import (
-            cubic_disorientation_angle,
-            qconj,
-            qmul,
-        )
-
         if CRYSYM != "cubic":
             raise NotImplementedError(
                 "theta is computed with the closed-form cubic disorientation "

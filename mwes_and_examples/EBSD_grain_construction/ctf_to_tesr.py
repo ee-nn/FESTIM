@@ -84,9 +84,9 @@ from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
-import matplotlib
+import matplotlib as mpl
 
-matplotlib.use("Agg")
+mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import ListedColormap
@@ -1376,7 +1376,7 @@ def measure_tesr_against_ctf(
     if against in ("voxel", "both"):
         if "vox_ori" in t:
             r = t["vox_ori"][::-1] if opt.flip_y else t["vox_ori"]
-            qvox = rodrigues_to_quat(sign * r).reshape(ok.shape + (4,))
+            qvox = rodrigues_to_quat(sign * r).reshape((*ok.shape, 4))
         else:
             log("  note: no **oridata in the tesr (voxel_ori=False); check skipped")
 
