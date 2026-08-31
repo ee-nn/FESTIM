@@ -3,68 +3,51 @@
     from segmentation_error import segmentation_error, format_report
     res = segmentation_error(qgrid, cellids, qcell, vox, ok=ok, threshold=10.0)
 
-ctf_to_tesr.convert() calls this itself and prints the report; to measure a
-.ctf/.tesr pair that already exists on disk, use
-ctf_to_tesr.measure_tesr_against_ctf(), which parses the .ctf and lines the two
-files up before calling in here.
+ctf_to_tesr.convert() calls this and prints the report; to measure a .ctf/.tesr
+pair already on disk use ctf_to_tesr.measure_tesr_against_ctf(), which parses
+the .ctf and lines the two files up first.
 
-A .ctf carries one orientation per pixel; a .tesr carries one orientation per
-*grain* (``**cell/*ori``), and that per-grain value is the only orientation the
-rest of the pipeline ever sees -- ``ebsd_to_mesh.sh`` reads it out with
-``-statcell rodrigues`` into ``${STEM}-grainori.txt`` and the transport driver
-builds every boundary theta from it. The difference between the two is the
-error introduced by segmenting, and it is what this script measures.
+A .ctf carries one orientation per pixel, a .tesr one per *grain*
+(``**cell/*ori``), and that per-grain value is the only orientation the rest of
+the pipeline sees: ebsd_to_mesh.sh reads it out with `-statcell rodrigues` and
+the transport driver builds every boundary theta from it. The difference is the
+cost of segmenting.
 
 Definition
 ----------
-For voxel i with area a_i = XStep x YStep, assigned to cell c(i),
+For voxel i of area a_i = XStep x YStep, assigned to cell c(i),
 
     theta_i = disorientation( q_ctf(i), q_cell(c(i)) )        [degrees]
 
-under the crystal symmetry declared in the tesr (cubic here), i.e. the minimum
-rotation angle over all symmetry-equivalent descriptions of the two
-orientations -- the same quantity the segmentation threshold is applied to.
-The reported norms are the discrete L2 norm of that field,
+under cubic symmetry, i.e. the minimum angle over all symmetry-equivalent
+descriptions -- the same quantity the segmentation threshold is applied to.
+Reported as the discrete L2 norm of that field and its normalised form,
 
-    ||theta||_L2      = sqrt( sum_i theta_i^2 a_i )            [deg * length]
-    ||theta||_L2 / sqrt(|Omega|)
-                      = sqrt( sum_i theta_i^2 a_i / sum_i a_i )
-                      = sqrt( mean_i theta_i^2 )               [deg]
+    ||theta||_L2 = sqrt( sum_i theta_i^2 a_i )                [deg * length]
+    ||theta||_L2 / sqrt(|Omega|) = sqrt( mean_i theta_i^2 )   [deg]
 
-The second is the headline number: it is the RMS disorientation of a pixel
-from the grain it was put in, in degrees, independent of how big the map is,
-and it is directly comparable with the segmentation threshold (--threshold,
-10 deg by default) and with the theta cutoff the transport script filters the
-boundary network on (THETA_MIN). Voxel areas are all equal on a square grid,
-so the area-weighted and unweighted forms coincide; the weighted form is
-computed anyway so that the number stays meaningful if XStep != YStep.
+The second is the headline: the RMS disorientation of a pixel from the grain it
+was put in, independent of map size and directly comparable with `threshold`
+(10 deg) and with the driver's THETA_MIN. Voxels are equal-area on a square
+grid so the weighted and unweighted forms coincide; the weights are carried
+anyway so the number stays right if XStep != YStep. This is the grain
+orientation spread (GOS) in RMS form (Wright, Nowell & Field, Microsc.
+Microanal. 17 (2011) 316), reported per grain as well as over the map.
 
-This is the grain-orientation-spread (GOS) field in RMS form
-(Wright, Nowell & Field, Microsc. Microanal. 17 (2011) 316, sec. "Grain
-Orientation Spread"), reported per grain as well as over the map.
+Two errors, not one. With ``qvox=None`` (the default) each pixel is compared
+with its *cell* orientation: the segmentation error, of order the intragranular
+spread, and irreducible -- one orientation per grain is what a tessellation is.
+Passing ``qvox`` compares it instead with its own ``**oridata`` entry, which
+measures transcription only and should land at the ~1e-6 deg arccos noise floor
+(orientation.self_test explains the amplification); anything larger means the
+convention flipped or the files are misaligned.
 
-Two errors, not one
--------------------
-``qvox=None`` (the default) compares each pixel with its *cell* orientation:
-the segmentation error, of order the intragranular spread, and irreducible --
-one orientation per grain is what a tessellation is.
-
-Passing ``qvox`` compares each pixel with the ``**oridata`` entry written
-for that same pixel: the transcription error of the Euler -> Rodrigues
-conversion and the ascii write. It should be ~1e-6 deg, which is the
-arccos-near-1 noise floor of the disorientation formula, not a real difference
-(orientation.self_test explains the amplification). Anything larger means the
-convention flipped or the file is misaligned; both are reported together.
-
-Alignment
----------
-The tesr covers the --crop window of the .ctf and may have been mirrored with
---flip-y, so the window and the flip have to be known to line the two files up.
-ctf_to_tesr.convert() writes them into ``<output>-provenance.json``, which
-ctf_to_tesr.measure_tesr_against_ctf() reads back. A mismatch in shape is a
-hard error, and a suspiciously large error with the right shape usually means
-the window is right but the flip is not; a wrong flip shows a
-mirror-symmetric theta map.
+Alignment. The tesr covers the `crop` window of the .ctf and may have been
+mirrored by `flip_y`, neither of which is recoverable from the .tesr, so
+convert() records them in <output>-provenance.json for
+measure_tesr_against_ctf() to read back. A shape mismatch is a hard error; a
+large error with the right shape and a mirror-symmetric theta map is a wrong
+flip.
 """
 
 from __future__ import annotations
@@ -76,13 +59,6 @@ from orientation import cubic_disorientation_angle, qconj, qmul
 
 
 # --- the measurement ---------------------------------------------------------
-def rodrigues_to_quat(r):
-    """Rodrigues vectors -> unit quaternions, q0 > 0."""
-    r = np.asarray(r, dtype=float).reshape(-1, 3)
-    q = np.column_stack((np.ones(len(r)), r))
-    return q / np.linalg.norm(q, axis=1)[:, None]
-
-
 def theta_field(qgrid, qref):
     """Per-voxel disorientation (degrees) between two (ny, nx, 4) quat fields."""
     a = qgrid.reshape(-1, 4)
@@ -109,7 +85,6 @@ def l2_stats(theta, mask, vox, threshold=None):
         "rms": float(np.sqrt(sq / n)),  # deg, = l2 / sqrt(area)
         "mean": float(t.mean()),
         "median": float(np.median(t)),
-        "p90": float(np.percentile(t, 90)),
         "p99": float(np.percentile(t, 99)),
         "max": float(t.max()),
     }
@@ -141,17 +116,15 @@ def segmentation_error(
     qgrid   (ny, nx, 4) per-pixel quaternions straight from the .ctf
     cellids (ny, nx)    grain id per pixel, 0 = unassigned, as in the tesr
     qcell   (ncell, 4)  one quaternion per grain, as in the tesr's **cell/*ori
-    ok      (ny, nx)    the quality mask, i.e. the tesr's **oridef. Voxels that
-                        failed it carry a meaningless orientation, so they are
-                        excluded from the headline number and reported apart.
-    qvox    (ny, nx, 4) the tesr's **oridata, if it was written, for the
-                        transcription check.
-    backfilled (ny, nx) voxels that fill_holes assigned to their nearest cell
-                        rather than to a grain of their own -- quality
-                        rejections *and* pixels whose grain was pruned by
-                        --min-pixels. Their theta is not a segmentation error
-                        but the price of filling, so they are counted apart.
-                        Defaults to ~ok, which catches only the first kind.
+    ok      (ny, nx)    quality mask, i.e. the tesr's **oridef; failed voxels
+                        carry a meaningless orientation and are reported apart
+    qvox    (ny, nx, 4) the tesr's **oridata, for the transcription check
+    backfilled (ny, nx) voxels fill_holes gave to their nearest cell rather
+                        than to a grain of their own -- quality rejections
+                        *and* grains the min_pixels prune removed. Their theta
+                        is the price of filling, not a segmentation error, so
+                        they are counted apart. Defaults to ~ok, which catches
+                        only the first kind.
     """
     ncells = int(cellids.max())
     assigned = cellids > 0
@@ -178,9 +151,7 @@ def segmentation_error(
     )
     res["grain_rms"], res["grain_npx"] = rms, cnt
     if qvox is not None:
-        tv = theta_field(qgrid, qvox)
-        res["theta_voxel"] = np.where(ok, tv, np.nan)
-        res["voxel"] = l2_stats(tv, ok, vox)
+        res["voxel"] = l2_stats(theta_field(qgrid, qvox), ok, vox)
     return res
 
 
@@ -195,7 +166,7 @@ def format_report(res, label="segmentation"):
     )
     lines.append(
         f"{label}   : mean {a['mean']:.3f}, median {a['median']:.3f}, "
-        f"p90 {a['p90']:.3f}, p99 {a['p99']:.3f}, max {a['max']:.3f} deg"
+        f"p99 {a['p99']:.3f}, max {a['max']:.3f} deg"
     )
     if "frac_over" in a:
         lines.append(
@@ -319,7 +290,11 @@ def write_csv(path, res, log=print):
 
 # --- reading a written tesr back ---------------------------------------------
 def read_tesr_full(path):
-    """header, **cell/*ori, **data, **oridata, **oridef of an ascii tesr."""
+    """header, **cell/*ori, **data, **oridata, **oridef of an ascii tesr.
+
+    The superset of mesh_overlay.read_tesr, which returns only the cell map;
+    ctf_to_tesr's read-back check uses this one too.
+    """
     with open(path) as fh:
         tok = fh.read().split()
     i = tok.index("**general")

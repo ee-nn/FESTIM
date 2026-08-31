@@ -1,80 +1,57 @@
-"""Convert an Oxford/Channel .ctf EBSD map into a Neper Raster Tessellation
-File (.tesr), including the grain segmentation that a .ctf does not contain.
-
-There is no official converter, one simply needs to do this by hand.
-
-The part that is not a transcription is the segmentation. A .ctf holds an
-orientation per pixel and nothing else; `neper -T -morpho tesr` fits its cells
-to the *cells* of the raster, so the file needs a `**cell` section and a
-`**data` section assigning every pixel to a grain. Grains are found here by
-flood-filling across neighbouring pixels whose disorientation is below a
-threshold, with cubic crystal symmetry taken into account.
-
-Example usage:
+"""Convert an Oxford/Channel .ctf EBSD map into a Neper raster tessellation
+(.tesr), including the grain segmentation a .ctf does not carry.
 
     from ctf_to_tesr import convert
     res = convert("map.ctf", "ebsd.tesr", min_pixels=20, diagnostics=True)
     res["segmentation_error"]["indexed"]["rms"]   # degrees
 
-then point the transport pipeline at the result:
+then set TESR = "ebsd.tesr" in ebsd_gb_diffusion.py.
 
-    TESR = "ebsd.tesr"   in ebsd_gb_diffusion.py
+There is no official converter; the transcription is straightforward but the
+segmentation is not. A .ctf holds an orientation per pixel and nothing else,
+while a .tesr needs a `**cell` section and a `**data` section putting every
+pixel in a grain. Grains are found here by flood-filling across neighbouring
+pixels whose disorientation is below `threshold`, under cubic symmetry.
 
-Every choice the conversion makes lives in the `Settings` dataclass, which
-`convert` will build from keyword arguments or accept ready-made. It is dumped
-into <output>-provenance.json alongside the .tesr, and read back by
+Every choice lives in the `Settings` dataclass, which `convert` builds from
+keyword arguments or accepts ready-made. It is dumped to
+<output>-provenance.json beside the .tesr and read back by
 `settings_from_provenance`, because the crop window, the y mirror and the
-orientation convention are not recoverable from the .tesr itself.
+orientation convention cannot be recovered from the .tesr itself.
 
 What is written
 ---------------
-**general   dimension, XCells/YCells, XStep/YStep (in microns by default)
-**cell      grain count, ids, crysym, and one mean orientation per grain
+**general   dimension, XCells/YCells, XStep/YStep (microns unless `scale`)
+**cell      grain count, ids, crysym, one mean orientation per grain
 **data      grain id of every pixel, contiguous from 1, 0 where unindexed
-**oridata   per-pixel orientation (optional; large, but needed for -V and GOS)
+**oridata   per-pixel orientation (optional; large, needed for -V and GOS)
 **oridef    per-pixel indexing flag, 0 where the point was rejected
 
-Length unit
------------
-The tesr is written in the .ctf's own unit (microns) unless `scale` is given.
-The transport driver converts to metres after reading
-the mesh (TESR_UNIT in ebsd_gb_diffusion.py).
+The driver rescales to metres after meshing (TESR_UNIT), so leave `scale` at 1.
 
 Orientation convention
 ----------------------
-Euler angles in a .ctf are Bunge (phi1, Phi, phi2) in degrees, referred to the
-sample frame. They are converted to Rodrigues vectors under Neper's default
-`passive` convention -- the rotation of the sample coordinate system into the
-crystal one. The file is written as tesr format 2.2: Neper 4.10.0 swapped the
-meaning of `active` and `passive` and bumped the tesr version to 2.2, and a
-file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
+Bunge (phi1, Phi, phi2) in degrees go to Rodrigues vectors under Neper's
+default `passive` convention. Rodrigues rather than passing the angles through
+because it removes any degrees-vs-radians ambiguity in the tesr reader; reduced
+to the cubic fundamental zone first, which also keeps the vector finite (a
+180 deg rotation has none). `orientation.self_test`, which `convert` runs
+first, pins this against Neper's own convention table.
+
+The file declares tesr format 2.2 deliberately: Neper 4.10.0 swapped the
+meaning of `active` and `passive` and bumped the version, and a file claiming
+2.1 has its `**cell/*ori` descriptor silently flipped on read
 (neut_tesr_fscanf2.c, "Fixing orientation convention") while `**oridata` is
-taken literally, leaving the two sections in opposite conventions. The
-conversion is verified against Neper's own convention table,
-which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
-(0.965925826, 0.258819045, 0, 0); see `orientation.self_test`, which
-`convert` runs before it touches a file.
+taken literally -- leaving the two sections in opposite conventions.
 
-Rodrigues is used rather than passing the Euler angles through unchanged
-because it removes any degrees-versus-radians ambiguity in the tesr reader.
-Orientations are reduced to the cubic fundamental zone first, which also keeps
-the Rodrigues vector finite (a 180-degree rotation has none).
+Any symmetry-equivalent representative is equally correct, since the crysym is
+declared and Neper applies it. The active/passive choice is not free, so check
+check-ori.png against AZtec or MTEX; if the colours look inverted, re-run with
+active=True.
 
-Because the crystal symmetry is declared in the file, any symmetry-equivalent
-representative is equally correct -- Neper applies the symmetry itself. What
-is *not* free is the active/passive choice, so verify the output visually:
-
-    neper -V ebsd.tesr -datavoxcol ori -datavoxcolscheme ipf -print check
-
-and compare against the same map plotted in AZtec or MTEX. If the colours are
-wrong in a way that looks like an inversion, re-run with active=True.
-
-Limitations
------------
-* Cubic symmetry only. The disorientation uses a closed form specific to the
-  cubic group. For hex or lower, segment in MTEX and write out grain ids instead.
-* Square grids only, which is what JobMode Grid with XStep == YStep gives. A
-  hexagonal acquisition must be resampled first (MTEX's `gridify`).
+Limitations: cubic only (the disorientation is a closed form specific to that
+group -- for hex or lower, segment in MTEX and import the grain ids), and
+square grids only (a hexagonal acquisition needs MTEX's `gridify` first).
 """
 
 from __future__ import annotations
@@ -84,13 +61,8 @@ from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
-import matplotlib as mpl
-
-mpl.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import ListedColormap
-from matplotlib.patches import Rectangle
+from mesh_overlay import use_agg
 from micrograph import scale_bar_ax
 from orientation import (
     crystal_equivalents,
@@ -100,27 +72,15 @@ from orientation import (
     qconj,
     qmul,
     quat_to_rodrigues,
+    rodrigues_to_quat,
     self_test,
     to_fundamental_zone,
 )
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from segmentation_error import (
-    format_report,
-    read_tesr_full,
-    rodrigues_to_quat,
-    segmentation_error,
-)
+from segmentation_error import format_report, read_tesr_full, segmentation_error
 from segmentation_error import write_csv as write_segerr_csv
 from segmentation_error import write_png as write_segerr_png
-
-plt.rcParams.update(
-    {
-        "font.size": 16,  # Baseline text, labels, ticks, and legends
-        "axes.titlesize": 16,  # Subplot titles
-        "figure.titlesize": 16,  # Global figure super title
-    }
-)
 
 # --- Channel conventions -----------------------------------------------------
 # Field 4 of a .ctf phase line is the Channel Laue group index. Mapped onto the
@@ -146,56 +106,37 @@ CUBIC_LAUE = (10, 11)
 class Settings:
     """Every choice `convert` makes, in one object.
 
-    It is passed to the writers rather than being unpacked into loose keyword
-    arguments, so a caller constructing one of these by hand gets exactly the
-    same behaviour, and so the fields that end up in the provenance json have a
-    single definition.
+    Passed whole to the writers, so a caller building one by hand gets exactly
+    the same behaviour and the fields reaching the provenance json have a
+    single definition. The four with a non-obvious rationale are commented; the
+    rest say what they do.
     """
 
     ctf: str
-    #: xmin,xmax,ymin,ymax in the .ctf's own units (microns), applied before
-    #: segmentation. Prefer this to Neper's -transform crop: cropping
-    #: afterwards clips grains into 1-2 pixel slivers that no `min_pixels`
-    #: prune has seen, and those degenerate cells abort the tessellation fit.
+    #: xmin,xmax,ymin,ymax in the .ctf's units, applied before segmentation.
+    #: Prefer this to Neper's -transform crop, which clips grains into 1-2 px
+    #: slivers that no `min_pixels` prune has seen and that abort the fit.
     crop: str | None = None
-    #: phase to keep
-    phase: int = 1
-    #: grain boundary misorientation threshold, degrees
-    threshold: float = 10.0
-    #: MAD cutoff
-    max_mad: float = 1.0
-    #: minimum Bands; 0 disables the test
-    min_bands: int = 0
-    #: keep points whose Error column is non-zero
-    allow_error: bool = False
-    #: discard grains smaller than this many pixels
-    min_pixels: int = 5
-    #: multiply step sizes by this to get the tesr length unit (1 keeps the
-    #: .ctf's microns). Do not write metres: Neper's fit objective and its
-    #: val/eps stopping criteria are in absolute length units, so a metre-scale
-    #: map stops the fit at iteration 1. The driver rescales to metres after
-    #: meshing (TESR_UNIT).
+    phase: int = 1  #: phase to keep
+    threshold: float = 10.0  #: grain boundary misorientation, degrees
+    max_mad: float = 1.0  #: MAD cutoff
+    min_bands: int = 0  #: minimum Bands; 0 disables the test
+    allow_error: bool = False  #: keep points whose Error column is non-zero
+    min_pixels: int = 5  #: discard grains smaller than this
+    #: step size multiplier giving the tesr length unit. Do not write metres:
+    #: Neper's fit objective and its val/eps criteria are in absolute lengths,
+    #: so a metre-scale map stops the fit at iteration 1.
     scale: float = 1.0
-    #: mirror the map in y. EBSD map coordinates usually run downwards while
-    #: Neper's y runs upwards, so set this if the physical top surface of the
-    #: specimen must end up at y = Ly.
+    #: mirror in y. EBSD coordinates usually run downwards and Neper's y runs
+    #: up, so set this to put the specimen's top surface at y = Ly.
     flip_y: bool = False
-    #: write orientations under the active convention instead of passive
-    active: bool = False
-    #: grow the cells into unassigned voxels. With fill=False the holes act as
-    #: interior surfaces in the tessellation fit, which is only useful for
-    #: inspecting how much of the map was rejected.
-    fill: bool = True
-    #: clean up enclosed grains and corner-only self-contacts. On by default
-    #: because `neper -M` aborts on a face whose boundary is not a single loop;
-    #: turn it off only for a consumer that can handle those.
+    active: bool = False  #: write orientations active rather than passive
+    fill: bool = True  #: grow cells into unassigned voxels; see fill_holes
+    #: clean up enclosed grains and corner-only self-contacts, because
+    #: `neper -M` aborts on a face whose boundary is not a single loop.
     topology_fix: bool = True
-    #: write **oridata/**oridef. False gives a much smaller file and keeps the
-    #: grain orientations, but loses per-pixel colouring in -V and GOS in -S.
-    voxel_ori: bool = True
-    #: also write <output>-quality.png, <output>-raw.png and
-    #: <output>-segerror.png/.csv. Needs matplotlib and Pillow.
-    diagnostics: bool = False
+    voxel_ori: bool = True  #: write **oridata/**oridef (large; needed by -V)
+    diagnostics: bool = False  #: also write <output>-quality.png, -segerror.*
 
     @property
     def unit(self):
@@ -710,278 +651,61 @@ def settings_from_provenance(path):
 
 
 # --- diagnostics -------------------------------------------------------------
-def _scale_bar(ax, width, unit):
-    """Kept as a name the figure code already uses; micrograph does the work."""
-    scale_bar_ax(ax, width, unit)
-
-
-def _ipf_triangle_rgb(d):
-    """RGB for crystal directions (n, 3): [001] red, [101] green, [111] blue.
-
-    The direction is taken to the standard triangle by |components| sorted so
-    that k <= h <= l, then coloured (l - h, h - k, k) normalised to unit
-    maximum. Shared by the map colouring and its legend so the two cannot
-    drift apart.
-    """
-    d = np.sort(np.abs(d), axis=1)  # k <= h <= l
-    k, h, l = d[:, 0], d[:, 1], d[:, 2]  # noqa: E741
-    rgb = np.stack((l - h, h - k, k), 1)
-    rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1e-12)
-    return rgb
-
-
-def ipf_z_colours(q):
-    """Simplified IPF-Z colouring of quaternions (n, 4), cubic symmetry.
-
-    The crystal-frame direction of the sample z axis is coloured by
-    `_ipf_triangle_rgb`. It is a simplified scheme -- AZtec and neper -V use
-    their own angle-based interpolations, so shades differ from check-ori.png
-    -- but the raw and read-back panels use the *same* scheme, which is what
-    makes them comparable.
-    """
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    # The sample Z axis in crystal coordinates is g e_z with g the Bunge
-    # sample->crystal matrix. For this quaternion convention the standard
-    # quaternion->matrix formula gives R(q) = g^T (self_test checks it), so the
-    # vector wanted is the third *row* of R(q). The third column would be the
-    # crystal [001] axis in sample coordinates -- a valid colouring, but not
-    # an IPF-Z, and not what neper -V's ipf scheme shows.
-    d = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), 1)
-    return _ipf_triangle_rgb(d)
-
-
-def ipf_legend_ax(ax, n=500):
-    """Draw the cubic IPF colour key (001-101-111) into `ax`.
-
-    The standard stereographic triangle, coloured pixel by pixel with the same
-    `_ipf_triangle_rgb` the maps use, so the key is the legend of what is
-    actually plotted rather than a stock image. A direction d projects to
-    (dx, dy) / (1 + dz), and the triangle is the set with 0 <= dy <= dx <= dz,
-    whose corners land at (0, 0), (sqrt(2) - 1, 0) and (sqrt(3) - 1) / 2 twice
-    over.
-    """
-    xmax, ymax = np.sqrt(2) - 1, (np.sqrt(3) - 1) / 2
-    gx, gy = np.meshgrid(np.linspace(0, xmax * 1.02, n), np.linspace(0, ymax * 1.02, n))
-    # inverse stereographic projection
-    r2 = gx**2 + gy**2
-    d = np.stack((2 * gx, 2 * gy, 1 - r2), -1) / (1 + r2)[..., None]
-    inside = (d[..., 1] <= d[..., 0] + 1e-9) & (d[..., 0] <= d[..., 2] + 1e-9)
-
-    rgba = np.ones((*gx.shape, 4))
-    rgba[..., :3] = _ipf_triangle_rgb(d.reshape(-1, 3)).reshape((*gx.shape, 3))
-    rgba[..., 3] = inside
-    ax.imshow(
-        rgba,
-        origin="lower",
-        extent=(0, xmax * 1.02, 0, ymax * 1.02),
-        interpolation="bilinear",
-    )
-    # outline: the 001-101 and 001-111 edges are straight, 101-111 is an arc
-    ax.plot([0, xmax], [0, 0], color="0.25", lw=1.0)
-    ax.plot([0, ymax], [0, ymax], color="0.25", lw=1.0)
-    t = np.linspace(0, 1, 200)
-    dx = np.stack((np.ones_like(t), t, np.ones_like(t)), 1)  # dx = dz, dy free
-    dx /= np.linalg.norm(dx, axis=1, keepdims=True)
-    ax.plot(dx[:, 0] / (1 + dx[:, 2]), dx[:, 1] / (1 + dx[:, 2]), color="0.25", lw=1.0)
-    for (px, py), label, ha, va in (
-        ((0, 0), "001", "center", "top"),
-        ((xmax, 0), "101", "center", "top"),
-        ((ymax, ymax), "111", "center", "bottom"),
-    ):
-        ax.annotate(
-            label,
-            (px, py),
-            textcoords="offset points",
-            xytext=(0, -6 if va == "top" else 6),
-            ha=ha,
-            va=va,
-            fontsize=14,
-        )
-    ax.set_aspect("equal")
-    ax.set_xlim(-0.03, xmax + 0.03)
-    ax.set_ylim(-0.06, ymax + 0.06)
-    ax.axis("off")
-    return ax
-
-
-def read_tesr_back(path):
-    """
-    Minimal reader for what this script writes:
-    header, **data, **oridata, **oridef.
-    """
-    with open(path) as fh:
-        tok = fh.read().split()
-    i = tok.index("**general")
-    nx, ny = int(tok[i + 2]), int(tok[i + 3])
-    vox = (float(tok[i + 4]), float(tok[i + 5]))
-    n = nx * ny
-    out = {"nx": nx, "ny": ny, "vox": vox}
-    i = tok.index("**data")
-    out["cells"] = np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx)
-    if "**oridata" in tok:
-        i = tok.index("**oridata")
-        out["orides"] = tok[i + 1]
-        r = np.array(tok[i + 3 : i + 3 + 3 * n], dtype=float).reshape(n, 3)
-        qq = np.column_stack((np.ones(n), r))
-        out["quat"] = (qq / np.linalg.norm(qq, axis=1)[:, None]).reshape(ny, nx, 4)
-        i = tok.index("**oridef")
-        out["oridef"] = (
-            np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx).astype(bool)
-        )
-    return out
-
-
 def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
-    """Re-read the written tesr and compare with what was meant to be written.
+    """Re-read the written tesr, compare with what was meant, return a report.
 
     Three checks: the cell map is identical, `**oridef` is the quality mask,
-    and every voxel orientation read back is the same rotation as the raw
-    Euler triple (disorientation under cubic symmetry ~ 0; the file holds a
-    symmetry-equivalent, fundamental-zone representative, so identity is only
-    expected up to the symmetry group, which is what the disorientation
-    measures).
+    and every voxel orientation read back is the same rotation as the raw Euler
+    triple. The file holds a fundamental-zone representative, so equality is
+    only expected up to the symmetry group -- which is what a disorientation
+    measures, hence ~0 rather than exactly 0.
     """
-    back = read_tesr_back(path)
+    back = read_tesr_full(path)
     exp_cells = cellids[::-1] if flip_y else cellids
     exp_ok = ok[::-1] if flip_y else ok
     exp_q = qgrid[::-1] if flip_y else qgrid
-    report = []
     same_cells = np.array_equal(back["cells"], exp_cells)
-    report.append(
+    report = [
         f"read-back: cell ids {'identical' if same_cells else 'DIFFER'} "
         f"({back['nx']} x {back['ny']} voxels)"
-    )
-    result = {"cells_ok": same_cells, "dis": None, "oridef_ok": None}
-    if "quat" in back:
+    ]
+    if "vox_ori" in back:
         same_def = np.array_equal(back["oridef"], exp_ok)
-        result["oridef_ok"] = same_def
         report.append(
-            f"read-back: **oridef \
-                {'identical' if same_def else 'DIFFERS'} to the quality mask"
+            f"read-back: **oridef {'identical' if same_def else 'DIFFERS'} "
+            "to the quality mask"
         )
         dis = cubic_disorientation_angle(
-            qmul(qconj(exp_q.reshape(-1, 4)), back["quat"].reshape(-1, 4))
-        ).reshape(exp_q.shape[:2])
-        result["dis"] = dis[::-1] if flip_y else dis
+            qmul(qconj(exp_q.reshape(-1, 4)), rodrigues_to_quat(back["vox_ori"]))
+        )
         report.append(
             f"read-back: voxel orientations vs raw Euler angles: max "
             f"{dis.max():.2e} deg, mean {dis.mean():.2e} deg over {dis.size} voxels"
             + ("" if dis.max() < 1e-3 else "  <-- NOT a round trip")
         )
-    result["report"] = report
-    return result
-
-
-def write_raw_png(
-    path,
-    qgrid_full,
-    ok_full,
-    window,
-    qgrid,
-    ok,
-    check,
-    ctf,
-    opt,
-    vox,
-    unit,
-    log=print,
-):
-    """<output>-raw.png: the .ctf as read, and the window that was written.
-
-    (a) the whole map, IPF-Z from the raw Euler angles, with the crop window
-    drawn; (b) the window from the raw Euler angles; and the IPF colour key
-    beside them. The read-back and round-trip panels that used to sit below
-    are gone; the round-trip number itself is still computed by
-    verify_readback, printed in the report, and repeated under panel (b), so
-    a convention flip or a mangled write is still visible here.
-    """
-
-    NY, NX = ok_full.shape
-    ny, nx = ok.shape
-    xs, ys = ctf.header["XStep"] * opt.scale, ctf.header["YStep"] * opt.scale
-
-    full_rgb = ipf_z_colours(qgrid_full.reshape(-1, 4)).reshape(NY, NX, 3)
-    full_rgb[~ok_full] = 0.6
-    win_rgb = ipf_z_colours(qgrid.reshape(-1, 4)).reshape(ny, nx, 3)
-    win_rgb[~ok] = 0.6
-
-    aspect = max(NY / NX, ny / nx)
-    fig = plt.figure(figsize=(13.5, 1.2 + 5.9 * aspect), layout="constrained")
-    grid = fig.add_gridspec(1, 3, width_ratios=(1, 1, 0.3))
-    axes = [fig.add_subplot(grid[0, i]) for i in range(3)]
-    kw_full = dict(
-        interpolation="nearest", origin="lower", extent=(0, NX * xs, 0, NY * ys)
-    )
-    kw = dict(
-        interpolation="nearest", origin="lower", extent=(0, nx * vox[0], 0, ny * vox[1])
-    )
-
-    ax = axes[0]
-    ax.imshow(full_rgb, **kw_full)
-    y0, y1 = window[0].start, window[0].stop
-    x0, x1 = window[1].start, window[1].stop
-    ax.add_patch(
-        Rectangle(
-            (x0 * xs, y0 * ys),
-            (x1 - x0) * xs,
-            (y1 - y0) * ys,
-            fill=False,
-            ec="white",
-            lw=1.5,
-        )
-    )
-    ax.set_title(
-        f"whole .ctf: {NX} x {NY} px \ngrey = rejected ({100 * (~ok_full).mean():.1f}%)"
-    )
-    _scale_bar(ax, NX * xs, unit)
-
-    ax = axes[1]
-    ax.imshow(win_rgb, **kw)
-    ax.set_title("window, raw Euler angles (simplified IPF-Z)")
-    if check["dis"] is not None:
-        worst = check["dis"].max()
-        verdict = "round trip exact" if worst < 1e-3 else "MISMATCH"
-        ax.set_xlabel(f"read back from the .tesr: max {worst:.1e} deg, {verdict}")
-    else:
-        ax.set_xlabel("no **oridata in the tesr (--no-voxel-ori), not read back")
-    _scale_bar(ax, nx * vox[0], unit)
-
-    for ax in axes[:2]:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    ipf_legend_ax(axes[2])
-    axes[2].set_title("IPF-Z key", fontsize=16)
-
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    if log:
-        log(f"  wrote {path}")
-    return path
+    return report
 
 
 def write_quality_png(
     path, diag, ok, unassigned, cellids, opt, vox, unit, flip_y=False, log=print
 ):
-    """Four panels tracing every grey pixel of `neper -V ... -datavoxcol ori`.
+    """Three panels tracing every grey pixel of `neper -V ... -datavoxcol ori`.
 
-    Neper paints a voxel grey when `**oridef` is 0, and this script writes
-    `**oridef` from the quality mask `ok` -- so a grey pixel is a point the
-    .ctf's own columns failed: Error != 0 (unless --allow-error), MAD above
-    --max-mad, Bands below --min-bands, or the wrong phase. The panels show:
-    Error column, MAD column, rejection reason, and which pixels of the
-    final cell map were back-filled from the nearest surviving cell
-    because they were rejected or belonged to a pruned grain.
+    Neper paints a voxel grey where `**oridef` is 0, and that is written from
+    the quality mask, so a grey pixel is one the .ctf's own columns failed. The
+    panels are the MAD column (which is what the max_mad cut has to be chosen
+    against), which test rejected each pixel, and which pixels the cell map
+    back-filled because they were rejected or belonged to a pruned grain.
     """
+
+    plt = use_agg()
+    from matplotlib.colors import ListedColormap
 
     def orient(a):
         return a[::-1] if flip_y else a
 
     ny, nx = ok.shape
-    err = diag.get("Error")
-    mad = diag.get("MAD")
-    bands = diag.get("Bands")
-    phase = diag.get("Phase")
+    mad, err, bands, phase = (diag.get(k) for k in ("MAD", "Error", "Bands", "Phase"))
 
     # rejection reason, first failing test wins
     reason = np.zeros((ny, nx), dtype=int)  # 0 kept
@@ -994,61 +718,39 @@ def write_quality_png(
     if bands is not None and opt.min_bands:
         reason[(reason == 0) & (bands < opt.min_bands)] = 3
     reason[ok] = 0
-    labels = [
-        "kept",
-        "Error != 0",
-        f"MAD > {opt.max_mad:g}",
-        "Bands < min",
-        "other phase",
-    ]
+    labels = ["kept", "Error != 0", f"MAD > {opt.max_mad:g}", "Bands < min", "phase"]
+    counts = np.bincount(reason.ravel(), minlength=5)
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 10 * ny / nx))
+    fig, axes = plt.subplots(
+        1, 3, figsize=(16, 2.4 + 5.2 * ny / nx), layout="constrained"
+    )
     kw = dict(
-        interpolation="nearest",
-        origin="lower",
-        extent=(0, nx * vox[0], 0, ny * vox[1]),
+        interpolation="nearest", origin="lower", extent=(0, nx * vox[0], 0, ny * vox[1])
     )
 
-    ax = axes[0, 0]
-    if err is not None:
-        codes = np.unique(err[err >= 0]).astype(int)
-        im = ax.imshow(orient(err), cmap="tab10", vmin=-0.5, vmax=9.5, **kw)
-        cb = fig.colorbar(im, ax=ax, ticks=codes, fraction=0.046)
-        cb.set_label("Error column (0 = indexed, 3 = no solution)")
-        ax.set_title(
-            "ctf Error code: "
-            + ", ".join(f"{c}: {int((err == c).sum())}" for c in codes)
-        )
-    else:
-        ax.set_title("no Error column")
-
-    ax = axes[0, 1]
+    ax = axes[0]
     if mad is not None:
         im = ax.imshow(
             orient(mad), cmap="viridis", vmin=0, vmax=max(opt.max_mad * 1.5, 1.0), **kw
         )
         fig.colorbar(im, ax=ax, fraction=0.046).set_label("MAD (deg)")
-        over = int((mad > opt.max_mad).sum())
-        ax.set_title(f"ctf MAD: {over} px above max_mad {opt.max_mad:g}")
+        ax.set_title(f"MAD: {int((mad > opt.max_mad).sum())} px over max_mad")
     else:
         ax.set_title("no MAD column")
 
-    ax = axes[1, 0]
+    ax = axes[1]
     cmap = ListedColormap(["white", "tab:red", "tab:orange", "tab:purple", "tab:brown"])
     im = ax.imshow(orient(reason), cmap=cmap, vmin=-0.5, vmax=4.5, **kw)
-    cb = fig.colorbar(im, ax=ax, ticks=range(5), fraction=0.046)
-    cb.set_ticklabels(labels)
-    counts = np.bincount(reason.ravel(), minlength=5)
+    fig.colorbar(im, ax=ax, ticks=range(5), fraction=0.046).set_ticklabels(labels)
     ax.set_title(
-        f"rejected (grey in neper -V): {int((~ok).sum())} of {ok.size} px "
+        f"rejected (grey in -V): {int((~ok).sum())}/{ok.size} px "
         f"({100 * (~ok).mean():.1f} %)"
     )
 
-    ax = axes[1, 1]
+    ax = axes[2]
     ncell = int(cellids.max())
     perm = np.random.default_rng(0).permutation(ncell) + 1
-    shown = np.where(cellids > 0, perm[np.maximum(cellids - 1, 0)], 0).astype(float)
-    shown[cellids == 0] = np.nan
+    shown = np.where(cellids > 0, perm[np.maximum(cellids - 1, 0)], np.nan)
     ax.imshow(orient(shown), cmap="tab20", **kw)
     filled = unassigned & (cellids > 0)
     ax.imshow(
@@ -1058,19 +760,18 @@ def write_quality_png(
         **kw,
     )
     ax.set_title(
-        f"{ncell} cells; {int(filled.sum())} px back-filled (dark), "
-        f"{int((cellids == 0).sum())} left empty"
+        f"{ncell} cells, {int(filled.sum())} px back-filled (dark), "
+        f"{int((cellids == 0).sum())} empty"
     )
 
-    for ax in axes.ravel():
+    for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
-        _scale_bar(ax, nx * vox[0], unit)
+        scale_bar_ax(ax, nx * vox[0], unit)
     fig.suptitle(
-        f"{Path(opt.ctf).name}: \
-            {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
+        f"{Path(opt.ctf).name}: "
+        + ", ".join(f"{labels[k]} {counts[k]}" for k in range(5) if counts[k])
     )
-    fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
     if log:
@@ -1128,7 +829,6 @@ def convert(ctf_path=None, output=None, *, settings=None, log=print, **kwargs):
     qgrid, ok, diag = build_grid(
         ctf, opt.phase, opt.max_mad, not opt.allow_error, opt.min_bands
     )
-    qgrid_full, ok_full = qgrid, ok
     window = (slice(0, ny), slice(0, nx))
     if opt.crop:
         qgrid, ok, window = crop_grid(
@@ -1263,23 +963,8 @@ def convert(ctf_path=None, output=None, *, settings=None, log=print, **kwargs):
             flip_y=opt.flip_y,
             log=log,
         )
-        check = verify_readback(out, qgrid, ok, cellids, opt.flip_y, sym)
-        for line in check["report"]:
+        for line in verify_readback(out, qgrid, ok, cellids, opt.flip_y, sym):
             log(f"  {line}")
-        write_raw_png(
-            out.with_name(out.stem + "-raw.png"),
-            qgrid_full,
-            ok_full,
-            window,
-            qgrid,
-            ok,
-            check,
-            ctf,
-            opt,
-            vox,
-            unit,
-            log=log,
-        )
 
     lx, ly = nx * vox[0], ny * vox[1]
     mean_px = counts.mean()

@@ -3,8 +3,8 @@
 # boundaries, for the FESTIM codim-1 grain-boundary transport script.
 #
 # `neper -M map.tesr` meshes the raster directly, which is supported in 2D only.
-# The msh4 carries the reconstructed topology as physical
-# groups named ver#, edge#, face#, and face k is raster cell k, so:
+# The msh4 carries the reconstructed topology as physical groups ver#, edge#,
+# face#, and face k is raster cell k, so:
 #
 #   grain boundary  : 1D element set "edge#", touching two "face#" sets
 #   specimen surface: 1D element set touching one face
@@ -12,36 +12,20 @@
 #                     (${STEM}-grainori.txt), computed in the Python driver
 #   triple junction : mesh vertex where 3+ distinct edge ids meet
 #
-# Outputs, all named ${STEM}:
-#   ${STEM}.msh4          Gmsh v4 mesh, linear triangles, all dimensions
-#   ${STEM}.sttesr        raster geometry, used to derive the domain size
-#   ${STEM}-grainori.txt  one orientation per grain, as read out of the tesr
-#   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
-#   check-grains.png      raster coloured by cell id
+# Outputs: ${STEM}.msh4 (Gmsh v4, linear triangles, all dimensions),
+# ${STEM}.sttesr (raster geometry), ${STEM}-grainori.txt (one orientation per
+# grain), and the untrimmed check-ori.png / check-grains.png renders.
 #
-# This script only runs Neper and Gmsh. The Python side of the
-# pipeline is a set of library modules with no command line, so the diagnostics
-# and the trimming of the two check images above are done by the caller --
-# ebsd_gb_diffusion.finish_diagnostics(), which runs straight after this script
-# returns and writes:
-#
-#   check-ori.png, check-grains.png   trimmed, with a scale bar (micrograph)
-#   check-mesh.png        raster cells with every reconstructed boundary edge
-#                         of the mesh drawn on top (mesh_overlay)
-#   ${STEM}-areachange.csv  per-grain area, rastered vs meshed, and the percent
-#                         change between them (grain_area_change)
-#   check-area.png        the grains coloured by that change, and its
-#                         distribution
-#
-# The area table is the quality number for this stage: -tesrsmooth and the
-# meshing both move the boundary, and the change in a grain's area is what that
-# motion does to the bulk term of the transport problem. Stage 1's equivalent
-# comes out of ctf_to_tesr.convert() (the RMS disorientation between a pixel
-# and the single orientation its grain is given).
+# This script runs Neper and Gmsh only. The Python side of the pipeline is a
+# set of library modules with no command line, so the check images are trimmed
+# and the diagnostics written by ebsd_gb_diffusion.finish_diagnostics(), which
+# runs straight after this returns: check-mesh.png, check-area.png and
+# ${STEM}-areachange.csv, the per-grain area change between raster and mesh.
+# That table is this stage's quality number, as the RMS disorientation out of
+# ctf_to_tesr.convert() is stage 1's.
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
-#
 # =============================================================================
 set -euo pipefail
 
@@ -96,11 +80,9 @@ need() {  # need <output> -> 0 if the stage must run
 }
 
 # -----------------------------------------------------------------------------
-# 0. Stage the raster.
-#
-# By default nothing is done to it: ctf_to_tesr.py already crops, fills holes,
-# and writes cell ids contiguously from 1 with the origin at (0,0), and its
-# grains are connected components so `rmsat` has nothing to remove. 
+# 0. Stage the raster. By default nothing is done to it: ctf_to_tesr already
+#    crops, fills holes and numbers cells from 1 with the origin at (0,0), and
+#    its grains are connected components so `rmsat` has nothing to remove.
 # -----------------------------------------------------------------------------
 if need "${STEM}-raw.tesr"; then
     if [ -n "$TESR_TRANSFORM" ]; then
@@ -153,8 +135,7 @@ echo "  grains: $NCELL"
 # -----------------------------------------------------------------------------
 # 0b. Check images. Look at these before trusting anything downstream: an
 #     inverted orientation convention shows up as IPF colours that disagree
-#     with AZtec/MTEX, and a bad segmentation shows up as speckle or as grains
-#     that are obviously back-filled. 
+#     with AZtec/MTEX, and a bad segmentation as speckle or back-filled grains.
 # -----------------------------------------------------------------------------
 if [ "$CHECK_IMAGES" = "1" ]; then
     for img in check-ori check-grains; do
@@ -172,11 +153,10 @@ if [ "$CHECK_IMAGES" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 1. Mesh the raster with Gmsh v4, because FESTIM reads it with dolfinx.io.gmshio 
-#    & needs the 1D element sets to access edge ids of the reconstructed boundary topology
-#
-#    Neper reconstructs the interfaces, smooths them, then meshes the edges
-#    and faces with the -rcl-derived length. -tmp must exist beforehand.
+# 1. Mesh the raster. Gmsh v4 because FESTIM reads it with dolfinx.io.gmshio and
+#    needs the 1D element sets, which carry the reconstructed edge ids. Neper
+#    reconstructs the interfaces, smooths them, then meshes the edges and faces
+#    at the -rcl-derived length. -tmp must exist beforehand.
 # -----------------------------------------------------------------------------
 if need "${STEM}.msh4"; then
     "$NEPER_BIN" -M "${STEM}-raw.tesr" \

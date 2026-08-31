@@ -47,7 +47,7 @@ from grain_area_change import measure
 from matplotlib.collections import LineCollection
 from mesh_overlay import draw_raster, overlay, read_tesr
 from micrograph import annotate_png, scale_bar_ax
-from orientation import cubic_disorientation_angle, qconj, qmul
+from orientation import cubic_disorientation_angle, qconj, qmul, rodrigues_to_quat
 
 import festim as F
 
@@ -302,12 +302,6 @@ def _allreduce(comm, arr, op):
     return out
 
 
-def _rodrigues_to_quat(r):
-    """Rodrigues vector r = (q1, q2, q3)/q0 -> unit quaternion (q0 > 0)."""
-    q = np.column_stack((np.ones(len(r)), r))
-    return q / np.linalg.norm(q, axis=1)[:, None]
-
-
 class EdgeTable:
     """Per-edge scalars in id order: ``values[k]`` belongs to edge ``k + 1``."""
 
@@ -423,7 +417,7 @@ class Microstructure:
                 f"{base}-grainori.txt has {self.ori.shape[0]} lines but the mesh "
                 f"has {n_grain} face# sets; they must be the same raster"
             )
-        q = _rodrigues_to_quat(self.ori)
+        q = rodrigues_to_quat(self.ori)
         theta = np.zeros(n_edge)
         inner = sides == 2
         a, b = pair[inner, 0] - 1, pair[inner, 1] - 1

@@ -1,19 +1,14 @@
-"""Micrograph housekeeping shared by the EBSD pipeline scripts.
+"""Scale bars and border trimming, shared by the pipeline's figures.
 
     from micrograph import annotate_png, scale_bar_ax
-
     annotate_png("check-ori.png", width_units=160, unit="um", trim_border=True)
     scale_bar_ax(ax, nx * voxsize, "um")
 
-Trims the uniform border neper -V leaves around a 2D raster (its camera frames
-a 3D scene, so a flat map lands in the middle of a 1200 x 900 canvas) and draws
-a scale bar in the lower right. After trimming, the image width *is* the
-raster width, so the bar length in pixels follows from --width, the physical
-width of the content in --unit. The same bar is available for matplotlib axes
-(`scale_bar_ax`) so every picture the pipeline writes carries one.
-
-Bar length is the largest of 1, 2, 5 x 10^k not exceeding a quarter of the
-image width, the usual micrograph convention.
+neper -V frames a flat map in the middle of a 1200 x 900 canvas, so a rendered
+PNG needs its uniform border trimmed; after that the image width *is* the
+raster width and the bar length in pixels follows from `width_units`. The same
+bar is available for matplotlib axes, so every picture carries one. Bar length
+is the largest of 1, 2, 5 x 10^k under a quarter of the width.
 """
 
 import numpy as np
@@ -29,13 +24,8 @@ def nice_length(width, fraction=0.25):
     return 10 ** (k - 1) * 5.0
 
 
-def unit_label(unit):
-    return {"um": "um", "micron": "um", "microns": "um"}.get(unit, unit)
-
-
 def format_length(value, unit):
-    v = f"{value:g}"
-    return f"{v} {unit_label(unit)}"
+    return f"{value:g} {'um' if unit in ('micron', 'microns') else unit}"
 
 
 # --- PIL (rendered PNGs) -----------------------------------------------------
@@ -111,12 +101,11 @@ def scale_bar_ax(ax, width_units, unit="um", length=None, color="white"):
 def annotate_png(
     path, width_units, unit="um", trim_border=False, length=None, output=None, log=print
 ):
-    """Trim a rendered PNG and draw a scale bar on it. Returns the output path.
+    """Trim a rendered PNG and draw a scale bar on it; returns the output path.
 
-    `width_units` is the physical width of the *content*, so after trimming the
-    image width and that number describe the same span. `output` defaults to
-    overwriting `path`. Needs Pillow; the matplotlib path (`scale_bar_ax`) does
-    not.
+    `width_units` is the physical width of the *content*, so after trimming it
+    and the image width describe the same span. `output` defaults to
+    overwriting `path`. Needs Pillow, which `scale_bar_ax` does not.
     """
     from PIL import Image
 

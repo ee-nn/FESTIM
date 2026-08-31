@@ -1,25 +1,14 @@
-"""Orientation algebra shared by the EBSD pipeline: quaternions, the cubic
-symmetry group, and the disorientation angle.
+"""Orientation algebra: quaternions, the cubic symmetry group, disorientation.
 
-Nothing here reads or writes a file, and nothing here imports another module of
-the pipeline, so this is the bottom of the import graph:
+Imports nothing else in the pipeline, so it is the bottom of the import graph
+(segmentation_error, ctf_to_tesr and ebsd_gb_diffusion all sit above it).
 
-    orientation  <-  segmentation_error  <-  ctf_to_tesr
-                 <-  ctf_to_tesr
-                 <-  ebsd_gb_diffusion
-
-Conventions
------------
-Quaternions are (w, x, y, z), unit, with w >= 0 where a canonical sign matters.
-Euler angles are Bunge (phi1, Phi, phi2) and are converted under Neper's
-`passive` convention, the rotation carrying the sample coordinate system onto
-the crystal one, which is the standard reading of Bunge angles and what a .ctf
-stores. `self_test` pins all of this against values Neper publishes and should
-be called once by whatever is driving the conversion.
-
-The crystal symmetry multiplies on the right: q maps sample to crystal, so an
-operator S, which relabels crystal axes, composes as q * S. See
-`crystal_equivalents`.
+Quaternions are (w, x, y, z), unit, w >= 0 where a canonical sign matters.
+Euler angles are Bunge (phi1, Phi, phi2) under Neper's `passive` convention:
+the rotation carrying the sample frame onto the crystal frame, which is the
+standard reading of Bunge angles and what a .ctf stores. Crystal symmetry
+multiplies on the right (see `crystal_equivalents`). `self_test` pins all of
+this against values Neper publishes; `ctf_to_tesr.convert` runs it.
 """
 
 import numpy as np
@@ -27,12 +16,9 @@ import numpy as np
 
 # --- quaternion helpers ------------------------------------------------------
 def cubic_symmetry_quaternions():
-    """The 24 rotations of the cubic group, as unit quaternions.
-
-    Nine 90/180/270-degree rotations about the <100> axes, six 180-degree
-    rotations about the <110> axes, and eight 120/240-degree rotations about
-    the <111> axes, plus the identity.
-    """
+    """The 24 rotations of the cubic group as unit quaternions: identity, nine
+    90/180/270 deg about <100>, six 180 deg about <110>, eight 120/240 about
+    <111>."""
     r = np.sqrt(0.5)
     q = [(1.0, 0.0, 0.0, 0.0)]
     for axis in range(3):
@@ -76,12 +62,7 @@ def qconj(q):
 
 
 def euler_bunge_to_quat(phi1, Phi, phi2, degrees=True):
-    """Bunge Euler angles -> unit quaternion, passive convention.
-
-    Passive here means what Neper means by it: the rotation carrying the sample
-    coordinate system onto the crystal coordinate system, which is the standard
-    reading of Bunge angles and what a .ctf stores.
-    """
+    """Bunge Euler angles -> unit quaternion, passive convention."""
     if degrees:
         phi1, Phi, phi2 = np.radians(phi1), np.radians(Phi), np.radians(phi2)
     sigma = 0.5 * (phi1 + phi2)
@@ -99,13 +80,10 @@ def euler_bunge_to_quat(phi1, Phi, phi2, degrees=True):
 def crystal_equivalents(q, sym):
     """All symmetry-equivalent descriptions of the orientations q, (n, 24, 4).
 
-    The crystal symmetry multiplies on the *right* in this quaternion
-    convention: q maps sample to crystal (Bunge, passive), so a symmetry
-    operator S, which relabels crystal axes, composes as q * S. Multiplying on
-    the left, S * q, would instead rotate the sample frame and yield a
-    physically different orientation. Checked against Neper: for a cell pair
-    (q, q*S) `-statedge theta` under -crysym cubic is 0; for (q, S*q) it is
-    17 degrees.
+    Symmetry multiplies on the *right*: q maps sample to crystal, so an
+    operator S relabelling crystal axes composes as q * S. S * q would rotate
+    the sample frame instead and is a different orientation -- checked against
+    Neper, where `-statedge theta` is 0 for (q, q*S) and 17 deg for (q, S*q).
     """
     return qmul(q[:, None, :], sym[None, :, :])
 
@@ -113,10 +91,10 @@ def crystal_equivalents(q, sym):
 def to_fundamental_zone(q, sym, chunk=50_000):
     """Pick, for each orientation, the symmetry equivalent closest to identity.
 
-    Any equivalent is as correct as any other -- the crysym is declared in the
-    tesr and Neper applies the symmetry itself. The point of choosing this one
-    is that its rotation angle is at most ~62.8 degrees for cubic, so the
-    scalar part never approaches zero and the Rodrigues vector stays finite.
+    Any equivalent is as correct as any other -- Neper applies the declared
+    symmetry itself. This one is chosen because its rotation angle is at most
+    ~62.8 deg for cubic, so q0 never nears zero and the Rodrigues vector stays
+    finite.
     """
     out = np.empty_like(q)
     for lo in range(0, len(q), chunk):
@@ -126,6 +104,13 @@ def to_fundamental_zone(q, sym, chunk=50_000):
         picked = cand[np.arange(len(blk)), best]
         out[lo : lo + chunk] = np.where(picked[..., :1] < 0, -picked, picked)
     return out
+
+
+def rodrigues_to_quat(r):
+    """Rodrigues vectors (n, 3) -> unit quaternions (n, 4), q0 > 0."""
+    r = np.asarray(r, dtype=float).reshape(-1, 3)
+    q = np.column_stack((np.ones(len(r)), r))
+    return q / np.linalg.norm(q, axis=1)[:, None]
 
 
 def quat_to_rodrigues(q):
@@ -139,16 +124,10 @@ def quat_to_rodrigues(q):
 def cubic_disorientation_angle(m):
     """Disorientation angle (degrees) of a cubic misorientation quaternion.
 
-    Closed form rather than a search over 24 x 24 symmetry pairs: with the
-    absolute components sorted descending as a >= b >= c >= d, the largest
-    attainable cos(omega/2) over the cubic group is
-
-        max( a, (a + b)/sqrt(2), (a + b + c + d)/2 )
-
-    which is the standard result for the cubic misorientation function (Grimmer,
-    Acta Cryst. A36 (1980) 382). Checked in the self-test against two cases with
-    known answers: a 90-degree rotation about <100> (a symmetry operation, so
-    zero) and a 60-degree rotation about <111> (the Sigma-3 twin).
+    Closed form rather than a 24 x 24 search: with |components| sorted
+    descending as a >= b >= c >= d, the largest attainable cos(omega/2) over
+    the cubic group is max(a, (a + b)/sqrt(2), (a + b + c + d)/2) (Grimmer,
+    Acta Cryst. A36 (1980) 382). The self-test checks it on two known cases.
     """
     s = np.sort(np.abs(m), axis=-1)[..., ::-1]
     a, b, c, d = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
@@ -158,28 +137,19 @@ def cubic_disorientation_angle(m):
 
 # --- self-test ---------------------------------------------------------------
 def self_test():
-    """Check the conventions against values Neper publishes.
-
-    ctf_to_tesr.convert() calls this before it does anything else, so a
-    drifted convention is caught before a file is written rather than after.
-
-    Neper's orientation-convention table gives, for a 30-degree rotation about
-    the sample x axis under the passive convention, Bunge angles (0, 30, 0),
-    quaternion (0.965925826, 0.258819045, 0, 0) and Rodrigues vector
-    (0.267949192, 0, 0). If this assertion ever fires, the Euler conversion has
-    drifted away from what the tesr reader will assume.
-    """
+    """Check the conventions against values Neper publishes, before any file is
+    written. Neper's table gives Bunge (0, 30, 0) as quaternion
+    (0.965925826, 0.258819045, 0, 0) and Rodrigues (0.267949192, 0, 0)."""
     sym = cubic_symmetry_quaternions()
     q = euler_bunge_to_quat(np.array([0.0]), np.array([30.0]), np.array([0.0]))
     assert np.allclose(q[0], [0.965925826, 0.258819045, 0, 0], atol=1e-8), q
     r = quat_to_rodrigues(to_fundamental_zone(q, sym))
     assert np.allclose(r[0], [0.267949192, 0, 0], atol=1e-8), r
 
-    # 90 degrees about z is a cubic symmetry operation -> disorientation 0.
-    # The tolerance is loose because arccos has an infinite derivative at 1, so
-    # a rounding error of 1e-16 in the argument surfaces as ~1e-6 degrees. That
-    # amplification is harmless at a 10-degree segmentation threshold but it is
-    # the reason not to compare disorientations to exact zero anywhere.
+    # 90 deg about z is a symmetry operation -> disorientation 0. The tolerance
+    # is loose because arccos has an infinite derivative at 1, so a 1e-16
+    # rounding error surfaces as ~1e-6 deg. Harmless at a 10 deg threshold, but
+    # the reason never to compare a disorientation to exact zero.
     q90 = np.array([[np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)]])
     assert cubic_disorientation_angle(q90)[0] < 1e-4
     # R(q) = g^T for Bunge (0, 30, 0): the IPF-Z direction is the third row
@@ -197,11 +167,9 @@ def self_test():
     # symmetry operators are unit quaternions and closed under multiplication
     assert np.allclose(np.linalg.norm(sym, axis=1), 1.0)
 
-    # The crystal symmetry acts on the right (see crystal_equivalents): every
-    # equivalent must be at zero disorientation from the original, the
-    # fundamental-zone representative must be the same orientation, and the
-    # left-multiplied version must NOT be (it is a sample-frame rotation). A
-    # regression of the S*q bug that used to corrupt **oridata and *ori.
+    # Symmetry acts on the right: every equivalent and the FZ representative
+    # must be at zero disorientation, the left-multiplied one must not be.
+    # Regression of the S*q bug that used to corrupt **oridata and *ori.
     qq = euler_bunge_to_quat(np.array([37.0]), np.array([52.0]), np.array([131.0]))
     equiv = crystal_equivalents(qq, sym)[0]
     d = cubic_disorientation_angle(qmul(qconj(np.repeat(qq, 24, 0)), equiv))

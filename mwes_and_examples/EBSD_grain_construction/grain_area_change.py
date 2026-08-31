@@ -1,53 +1,39 @@
 """How much the grains change size between the raster and the mesh.
 
-    from grain_area_change import area_change, format_report, write_png
-    res = area_change("map.tesr", "poly.msh4")
-    for line in format_report(res):
-        print(line)
+    from grain_area_change import measure
+    res = measure("map.tesr", "poly.msh4", csv="areas.csv", png="check-area.png")
 
-Stage 2 of the pipeline replaces each grain's pixel staircase by a polygon:
 `neper -M map.tesr` reconstructs the raster interfaces into a vertex/edge/face
-topology, runs -tesrsmooth (Laplacian by default) over it, and meshes the
-result. Both halves move the boundary, so the meshed grain is not the same set
-of points as the rastered one. This script measures the difference in the one
-number the transport model is sensitive to through its bulk terms -- the area
-each grain ends up with -- and in the boundary position itself.
+topology, smooths them (-tesrsmooth, Laplacian by default) and meshes the
+result, so the meshed grain is not the same set of points as the rastered one.
 
     A_raster(k) = (voxels with cell id k) x XStep x YStep
     A_mesh(k)   = sum of the triangle areas of the mesh's face k
     delta(k)    = 100 (A_mesh(k) - A_raster(k)) / A_raster(k)      [%]
 
-reported as min / mean / median / max over the grains, which is the combined
-effect of smoothing and meshing; there is no intermediate file between the two
-to separate them from. To separate them anyway, re-run the mesh stage with
-TESR_SMOOTH=none (`-tesrsmooth none`) into a different STEM and difference the
-two tables: what is left is the discretisation alone.
+reported as min / mean / median / max over the grains. That is smoothing and
+meshing combined -- there is no intermediate file to separate them from. To
+split them, re-run the mesh stage with TESR_SMOOTH=none into a different STEM
+and difference the two tables; what is left is the discretisation alone.
 
-Because a linear-triangle mesh represents a face by a polygon whose vertices
-lie on the smoothed boundary, delta is not a bias-free quantity -- it is
-dominated by the smoothing, which cuts pixel corners and therefore shrinks a
-convex grain and grows a concave one. The signed mean over all grains is
-correspondingly near zero while individual grains move by several percent, so
-both are printed.
+delta is not bias-free: smoothing cuts pixel corners, so it shrinks a convex
+grain and grows a concave one. The signed mean over all grains is therefore
+near zero while individual grains move by percents, and both are printed. Two
+more numbers go with it, because area can be preserved while the boundary
+moves:
 
-Two further numbers are printed because the area alone can be preserved while
-the boundary moves:
+  size (ECD)      the same change as an equivalent circular diameter, sqrt(A),
+                  which is what compares with a grain size -- about half the
+                  percent in area.
+  displaced area  the fraction of meshed area sitting over a *different* raster
+                  grain, from each triangle's centroid. Counts boundary motion
+                  regardless of sign, and is directly comparable with the ~17 %
+                  misplaced voxels that made a convex-cell Laguerre fit
+                  unusable.
 
-  size (ECD)     the same change expressed as an equivalent circular diameter,
-                 sqrt(A). A percent in diameter is what compares with a grain
-                 size, and it is about half the percent in area.
-  displaced area the fraction of the meshed area that sits over a *different*
-                 grain of the raster, found by locating each triangle's
-                 centroid in the raster. This counts boundary motion whatever
-                 its sign, and it is the quantity that is directly comparable
-                 with the ~17 % of misplaced voxels that made the convex-cell
-                 Laguerre fit (route B) unusable; see the header of
-                 ebsd_to_mesh.sh.
-
-The same centroid lookup checks the assumption the rest of the pipeline rests
-on, that mesh face k is raster cell k. If it does not hold the script says so
-and refuses to report areas, because every number here (and every theta in the
-transport driver) would then be attached to the wrong grain.
+That centroid lookup is also the only check in the pipeline that mesh face k is
+raster cell k. If it fails, `measure` raises: every per-grain quantity
+downstream, theta included, is indexed by face id.
 """
 
 from __future__ import annotations
@@ -106,9 +92,8 @@ def face_to_cell(cells, vox, origin, tags, area, centroid, ncell):
     and is almost all zeros, since a face touches one cell and its neighbours.
 
     Returns the mapping face tag -> cell id, the meshed area of each face, the
-    area of each face lying on its mapped cell and on the cell of its own id,
-    and the fraction of the whole meshed area that does not lie over the cell
-    of its own id -- boundary motion, counted without regard to sign.
+    area of each face lying on its mapped cell, and the fraction of the whole
+    meshed area not over the cell of its own id -- boundary motion, unsigned.
     """
     ny, nx = cells.shape
     ix = np.clip(((centroid[:, 0] - origin[0]) / vox[0]).astype(int), 0, nx - 1)
@@ -133,15 +118,13 @@ def face_to_cell(cells, vox, origin, tags, area, centroid, ncell):
     best[ut[last]] = uw[last]
 
     total = np.bincount(tags, weights=area, minlength=ntag + 1)
-    self_area = np.zeros(ntag + 1)
-    same = utag == ucell
-    self_area[utag[same]] = w[same]
-    displaced = 1.0 - self_area.sum() / total.sum() if total.sum() else 0.0
-    return mapping, total, best, self_area, displaced
+    same = utag == ucell  # area lying over the cell of its own id
+    displaced = 1.0 - w[same].sum() / total.sum() if total.sum() else 0.0
+    return mapping, total, best, displaced
 
 
 def summarise(delta, weights=None):
-    """min / mean / median / max, plus the shape-blind and weighted versions."""
+    """min / mean / median / max, plus the sign-blind and weighted versions."""
     d = np.asarray(delta, dtype=float)
     d = d[np.isfinite(d)]
     if d.size == 0:
@@ -153,10 +136,7 @@ def summarise(delta, weights=None):
         "median": float(np.median(d)),
         "max": float(d.max()),
         "abs_mean": float(np.abs(d).mean()),
-        "abs_median": float(np.median(np.abs(d))),
         "rms": float(np.sqrt(np.mean(d**2))),
-        "p05": float(np.percentile(d, 5)),
-        "p95": float(np.percentile(d, 95)),
     }
     if weights is not None:
         w = np.asarray(weights, dtype=float)[np.isfinite(delta)]
@@ -175,7 +155,7 @@ def area_change(tesr_path, msh4_path, allow_mismatch=False):
     ncell = int(cells.max())
     a_ras, npx = raster_areas(cells, vox, ncell)
     tags, tarea, cent = triangle_areas(xyz, tri)
-    mapping, f_total, f_best, f_self, displaced = face_to_cell(
+    mapping, f_total, f_best, displaced = face_to_cell(
         cells, vox, origin, tags, tarea, cent, ncell
     )
 
@@ -200,11 +180,9 @@ def area_change(tesr_path, msh4_path, allow_mismatch=False):
         "mapping": mapping,
         "face_area": f_total,
         "face_matched": f_best,
-        "face_self": f_self,
         "displaced": float(displaced),
         "a_raster": a_ras,
         "a_mesh": a_mesh,
-        "domain": (cells.shape[1] * vox[0], cells.shape[0] * vox[1]),
         "mesh_total": float(tarea.sum()),
         "raster_total": float(a_ras.sum()),
     }
@@ -265,9 +243,8 @@ def format_report(res):
         f"median {a['median']:+.2f} %, max {a['max']:+.2f} %"
     )
     lines.append(
-        f"  |change|: mean {a['abs_mean']:.2f} %, median {a['abs_median']:.2f} %, "
-        f"rms {a['rms']:.2f} %; area-weighted mean {a['area_weighted_mean']:+.2f} %; "
-        f"5-95 % of grains within [{a['p05']:+.2f}, {a['p95']:+.2f}] %"
+        f"  |change|: mean {a['abs_mean']:.2f} %, rms {a['rms']:.2f} %; "
+        f"area-weighted mean {a['area_weighted_mean']:+.2f} %"
     )
     lines.append(
         f"  as a size (ECD ~ sqrt(area)): min {e['min']:+.2f} %, "
