@@ -98,6 +98,13 @@ def scale_bar_ax(ax, width_units, unit="um", length=None, color="white"):
     return bar
 
 
+# Corner labels of Neper's standard stereographic triangle, as fractions of the
+# key image. The Neper tutorial draws them at (180, 390), (545, 390), (505, 30)
+# on the 800 x 400 render, and these are those positions divided through, so
+# they survive the trim and the rescale below.
+IPF_KEY_LABELS = (("[001]", 0.22, 0.96), ("[011]", 0.68, 0.96), ("[111]", 0.63, 0.08))
+
+
 def annotate_png(
     path, width_units, unit="um", trim_border=False, length=None, output=None, log=print
 ):
@@ -118,4 +125,54 @@ def annotate_png(
     if log:
         bar = format_length(length or nice_length(width_units), unit)
         log(f"  wrote {out} ({img.size[0]} x {img.size[1]} px, bar {bar})")
+    return out
+
+
+def append_key(png, key_png, output=None, labels=("001", "011", "111"), log=print):
+    """Paste an IPF colour key to the right of a rendered map; returns the path.
+
+    `key_png` is the standard stereographic triangle as Neper prints it (the
+    ipf-key stage of ebsd_to_mesh.sh), so the key comes out of the same
+    colouring code as the map rather than approximating it. It arrives with the
+    uniform border every neper -V render has, and unlabelled, so it is trimmed,
+    scaled to the map and its corners labelled here; the documented recipe uses
+    ImageMagick for the labels, which the pipeline would not otherwise need.
+
+    Corner positions follow the projection: [001] is at the origin, [011] at
+    (sqrt(2) - 1, 0) and [111] at (sqrt(3) - 1)/2 twice over, and the 011-111
+    arc only moves inwards, so after trimming the bounding box is exactly
+    [001]-[011] wide and the apex sits at 0.884 of that width.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    base = Image.open(png).convert("RGB")
+    key = trim(Image.open(key_png).convert("RGB"))
+    h = round(0.62 * base.height)
+    w = round(key.width * h / key.height)
+    key = key.resize((w, h), Image.LANCZOS)
+
+    size = max(round(0.10 * h), 11)
+    m = max(round(0.22 * h), 3 * size // 2)  # margin the corner labels live in
+    font = ImageFont.load_default(size)
+    panel = Image.new("RGB", (w + 2 * m, h + 2 * m), "white")
+    panel.paste(key, (m, m))
+    draw = ImageDraw.Draw(panel)
+    apex = ((np.sqrt(3) - 1) / 2) / (np.sqrt(2) - 1)
+    corners = ((m, m + h, 1), (m + w, m + h, 1), (m + round(apex * w), m, -1))
+    for label, (x, y, below) in zip(labels, corners):
+        tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+        y = y + m // 4 if below > 0 else y - m // 4 - th
+        draw.text((x - tw / 2, y), label, font=font, fill="black")
+
+    gap = round(0.02 * base.width)
+    out_img = Image.new(
+        "RGB", (base.width + gap + panel.width, max(base.height, panel.height)), "white"
+    )
+    out_img.paste(base, (0, (out_img.height - base.height) // 2))
+    out_img.paste(panel, (base.width + gap, (out_img.height - panel.height) // 2))
+    out = output or png
+    out_img.save(out)
+    if log:
+        w, h = out_img.size
+        log(f"  wrote {out} with the IPF key ({w} x {h} px)")
     return out

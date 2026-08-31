@@ -14,12 +14,14 @@
 #
 # Outputs: ${STEM}.msh4 (Gmsh v4, linear triangles, all dimensions),
 # ${STEM}.sttesr (raster geometry), ${STEM}-grainori.txt (one orientation per
-# grain), and the untrimmed check-ori.png / check-grains.png renders.
+# grain), the untrimmed check-ori.png / check-grains.png renders, and
+# ipf-key.png, the colour key for the first of those.
 #
 # This script runs Neper and Gmsh only. The Python side of the pipeline is a
 # set of library modules with no command line, so the check images are trimmed
 # and the diagnostics written by ebsd_gb_diffusion.finish_diagnostics(), which
-# runs straight after this returns: check-mesh.png, check-area.png and
+# runs straight after this returns, and which also pastes ipf-key.png beside
+# check-ori.png: check-mesh.png, check-area.png and
 # ${STEM}-areachange.csv, the per-grain area change between raster and mesh.
 # That table is this stage's quality number, as the RMS disorientation out of
 # ctf_to_tesr.convert() is stage 1's.
@@ -150,6 +152,28 @@ if [ "$CHECK_IMAGES" = "1" ]; then
         "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img" \
             || echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
     done
+fi
+
+# -----------------------------------------------------------------------------
+# 0c. IPF colour key. `-V` colours by orientation but does not print the key
+#     (neper.info/tutorials/orientation_color_key.html), so it is built the way
+#     that page documents: tessellate the standard stereographic triangle, mesh
+#     it, read the node colours out with `-statnode col_stdtriangle`, and render
+#     that. Cubic symmetry, as everywhere else here. It does not depend on the
+#     map, so it is only built once; the driver trims it, labels the corners and
+#     pastes it beside check-ori.png.
+# -----------------------------------------------------------------------------
+if [ "$CHECK_IMAGES" = "1" ] && need "ipf-key.png"; then
+    if "$NEPER_BIN" -T -n 1 -domain "stdtriangle(20)" -dim 2 -o stdtriangle \
+        && "$NEPER_BIN" -M stdtriangle.tess -cl 0.02 -statnode col_stdtriangle \
+        && "$NEPER_BIN" -V stdtriangle.msh -povray "$POVRAY_BIN" \
+            -datanodecol "col:file(stdtriangle.stnode)" -dataeltcol from_nodes \
+            -dataelt2dedgerad 0 -dataelt1drad 0.001 -showelt1d all \
+            -imagesize 800:400 -print ipf-key; then
+        rm -f stdtriangle.tess stdtriangle.msh stdtriangle.stnode
+    else
+        echo "  WARNING: could not build ipf-key.png; check-ori will have no key" >&2
+    fi
 fi
 
 # -----------------------------------------------------------------------------

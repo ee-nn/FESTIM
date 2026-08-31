@@ -46,7 +46,7 @@ mpl.use("Agg")
 from grain_area_change import measure
 from matplotlib.collections import LineCollection
 from mesh_overlay import draw_raster, overlay, read_tesr
-from micrograph import annotate_png, scale_bar_ax
+from micrograph import annotate_png, append_key, scale_bar_ax
 from orientation import cubic_disorientation_angle, qconj, qmul, rodrigues_to_quat
 
 import festim as F
@@ -252,7 +252,8 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
     importable rather than needing a command line:
 
       check-ori.png, check-grains.png  the neper -V renders, border trimmed and
-                                       a scale bar added
+                                       a scale bar added; check-ori also gets
+                                       ipf-key.png pasted beside it
       check-mesh.png                   the reconstructed boundary edges over the
                                        raster cells
       <stem>-areachange.csv, check-area.png
@@ -278,6 +279,9 @@ def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
                 continue
             try:
                 annotate_png(png, lx, unit, trim_border=True)
+                key = work / "ipf-key.png"
+                if name == "check-ori" and key.is_file():
+                    append_key(png, key)
             except Exception as exc:  # Pillow missing, or a zero-size render
                 print(f"  WARNING: {png.name} left untrimmed ({exc})")
         overlay(tesr, msh4, output=str(work / "check-mesh.png"), unit=unit)

@@ -79,7 +79,6 @@ from orientation import (
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from segmentation_error import format_report, read_tesr_full, segmentation_error
-from segmentation_error import write_csv as write_segerr_csv
 from segmentation_error import write_png as write_segerr_png
 
 # --- Channel conventions -----------------------------------------------------
@@ -949,7 +948,6 @@ def convert(ctf_path=None, output=None, *, settings=None, log=print, **kwargs):
             threshold=opt.threshold,
             log=log,
         )
-        write_segerr_csv(out.with_name(out.stem + "-segerror.csv"), seg, log=log)
         png = out.with_name(out.stem + "-quality.png")
         write_quality_png(
             png,
@@ -1093,6 +1091,4 @@ def measure_tesr_against_ctf(
         write_segerr_png(
             png, res, cells, unit=opt.unit, threshold=opt.threshold, log=log
         )
-    if csv:
-        write_segerr_csv(csv, res, log=log)
     return res
