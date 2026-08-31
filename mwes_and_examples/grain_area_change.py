@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 """How much the grains change size between the raster and the mesh.
 
-    python grain_area_change.py map.tesr poly.msh4 [-o check-area.png]
+    from grain_area_change import area_change, format_report, write_png
+    res = area_change("map.tesr", "poly.msh4")
+    for line in format_report(res):
+        print(line)
 
 Stage 2 of the pipeline replaces each grain's pixel staircase by a polygon:
 `neper -M map.tesr` reconstructs the raster interfaces into a vertex/edge/face
@@ -50,12 +52,9 @@ transport driver) would then be attached to the wrong grain.
 
 from __future__ import annotations
 
-import argparse
-import sys
-
 import numpy as np
-
-from mesh_overlay import read_msh4, read_tesr
+from mesh_overlay import read_msh4, read_tesr, use_agg
+from micrograph import scale_bar_ax
 
 
 def tesr_origin(path):
@@ -171,7 +170,7 @@ def area_change(tesr_path, msh4_path, allow_mismatch=False):
     origin = tesr_origin(tesr_path)
     xyz, _seg, tri = read_msh4(msh4_path)
     if not tri:
-        sys.exit(f"{msh4_path}: no 2D elements. Mesh with -dim all.")
+        raise ValueError(f"{msh4_path}: no 2D elements. Mesh with -dim all.")
 
     ncell = int(cells.max())
     a_ras, npx = raster_areas(cells, vox, ncell)
@@ -284,25 +283,25 @@ def format_report(res):
     return lines
 
 
-def write_csv(path, res):
+def write_csv(path, res, log=print):
     with open(path, "w") as fh:
-        fh.write("cell_id,n_voxels,area_raster,area_mesh,delta_area_pct,delta_ecd_pct\n")
+        fh.write(
+            "cell_id,n_voxels,area_raster,area_mesh,delta_area_pct,delta_ecd_pct\n"
+        )
         for k in range(len(res["a_raster"])):
             fh.write(
                 f"{k + 1},{int(res['npx'][k])},{res['a_raster'][k]:.8g},"
                 f"{res['a_mesh'][k]:.8g},{res['delta'][k]:.6g},"
                 f"{res['delta_ecd'][k]:.6g}\n"
             )
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
-def write_png(path, res, unit="um", dpi=150):
+def write_png(path, res, unit="um", dpi=150, log=print):
     """The grains coloured by their area change, next to its distribution."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+    plt = use_agg()
     plt.rcParams.update({"font.size": 15, "axes.titlesize": 15})
 
     cells, (vx, vy) = res["cells"], res["vox"]
@@ -333,60 +332,52 @@ def write_png(path, res, unit="um", dpi=150):
     ax.set_xlabel(f"blue = shrunk, red = grew; colour limit {lim:.2g} %")
     ax.set_xticks([])
     ax.set_yticks([])
-    try:
-        from micrograph import scale_bar_ax
-
-        scale_bar_ax(ax, nx * vx, unit)
-    except ImportError:  # pragma: no cover - scale bar is cosmetic
-        pass
+    scale_bar_ax(ax, nx * vx, unit)
 
     ax = axes[1]
     a = res["area"]
     ax.hist(delta[np.isfinite(delta)], bins=40, color="0.35")
     ax.axvline(0, color="k", lw=1)
-    ax.axvline(a["median"], color="tab:blue", ls="--", lw=2,
-               label=f"median {a['median']:+.2f} %")
+    ax.axvline(
+        a["median"],
+        color="tab:blue",
+        ls="--",
+        lw=2,
+        label=f"median {a['median']:+.2f} %",
+    )
     ax.axvline(a["mean"], color="tab:red", lw=2, label=f"mean {a['mean']:+.2f} %")
     ax.set_xlabel("area change (%)")
     ax.set_ylabel("grains")
-    ax.set_title(
-        f"min {a['min']:+.2f} %, max {a['max']:+.2f} % over {a['n']} grains"
-    )
+    ax.set_title(f"min {a['min']:+.2f} %, max {a['max']:+.2f} % over {a['n']} grains")
     ax.legend(fontsize=12)
 
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("tesr")
-    p.add_argument("msh4")
-    p.add_argument("-o", "--output", default=None, help="PNG (default: none)")
-    p.add_argument("--csv", default=None, help="per-grain table")
-    p.add_argument(
-        "--allow-mismatch",
-        action="store_true",
-        help="report the areas even if a face does not sit on the cell of the "
-        "same id, instead of stopping. The areas are then indexed by face id "
-        "and may belong to another grain",
-    )
-    p.add_argument("--unit", default="um")
-    p.add_argument("--dpi", type=int, default=150)
-    args = p.parse_args(argv)
+def measure(
+    tesr, msh4, csv=None, png=None, unit="um", dpi=150, allow_mismatch=False, log=print
+):
+    """Measure, report, and optionally write the table and the picture.
 
-    res = area_change(args.tesr, args.msh4, allow_mismatch=args.allow_mismatch)
-    for line in format_report(res):
-        print("  " + line)
+    Returns the result dict. Raises ValueError when a mesh face does not sit on
+    the raster cell of the same id, unless `allow_mismatch`: every per-grain
+    quantity downstream is indexed by face id, so continuing past that would
+    attach the areas -- and the transport driver's theta -- to the wrong
+    grains.
+    """
+    res = area_change(tesr, msh4, allow_mismatch=allow_mismatch)
+    lines = format_report(res)
+    if log:
+        for line in lines:
+            log("  " + line)
     if "delta" not in res:
-        return 1
-    if args.csv:
-        write_csv(args.csv, res)
-    if args.output:
-        write_png(args.output, res, unit=args.unit, dpi=args.dpi)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        raise ValueError("\n".join(lines))
+    if csv:
+        write_csv(csv, res, log=log)
+    if png:
+        write_png(png, res, unit=unit, dpi=dpi, log=log)
+    return res

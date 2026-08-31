@@ -128,9 +128,11 @@ POVRAY_BIN = os.path.join(NEPER_ENV, "povray")
 if not Path(POVRAY_BIN).is_file():
     POVRAY_BIN = "povray"
 
-# ctf_to_tesr.py, next to this file, owns the cubic disorientation function
-# used to segment the map; theta is computed with the same function so a
-# boundary's theta here means the same thing as the threshold that created it.
+# The pipeline modules sit next to this file and are imported, not run:
+# orientation.py owns the cubic disorientation function used to segment the map,
+# so a boundary's theta here means the same thing as the threshold that created
+# it, and micrograph / mesh_overlay / grain_area_change supply the diagnostics
+# that ebsd_to_mesh.sh used to shell out for.
 sys.path.insert(0, str(_HERE))
 
 
@@ -219,7 +221,6 @@ def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
             "TESR_SMOOTH_FACT": str(TESR_SMOOTH_FACT),
             "TESR_SMOOTH_ITER": str(TESR_SMOOTH_ITER),
             "CHECK_IMAGES": "1",
-            "PYTHON_BIN": sys.executable,
             "UNIT_NAME": UNIT_NAME,
         }
     )
@@ -229,7 +230,66 @@ def run_ebsd_pipeline(tesr=TESR, workdir=WORKDIR, force=True):
         env["MESH_MAX_TIME"] = str(MESH_MAX_TIME)
 
     run_interruptible(["bash", str(MESH_SCRIPT)], cwd=str(base.parent), env=env)
+    finish_diagnostics(base)
     return base
+
+
+def raster_extent(base):
+    """(Lx, Ly, voxel x, voxel y) out of the .sttesr the mesh script wrote."""
+    dim, lx, ly, vsx, vsy = Path(f"{base}.sttesr").read_text().split()
+    if int(dim) != 2:
+        raise ValueError(f"{base}.sttesr: expected a 2D raster, got {dim}D")
+    return float(lx), float(ly), float(vsx), float(vsy)
+
+
+def finish_diagnostics(base, unit=UNIT_NAME, check_images=True):
+    """The Python half of the meshing stage, run once the shell script is done.
+
+    ebsd_to_mesh.sh drives Neper and Gmsh only; these four outputs come from the
+    pipeline's library modules and are done here so that those modules stay
+    importable rather than needing a command line:
+
+      check-ori.png, check-grains.png  the neper -V renders, border trimmed and
+                                       a scale bar added
+      check-mesh.png                   the reconstructed boundary edges over the
+                                       raster cells
+      <stem>-areachange.csv, check-area.png
+                                       how much each grain changed size between
+                                       the raster and the mesh
+
+    A missing check image is reported and skipped, since neper -V needs POV-Ray
+    and may have failed upstream. The area table is not optional: it also checks
+    that mesh face k is raster cell k, which every theta downstream depends on,
+    and grain_area_change.measure raises if it is not.
+    """
+    from grain_area_change import measure
+    from mesh_overlay import overlay
+    from micrograph import annotate_png
+
+    base = Path(base)
+    work = base.parent
+    lx, _ly, _vx, _vy = raster_extent(base)
+    tesr, msh4 = f"{base}-raw.tesr", f"{base}.msh4"
+
+    if check_images:
+        for name in ("check-ori", "check-grains"):
+            png = work / f"{name}.png"
+            if not png.is_file():
+                print(f"  note: {png.name} was not rendered, skipping")
+                continue
+            try:
+                annotate_png(png, lx, unit, trim_border=True)
+            except Exception as exc:  # Pillow missing, or a zero-size render
+                print(f"  WARNING: {png.name} left untrimmed ({exc})")
+        overlay(tesr, msh4, output=str(work / "check-mesh.png"), unit=unit)
+
+    measure(
+        tesr,
+        msh4,
+        csv=f"{base}-areachange.csv",
+        png=str(work / "check-area.png") if check_images else None,
+        unit=unit,
+    )
 
 
 def _ids(mask):
@@ -289,12 +349,12 @@ class Microstructure:
     """
 
     def __init__(self, base, mesh, cell_tags, facet_tags, extent):
-        from ctf_to_tesr import cubic_disorientation_angle, qconj, qmul
+        from orientation import cubic_disorientation_angle, qconj, qmul
 
         if CRYSYM != "cubic":
             raise NotImplementedError(
                 "theta is computed with the closed-form cubic disorientation "
-                f"from ctf_to_tesr.py; CRYSYM = {CRYSYM!r} needs a general "
+                f"from orientation.py; CRYSYM = {CRYSYM!r} needs a general "
                 "symmetry-operator search"
             )
         comm = mesh.comm

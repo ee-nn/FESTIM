@@ -28,21 +28,28 @@
 #   ${STEM}.msh4          Gmsh v4 mesh, linear triangles, all dimensions
 #   ${STEM}.sttesr        raster geometry, used to derive the domain size
 #   ${STEM}-grainori.txt  one orientation per grain, as read out of the tesr
-#   check-ori.png         raster coloured by per-voxel orientation (IPF-z),
-#                         border trimmed, scale bar added (micrograph.py)
-#   check-grains.png      raster coloured by cell id, likewise
+#   check-ori.png         raster coloured by per-voxel orientation (IPF-z)
+#   check-grains.png      raster coloured by cell id
+#
+# This script runs Neper and Gmsh and nothing else. The Python side of the
+# pipeline is a set of library modules with no command line, so the diagnostics
+# and the trimming of the two check images above are done by the caller --
+# ebsd_gb_diffusion.finish_diagnostics(), which runs straight after this script
+# returns and writes:
+#
+#   check-ori.png, check-grains.png   trimmed, with a scale bar (micrograph)
 #   check-mesh.png        raster cells with every reconstructed boundary edge
-#                         of the mesh drawn on top (mesh_overlay.py)
+#                         of the mesh drawn on top (mesh_overlay)
 #   ${STEM}-areachange.csv  per-grain area, rastered vs meshed, and the percent
-#                         change between them (grain_area_change.py)
+#                         change between them (grain_area_change)
 #   check-area.png        the grains coloured by that change, and its
 #                         distribution
 #
 # The area table is the quality number for this stage: -tesrsmooth and the
 # meshing both move the boundary, and the change in a grain's area is what that
 # motion does to the bulk term of the transport problem. Stage 1's equivalent
-# is printed by ctf_to_tesr.py (the RMS disorientation between a pixel and the
-# single orientation its grain is given).
+# comes out of ctf_to_tesr.convert() (the RMS disorientation between a pixel
+# and the single orientation its grain is given).
 #
 # All parameters arrive as environment variables so the Python driver stays the
 # single source of truth. Run standalone by exporting them yourself.
@@ -60,8 +67,6 @@ set -euo pipefail
 : "${NEPER_ENV:=}"                   # bin dir of the neper environment, if any
 # Make the neper environment's helper programs visible without activating it:
 # neper -V spawns `povray` (and -M spawns gmsh) by name unless given a path.
-# The caller's python3 is remembered first, as a last resort for the overlay.
-CALLER_PYTHON=$(command -v python3 || true)
 if [ -n "$NEPER_ENV" ]; then
     export PATH="$NEPER_ENV:$PATH"
 fi
@@ -77,19 +82,9 @@ fi
 # skipping this avoids Neper's tesr write path (see stage 0).
 : "${TESR_TRANSFORM:=}"
 
-# check images (neper -V needs POV-Ray, mesh_overlay.py needs matplotlib; a
-# failure here is reported, not fatal). PYTHON_BIN is whichever interpreter
-# has numpy and matplotlib; the driver passes its own, and if that one lacks
-# matplotlib the neper environment's python is tried before giving up.
+# check images. neper -V needs POV-Ray; a failure here is reported, not fatal.
+# The images land untrimmed and without a scale bar, which the caller adds.
 : "${CHECK_IMAGES:=1}"
-: "${PYTHON_BIN:=python3}"
-: "${UNIT_NAME:=um}"                 # length unit of the raster, for scale bars
-for candidate in "$PYTHON_BIN" ${NEPER_ENV:+"$NEPER_ENV/python"} ${CALLER_PYTHON:+"$CALLER_PYTHON"}; do
-    if "$candidate" -c "import matplotlib" 2>/dev/null; then
-        PYTHON_BIN="$candidate"
-        break
-    fi
-done
 
 # interface smoothing before meshing (Neper's defaults). The reconstructed
 # boundaries are pixel staircases; Laplacian smoothing rounds them off.
@@ -189,15 +184,10 @@ if [ "$CHECK_IMAGES" = "1" ]; then
             opts=""
         fi
         # shellcheck disable=SC2086
-        if "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img"; then
-            # neper -V frames the flat map in the middle of a 3D canvas; cut the
-            # border away and add a scale bar (the trimmed width is LX)
-            "$PYTHON_BIN" "$(dirname "$0")/micrograph.py" "$img.png" \
-                --trim --width "$LX" --unit "$UNIT_NAME" \
-                || echo "  WARNING: $img.png left untrimmed (Pillow/matplotlib missing?)" >&2
-        else
-            echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
-        fi
+        # neper -V frames the flat map in the middle of a 3D canvas; the caller
+        # trims that border away and adds a scale bar, the trimmed width being LX
+        "$NEPER_BIN" -V "${STEM}-raw.tesr" -povray "$POVRAY_BIN" $opts -print "$img" \
+            || echo "  WARNING: neper -V failed for $img (POV-Ray missing?)" >&2
     done
 fi
 
@@ -226,42 +216,6 @@ if need "${STEM}.msh4"; then
         -format msh4 \
         -statmesh nodenb,eltnb \
         -o "$STEM"
-fi
-
-# -----------------------------------------------------------------------------
-# 2. Mesh overlay: the raster cells with every edge# element set of the mesh
-#    drawn over them, black between two grains and grey on the specimen
-#    surface. This is the set of segments the driver can select a network
-#    from; the driver draws the theta-filtered subset as check-network.png.
-# -----------------------------------------------------------------------------
-if [ "$CHECK_IMAGES" = "1" ] && need "check-mesh.png"; then
-    "$PYTHON_BIN" "$(dirname "$0")/mesh_overlay.py" \
-        "${STEM}-raw.tesr" "${STEM}.msh4" -o check-mesh.png --unit "$UNIT_NAME" \
-        || echo "  WARNING: check-mesh.png not written (matplotlib missing?)" >&2
-fi
-
-# -----------------------------------------------------------------------------
-# 3. How much the grains changed size. Compares the voxel count of every raster
-#    cell with the summed triangle area of the corresponding mesh face, so it
-#    measures -tesrsmooth and the meshing together -- there is no intermediate
-#    file to separate them from. Set TESR_SMOOTH=none and a different STEM to
-#    get the discretisation on its own, then difference the two csv files.
-#
-#    It also re-derives the face -> cell correspondence from triangle
-#    centroids, which is the only check anywhere in the pipeline that Neper's
-#    face k really is raster cell k. Everything downstream indexes theta by
-#    face id, so a failure here is fatal rather than cosmetic; the script says
-#    so and exits non-zero, and that is deliberately not swallowed.
-# -----------------------------------------------------------------------------
-AREA_PNG=()
-if [ "$CHECK_IMAGES" = "1" ]; then
-    AREA_PNG=(-o check-area.png)
-fi
-if need "${STEM}-areachange.csv"; then
-    "$PYTHON_BIN" "$(dirname "$0")/grain_area_change.py" \
-        "${STEM}-raw.tesr" "${STEM}.msh4" \
-        --csv "${STEM}-areachange.csv" --unit "$UNIT_NAME" \
-        ${AREA_PNG[@]+"${AREA_PNG[@]}"}
 fi
 
 # Neper writes one .geo/.msh pair per tessellation entity into -tmp and deletes

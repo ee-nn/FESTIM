@@ -1,8 +1,12 @@
-#!/usr/bin/env python3
 """How much orientation information the .ctf -> .tesr segmentation throws away.
 
-    python segmentation_error.py map.ctf map.tesr [-o seg-error.png]
-    python segmentation_error.py map.ctf map.tesr --provenance map-provenance.json
+    from segmentation_error import segmentation_error, format_report
+    res = segmentation_error(qgrid, cellids, qcell, vox, ok=ok, threshold=10.0)
+
+ctf_to_tesr.convert() calls this itself and prints the report; to measure a
+.ctf/.tesr pair that already exists on disk, use
+ctf_to_tesr.measure_tesr_against_ctf(), which parses the .ctf and lines the two
+files up before calling in here.
 
 A .ctf carries one orientation per pixel; a .tesr carries one orientation per
 *grain* (``**cell/*ori``), and that per-grain value is the only orientation the
@@ -41,54 +45,34 @@ Orientation Spread"), reported per grain as well as over the map.
 
 Two errors, not one
 -------------------
-``--against grain`` (default) compares each pixel with its *cell* orientation:
+``qvox=None`` (the default) compares each pixel with its *cell* orientation:
 the segmentation error, of order the intragranular spread, and irreducible --
 one orientation per grain is what a tessellation is.
 
-``--against voxel`` compares each pixel with the ``**oridata`` entry written
+Passing ``qvox`` compares each pixel with the ``**oridata`` entry written
 for that same pixel: the transcription error of the Euler -> Rodrigues
 conversion and the ascii write. It should be ~1e-6 deg, which is the
 arccos-near-1 noise floor of the disorientation formula, not a real difference
-(ctf_to_tesr.self_test explains the amplification). Anything larger means the
-convention flipped or the file is misaligned. ``--against both`` prints both.
+(orientation.self_test explains the amplification). Anything larger means the
+convention flipped or the file is misaligned; both are reported together.
 
 Alignment
 ---------
 The tesr covers the --crop window of the .ctf and may have been mirrored with
 --flip-y, so the window and the flip have to be known to line the two files up.
-ctf_to_tesr.py writes them into ``<output>-provenance.json``; pass that with
---provenance, or repeat the conversion flags by hand. A mismatch in shape is a
+ctf_to_tesr.convert() writes them into ``<output>-provenance.json``, which
+ctf_to_tesr.measure_tesr_against_ctf() reads back. A mismatch in shape is a
 hard error, and a suspiciously large error with the right shape usually means
-the window is right but the flip is not (try toggling --flip-y: a wrong flip
-shows a mirror-symmetric theta map).
+the window is right but the flip is not; a wrong flip shows a
+mirror-symmetric theta map.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-from pathlib import Path
-
 import numpy as np
-
-
-def _ctf():
-    """The ctf_to_tesr module, whether it is imported or is the running script.
-
-    ctf_to_tesr.py imports this file to print the error at conversion time, and
-    this file needs ctf_to_tesr's quaternion algebra, so the import has to be
-    resolved late. Looking in sys.modules first also avoids loading a second
-    copy of ctf_to_tesr when that script is the one being run (in which case it
-    is registered as __main__, not as ctf_to_tesr).
-    """
-    for name in ("ctf_to_tesr", "__main__"):
-        mod = sys.modules.get(name)
-        if getattr(mod, "cubic_disorientation_angle", None) is not None:
-            return mod
-    import ctf_to_tesr
-
-    return ctf_to_tesr
+from mesh_overlay import use_agg
+from micrograph import scale_bar_ax
+from orientation import cubic_disorientation_angle, qconj, qmul
 
 
 # --- the measurement ---------------------------------------------------------
@@ -101,10 +85,9 @@ def rodrigues_to_quat(r):
 
 def theta_field(qgrid, qref):
     """Per-voxel disorientation (degrees) between two (ny, nx, 4) quat fields."""
-    c = _ctf()
     a = qgrid.reshape(-1, 4)
     b = qref.reshape(-1, 4)
-    return c.cubic_disorientation_angle(c.qmul(c.qconj(a), b)).reshape(qgrid.shape[:2])
+    return cubic_disorientation_angle(qmul(qconj(a), b)).reshape(qgrid.shape[:2])
 
 
 def l2_stats(theta, mask, vox, threshold=None):
@@ -142,9 +125,9 @@ def per_grain_rms(theta, cellids, ncells):
     flat_t = np.asarray(theta).ravel()
     keep = flat_id > 0
     cnt = np.bincount(flat_id[keep], minlength=ncells + 1)[1:]
-    ssq = np.bincount(
-        flat_id[keep], weights=flat_t[keep] ** 2, minlength=ncells + 1
-    )[1:]
+    ssq = np.bincount(flat_id[keep], weights=flat_t[keep] ** 2, minlength=ncells + 1)[
+        1:
+    ]
     with np.errstate(invalid="ignore", divide="ignore"):
         rms = np.sqrt(ssq / np.where(cnt > 0, cnt, np.nan))
     return rms, cnt
@@ -220,11 +203,16 @@ def format_report(res, label="segmentation"):
             f"than the {a['threshold']:g} deg segmentation threshold from "
             "their own grain's orientation"
         )
-    b = res["backfilled"]
+    b, c = res["backfilled"], res["all"]
     if b["n"]:
         lines.append(
             f"{label}   : back-filled voxels ({b['n']}, excluded above): "
             f"RMS {b['rms']:.3f} deg, max {b['max']:.3f} deg"
+        )
+        lines.append(
+            f"{label}   : over every voxel that has a grain ({c['n']}, the two "
+            f"populations together): RMS {c['rms']:.3f} deg, "
+            f"||theta||_2 = {c['l2']:.4g} deg*len"
         )
     rms, cnt = res["grain_rms"], res["grain_npx"]
     fin = np.flatnonzero(np.isfinite(rms))
@@ -245,25 +233,15 @@ def format_report(res, label="segmentation"):
 
 
 # --- picture -----------------------------------------------------------------
-def write_png(path, res, cellids, unit="um", dpi=150, threshold=None):
+def write_png(path, res, cellids, unit="um", dpi=150, threshold=None, log=print):
     """theta map, its distribution, and the per-grain RMS on the same map."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+    plt = use_agg()
     plt.rcParams.update({"font.size": 15, "axes.titlesize": 15})
-    try:
-        from micrograph import scale_bar_ax
-    except ImportError:  # pragma: no cover - scale bar is cosmetic
-        scale_bar_ax = None
 
     theta = res["theta"]
     ny, nx = theta.shape
     vx, vy = res["vox"]
-    kw = dict(
-        interpolation="nearest", origin="lower", extent=(0, nx * vx, 0, ny * vy)
-    )
+    kw = dict(interpolation="nearest", origin="lower", extent=(0, nx * vx, 0, ny * vy))
     a = res["indexed"]
     vmax = max(a["p99"], 1e-3)
     aspect = ny * vy / (nx * vx)
@@ -279,8 +257,7 @@ def write_png(path, res, cellids, unit="um", dpi=150, threshold=None):
     ax.set_xlabel(f"clipped at p99 = {vmax:.2f} deg")
     ax.set_xticks([])
     ax.set_yticks([])
-    if scale_bar_ax:
-        scale_bar_ax(ax, nx * vx, unit)
+    scale_bar_ax(ax, nx * vx, unit)
 
     ax = axes[1]
     good = theta[res["good"]]
@@ -320,31 +297,34 @@ def write_png(path, res, cellids, unit="um", dpi=150, threshold=None):
     ax.set_title(f"{res['ncells']} grains, worst {np.nanmax(rms):.2f} deg")
     ax.set_xticks([])
     ax.set_yticks([])
-    if scale_bar_ax:
-        scale_bar_ax(ax, nx * vx, unit)
+    scale_bar_ax(ax, nx * vx, unit)
 
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
-def write_csv(path, res):
+def write_csv(path, res, log=print):
     rms, cnt = res["grain_rms"], res["grain_npx"]
     with open(path, "w") as fh:
         fh.write("cell_id,n_voxels,rms_theta_deg\n")
         for k, (r, c) in enumerate(zip(rms, cnt), start=1):
             fh.write(f"{k},{int(c)},{'' if not np.isfinite(r) else f'{r:.6g}'}\n")
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
-# --- standalone --------------------------------------------------------------
+# --- reading a written tesr back ---------------------------------------------
 def read_tesr_full(path):
     """header, **cell/*ori, **data, **oridata, **oridef of an ascii tesr."""
     with open(path) as fh:
         tok = fh.read().split()
     i = tok.index("**general")
     if int(tok[i + 1]) != 2:
-        sys.exit(f"{path}: not a 2D tesr")
+        raise ValueError(f"{path}: not a 2D tesr")
     nx, ny = int(tok[i + 2]), int(tok[i + 3])
     n = nx * ny
     out = {"nx": nx, "ny": ny, "vox": (float(tok[i + 4]), float(tok[i + 5]))}
@@ -357,7 +337,7 @@ def read_tesr_full(path):
     j = tok.index("*ori", i)
     out["orides"] = tok[j + 1]
     if not out["orides"].startswith("rodrigues"):
-        sys.exit(
+        raise ValueError(
             f"{path}: **cell/*ori is {out['orides']!r}; this reader only "
             "understands the rodrigues descriptor ctf_to_tesr.py writes"
         )
@@ -367,7 +347,7 @@ def read_tesr_full(path):
 
     i = tok.index("**data")
     if tok[i + 1] != "ascii":
-        sys.exit(f"{path}: **data is {tok[i + 1]}, write it as ascii")
+        raise ValueError(f"{path}: **data is {tok[i + 1]}, write it as ascii")
     out["cells"] = np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx)
 
     if "**oridata" in tok:
@@ -379,112 +359,3 @@ def read_tesr_full(path):
             np.array(tok[i + 2 : i + 2 + n], dtype=int).reshape(ny, nx).astype(bool)
         )
     return out
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("ctf")
-    p.add_argument("tesr")
-    p.add_argument("-o", "--output", default=None, help="PNG (default: none)")
-    p.add_argument("--csv", default=None, help="per-grain RMS table")
-    p.add_argument(
-        "--against",
-        choices=("grain", "voxel", "both"),
-        default="grain",
-        help="compare each pixel with its grain's orientation (default), with "
-        "the per-pixel **oridata, or both",
-    )
-    p.add_argument(
-        "--provenance",
-        default=None,
-        help="the <output>-provenance.json ctf_to_tesr.py wrote; supplies "
-        "--crop / --flip-y / --phase / the quality cutoffs",
-    )
-    p.add_argument("--crop", default=None)
-    p.add_argument("--flip-y", action="store_true")
-    p.add_argument("--active", action="store_true")
-    p.add_argument("--phase", type=int, default=1)
-    p.add_argument("--threshold", type=float, default=10.0)
-    p.add_argument("--max-mad", type=float, default=1.0)
-    p.add_argument("--min-bands", type=int, default=0)
-    p.add_argument("--allow-error", action="store_true")
-    p.add_argument("--unit", default="um")
-    args = p.parse_args(argv)
-    c = _ctf()
-
-    prov = {}
-    if args.provenance:
-        prov = json.loads(Path(args.provenance).read_text())
-        for k in (
-            "crop",
-            "flip_y",
-            "active",
-            "phase",
-            "threshold",
-            "max_mad",
-            "min_bands",
-            "allow_error",
-        ):
-            if k in prov:
-                setattr(args, k, prov[k])
-        args.unit = prov.get("unit", args.unit)
-
-    ctf = c.CtfMap(args.ctf)
-    _crysym, phase = ctf.crysym(args.phase)
-    if phase is None or phase["laue"] not in c.CUBIC_LAUE:
-        sys.exit("cubic phases only: the disorientation used here is cubic-specific")
-    qgrid, ok, _diag = c.build_grid(
-        ctf, args.phase, args.max_mad, not args.allow_error, args.min_bands
-    )
-    if args.crop:
-        qgrid, ok, _w = c.crop_grid(
-            qgrid, ok, args.crop, ctf.header["XStep"], ctf.header["YStep"]
-        )
-
-    t = read_tesr_full(args.tesr)
-    if (t["ny"], t["nx"]) != ok.shape:
-        sys.exit(
-            f"{args.tesr} is {t['nx']} x {t['ny']} voxels but the .ctf window is "
-            f"{ok.shape[1]} x {ok.shape[0]}. Pass the --crop used for the "
-            "conversion, or --provenance."
-        )
-    cells = t["cells"][::-1] if args.flip_y else t["cells"]
-    sign = -1.0 if args.active else 1.0
-    qcell = rodrigues_to_quat(sign * t["cell_ori"])
-    qvox = None
-    if args.against in ("voxel", "both") and "vox_ori" in t:
-        r = t["vox_ori"][::-1] if args.flip_y else t["vox_ori"]
-        qvox = rodrigues_to_quat(sign * r).reshape(ok.shape + (4,))
-    elif args.against in ("voxel", "both"):
-        print("  note: no **oridata in the tesr (--no-voxel-ori); voxel check skipped")
-
-    res = segmentation_error(
-        qgrid, cells, qcell, t["vox"], ok=ok, threshold=args.threshold, qvox=qvox
-    )
-    for line in format_report(res):
-        print("  " + line)
-
-    # ctf_to_tesr.py knows which voxels fill_holes back-filled, including the
-    # ones whose grain was pruned by --min-pixels; this script can only see the
-    # quality rejections, so the two populations differ by the pruned pixels
-    # and the numbers differ slightly with them. Say so rather than leave two
-    # unequal RMS values lying about.
-    ref = prov.get("segmentation_error_deg", {}).get("indexed", {})
-    if ref and ref.get("n") != res["indexed"]["n"]:
-        print(
-            f"  note: ctf_to_tesr.py measured {ref['rms']:.3f} deg over "
-            f"{ref['n']} voxels. The {res['indexed']['n'] - ref['n']} extra "
-            "voxels here belonged to grains the prune removed and were then "
-            "back-filled; only the converter can tell them apart from voxels "
-            "in a grain of their own."
-        )
-
-    if args.output:
-        write_png(args.output, res, cells, unit=args.unit, threshold=args.threshold)
-    if args.csv:
-        write_csv(args.csv, res)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

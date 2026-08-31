@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 """Micrograph housekeeping shared by the EBSD pipeline scripts.
 
-    python micrograph.py check-ori.png --width 160 --unit um [--trim] [-o out.png]
+    from micrograph import annotate_png, scale_bar_ax
+
+    annotate_png("check-ori.png", width_units=160, unit="um", trim_border=True)
+    scale_bar_ax(ax, nx * voxsize, "um")
 
 Trims the uniform border neper -V leaves around a 2D raster (its camera frames
 a 3D scene, so a flat map lands in the middle of a 1200 x 900 canvas) and draws
@@ -13,9 +15,6 @@ width of the content in --unit. The same bar is available for matplotlib axes
 Bar length is the largest of 1, 2, 5 x 10^k not exceeding a quarter of the
 image width, the usual micrograph convention.
 """
-
-import argparse
-import sys
 
 import numpy as np
 
@@ -109,34 +108,25 @@ def scale_bar_ax(ax, width_units, unit="um", length=None, color="white"):
     return bar
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("png")
-    p.add_argument(
-        "--width", type=float, required=True, help="physical width of the content"
-    )
-    p.add_argument("--unit", default="um")
-    p.add_argument("--trim", action="store_true", help="crop the uniform border first")
-    p.add_argument(
-        "--length", type=float, default=None, help="bar length (default: auto)"
-    )
-    p.add_argument("-o", "--output", default=None, help="default: overwrite input")
-    args = p.parse_args(argv)
+def annotate_png(
+    path, width_units, unit="um", trim_border=False, length=None, output=None, log=print
+):
+    """Trim a rendered PNG and draw a scale bar on it. Returns the output path.
 
+    `width_units` is the physical width of the *content*, so after trimming the
+    image width and that number describe the same span. `output` defaults to
+    overwriting `path`. Needs Pillow; the matplotlib path (`scale_bar_ax`) does
+    not.
+    """
     from PIL import Image
 
-    img = Image.open(args.png)
-    if args.trim:
+    img = Image.open(path)
+    if trim_border:
         img = trim(img)
-    img = scale_bar_image(img, args.width, args.unit, args.length)
-    out = args.output or args.png
+    img = scale_bar_image(img, width_units, unit, length)
+    out = output or path
     img.save(out)
-    print(
-        f"wrote {out} ({img.size[0]} x {img.size[1]} px, \
-        bar {format_length(args.length or nice_length(args.width), args.unit)})"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    if log:
+        bar = format_length(length or nice_length(width_units), unit)
+        log(f"  wrote {out} ({img.size[0]} x {img.size[1]} px, bar {bar})")
+    return out

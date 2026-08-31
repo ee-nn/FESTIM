@@ -1,6 +1,7 @@
 """Overlay the grain boundaries of a `neper -M map.tesr` mesh on the raster.
 
-    python mesh_overlay.py map.tesr poly.msh4 -o check-mesh.png
+    from mesh_overlay import overlay
+    overlay("map.tesr", "poly.msh4", output="check-mesh.png", unit="um")
 
 The raster is drawn with its cell ids shuffled onto a categorical colormap
 (consecutive ids are neighbours, so a continuous map hides the boundaries), and
@@ -11,40 +12,57 @@ what is drawn is exactly the set of segments FESTIM can put a boundary on --
 before the disorientation filter, which the driver applies and draws itself
 (check-network.png).
 
-The msh4 is parsed directly (no gmsh/meshio dependency), and the two functions
-`read_tesr` / `read_msh4` are reused by ebsd_gb_diffusion.py.
+The msh4 is parsed directly (no gmsh/meshio dependency), and the readers
+`read_tesr` / `read_msh4` are reused by ebsd_gb_diffusion.py and
+grain_area_change.py.
+
+Importing this module has no side effects: the Agg backend and the font sizes
+are set by `overlay`, which is the function that writes a file, and never by
+the drawing primitive `draw_raster`, which takes an axes the caller owns.
 """
 
-import argparse
-import sys
-
-import matplotlib
 import numpy as np
+from micrograph import scale_bar_ax
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# Every figure the pipeline writes uses these.
+RCPARAMS = {
+    "font.size": 16,  # Baseline text, labels, ticks, and legends
+    "axes.titlesize": 16,  # Subplot titles
+    "figure.titlesize": 16,  # Global figure super title
+}
 
-plt.rcParams.update(
-    {
-        "font.size": 16,  # Baseline text, labels, ticks, and legends
-        "axes.titlesize": 16,  # Subplot titles
-        "figure.titlesize": 16,  # Global figure super title
-    }
-)
+
+def use_agg():
+    """Select the non-interactive backend and the pipeline's font sizes.
+
+    Called by every function here that writes a PNG. Kept out of module scope
+    so that importing this file does not reach into a caller's matplotlib.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update(RCPARAMS)
+    return plt
 
 
 def read_tesr(path):
-    """(cell ids as (ny, nx) array, (voxel size x, y)) from an ascii tesr."""
+    """(cell ids as (ny, nx) array, (voxel size x, y)) from an ascii tesr.
+
+    Raises ValueError on a file this reader cannot handle, rather than exiting:
+    the caller is another module, not a shell.
+    """
     with open(path) as fh:
         tok = fh.read().split()
     i = tok.index("**general")
     if int(tok[i + 1]) != 2:
-        sys.exit(f"{path}: not a 2D tesr")
+        raise ValueError(f"{path}: not a 2D tesr")
     nx, ny = int(tok[i + 2]), int(tok[i + 3])
     vox = float(tok[i + 4]), float(tok[i + 5])
     i = tok.index("**data")
     if tok[i + 1] != "ascii":
-        sys.exit(f"{path}: **data is {tok[i + 1]}, write it as ascii")
+        raise ValueError(f"{path}: **data is {tok[i + 1]}, write it as ascii")
     return np.array(tok[i + 2 : i + 2 + nx * ny], dtype=int).reshape(ny, nx), vox
 
 
@@ -237,26 +255,20 @@ def draw_raster(ax, cells, vox, alpha=1.0):
     return rgba
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("tesr")
-    p.add_argument("msh4")
-    p.add_argument("-o", "--output", default="check-mesh.png")
-    p.add_argument("--dpi", type=int, default=150)
-    p.add_argument("--unit", default="um", help="raster length unit, for the scale bar")
-    args = p.parse_args(argv)
+def overlay(tesr, msh4, output="check-mesh.png", dpi=150, unit="um", log=print):
+    """Write the overlay PNG. Returns the output path.
 
-    import matplotlib
+    `tesr` and `msh4` are paths; everything else is cosmetic. The counts are
+    printed through `log`, which can be set to None to silence them.
+    """
+    plt = use_agg()
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    cells, vox = read_tesr(args.tesr)
-    xyz, seg, tri = read_msh4(args.msh4)
+    cells, vox = read_tesr(tesr)
+    xyz, seg, tri = read_msh4(msh4)
     sides = edge_sides(seg, tri)
     faces = {t for t, _ in tri}
-    if len(faces) != int(cells.max()):
-        print(f"note: raster has {int(cells.max())} cells, mesh has {len(faces)} faces")
+    if log and len(faces) != int(cells.max()):
+        log(f"note: raster has {int(cells.max())} cells, mesh has {len(faces)} faces")
 
     ny, nx = cells.shape
     fig, ax = plt.subplots(figsize=(7, 7 * ny * vox[1] / (nx * vox[0])))
@@ -277,16 +289,12 @@ def main(argv=None):
         f"{len(sides)} edges ({sum(len(s) == 2 for s in sides.values())} interior), "
         f"{n_int + n_surf} segments over {int(cells.max())} raster cells"
     )
-    ax.set_xlabel(f"x ({args.unit})")
-    ax.set_ylabel(f"y ({args.unit})")
-    from micrograph import scale_bar_ax
-
-    scale_bar_ax(ax, nx * vox[0], args.unit)
+    ax.set_xlabel(f"x ({unit})")
+    ax.set_ylabel(f"y ({unit})")
+    scale_bar_ax(ax, nx * vox[0], unit)
     fig.tight_layout()
-    fig.savefig(args.output, dpi=args.dpi)
-    print(f"wrote {args.output}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    fig.savefig(output, dpi=dpi)
+    plt.close(fig)
+    if log:
+        log(f"  wrote {output}")
+    return output

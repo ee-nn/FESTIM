@@ -12,11 +12,19 @@ threshold, with cubic crystal symmetry taken into account.
 
 Example usage:
 
-    python ctf_to_tesr.py map.ctf -o ebsd.tesr
+    from ctf_to_tesr import convert
+    res = convert("map.ctf", "ebsd.tesr", min_pixels=20, diagnostics=True)
+    res["segmentation_error"]["indexed"]["rms"]   # degrees
 
 then point the transport pipeline at the result:
 
-    TESR = "ebsd.tesr"   in festim_ebsd_gb_diffusion.py
+    TESR = "ebsd.tesr"   in ebsd_gb_diffusion.py
+
+Every choice the conversion makes lives in the `Settings` dataclass, which
+`convert` will build from keyword arguments or accept ready-made. It is dumped
+into <output>-provenance.json alongside the .tesr, and read back by
+`settings_from_provenance`, because the crop window, the y mirror and the
+orientation convention are not recoverable from the .tesr itself.
 
 What is written
 ---------------
@@ -28,7 +36,7 @@ What is written
 
 Length unit
 -----------
-The tesr is written in the .ctf's own unit (microns) unless --scale is given.
+The tesr is written in the .ctf's own unit (microns) unless `scale` is given.
 The transport driver converts to metres after reading
 the mesh (TESR_UNIT in ebsd_gb_diffusion.py).
 
@@ -44,7 +52,8 @@ file declaring 2.1 has its `**cell/*ori` descriptor silently flipped on read
 taken literally, leaving the two sections in opposite conventions. The
 conversion is verified against Neper's own convention table,
 which gives Bunge (0, 30, 0) as Rodrigues (0.267949192, 0, 0) and quaternion
-(0.965925826, 0.258819045, 0, 0); see the self-test at the bottom.
+(0.965925826, 0.258819045, 0, 0); see `orientation.self_test`, which
+`convert` runs before it touches a file.
 
 Rodrigues is used rather than passing the Euler angles through unchanged
 because it removes any degrees-versus-radians ambiguity in the tesr reader.
@@ -58,7 +67,7 @@ is *not* free is the active/passive choice, so verify the output visually:
     neper -V ebsd.tesr -datavoxcol ori -datavoxcolscheme ipf -print check
 
 and compare against the same map plotted in AZtec or MTEX. If the colours are
-wrong in a way that looks like an inversion, re-run with --active.
+wrong in a way that looks like an inversion, re-run with active=True.
 
 Limitations
 -----------
@@ -70,8 +79,9 @@ Limitations
 
 from __future__ import annotations
 
-import argparse
-import sys
+import json
+from dataclasses import asdict, dataclass
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 import matplotlib
@@ -81,10 +91,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
+from micrograph import scale_bar_ax
+from orientation import (
+    crystal_equivalents,
+    cubic_disorientation_angle,
+    cubic_symmetry_quaternions,
+    euler_bunge_to_quat,
+    qconj,
+    qmul,
+    quat_to_rodrigues,
+    self_test,
+    to_fundamental_zone,
+)
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from segmentation_error import (
     format_report,
+    read_tesr_full,
+    rodrigues_to_quat,
     segmentation_error,
 )
 from segmentation_error import write_csv as write_segerr_csv
@@ -117,135 +141,65 @@ LAUE_TO_CRYSYM = {
 CUBIC_LAUE = (10, 11)
 
 
-# --- quaternion helpers ------------------------------------------------------
-def cubic_symmetry_quaternions():
-    """The 24 rotations of the cubic group, as unit quaternions.
+# --- conversion settings -----------------------------------------------------
+@dataclass
+class Settings:
+    """Every choice `convert` makes, in one object.
 
-    Nine 90/180/270-degree rotations about the <100> axes, six 180-degree
-    rotations about the <110> axes, and eight 120/240-degree rotations about
-    the <111> axes, plus the identity.
+    It is passed to the writers rather than being unpacked into loose keyword
+    arguments, so a caller constructing one of these by hand gets exactly the
+    same behaviour, and so the fields that end up in the provenance json have a
+    single definition.
     """
-    r = np.sqrt(0.5)
-    q = [(1.0, 0.0, 0.0, 0.0)]
-    for axis in range(3):
-        for w, s in ((r, r), (0.0, 1.0), (r, -r)):
-            v = [0.0, 0.0, 0.0]
-            v[axis] = s
-            q.append((w, *v))
-    for i, j in ((0, 1), (0, 2), (1, 2)):
-        for sign in (1.0, -1.0):
-            v = [0.0, 0.0, 0.0]
-            v[i], v[j] = r, sign * r
-            q.append((0.0, *v))
-    for sx in (0.5, -0.5):
-        for sy in (0.5, -0.5):
-            for sz in (0.5, -0.5):
-                q.append((0.5, sx, sy, sz))
-    out = np.array(q, dtype=float)
-    assert out.shape == (24, 4), out.shape
-    return out
 
+    ctf: str
+    #: xmin,xmax,ymin,ymax in the .ctf's own units (microns), applied before
+    #: segmentation. Prefer this to Neper's -transform crop: cropping
+    #: afterwards clips grains into 1-2 pixel slivers that no `min_pixels`
+    #: prune has seen, and those degenerate cells abort the tessellation fit.
+    crop: str | None = None
+    #: phase to keep
+    phase: int = 1
+    #: grain boundary misorientation threshold, degrees
+    threshold: float = 10.0
+    #: MAD cutoff
+    max_mad: float = 1.0
+    #: minimum Bands; 0 disables the test
+    min_bands: int = 0
+    #: keep points whose Error column is non-zero
+    allow_error: bool = False
+    #: discard grains smaller than this many pixels
+    min_pixels: int = 5
+    #: multiply step sizes by this to get the tesr length unit (1 keeps the
+    #: .ctf's microns). Do not write metres: Neper's fit objective and its
+    #: val/eps stopping criteria are in absolute length units, so a metre-scale
+    #: map stops the fit at iteration 1. The driver rescales to metres after
+    #: meshing (TESR_UNIT).
+    scale: float = 1.0
+    #: mirror the map in y. EBSD map coordinates usually run downwards while
+    #: Neper's y runs upwards, so set this if the physical top surface of the
+    #: specimen must end up at y = Ly.
+    flip_y: bool = False
+    #: write orientations under the active convention instead of passive
+    active: bool = False
+    #: grow the cells into unassigned voxels. With fill=False the holes act as
+    #: interior surfaces in the tessellation fit, which is only useful for
+    #: inspecting how much of the map was rejected.
+    fill: bool = True
+    #: clean up enclosed grains and corner-only self-contacts. On by default
+    #: because `neper -M` aborts on a face whose boundary is not a single loop;
+    #: turn it off only for a consumer that can handle those.
+    topology_fix: bool = True
+    #: write **oridata/**oridef. False gives a much smaller file and keeps the
+    #: grain orientations, but loses per-pixel colouring in -V and GOS in -S.
+    voxel_ori: bool = True
+    #: also write <output>-quality.png, <output>-raw.png and
+    #: <output>-segerror.png/.csv. Needs matplotlib and Pillow.
+    diagnostics: bool = False
 
-def qmul(a, b):
-    """Hamilton product, broadcasting over leading axes."""
-    a0, a1, a2, a3 = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
-    b0, b1, b2, b3 = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
-    return np.stack(
-        (
-            a0 * b0 - a1 * b1 - a2 * b2 - a3 * b3,
-            a0 * b1 + a1 * b0 + a2 * b3 - a3 * b2,
-            a0 * b2 - a1 * b3 + a2 * b0 + a3 * b1,
-            a0 * b3 + a1 * b2 - a2 * b1 + a3 * b0,
-        ),
-        axis=-1,
-    )
-
-
-def qconj(q):
-    out = q.copy()
-    out[..., 1:] *= -1.0
-    return out
-
-
-def euler_bunge_to_quat(phi1, Phi, phi2, degrees=True):
-    """Bunge Euler angles -> unit quaternion, passive convention.
-
-    Passive here means what Neper means by it: the rotation carrying the sample
-    coordinate system onto the crystal coordinate system, which is the standard
-    reading of Bunge angles and what a .ctf stores.
-    """
-    if degrees:
-        phi1, Phi, phi2 = np.radians(phi1), np.radians(Phi), np.radians(phi2)
-    sigma = 0.5 * (phi1 + phi2)
-    delta = 0.5 * (phi1 - phi2)
-    c, s = np.cos(0.5 * Phi), np.sin(0.5 * Phi)
-    q = np.stack(
-        (c * np.cos(sigma), s * np.cos(delta), s * np.sin(delta), c * np.sin(sigma)),
-        axis=-1,
-    )
-    # a quaternion and its negative are the same rotation; fix the sign so that
-    # averaging and fundamental-zone reduction are well defined
-    return np.where(q[..., :1] < 0, -q, q)
-
-
-def crystal_equivalents(q, sym):
-    """All symmetry-equivalent descriptions of the orientations q, (n, 24, 4).
-
-    The crystal symmetry multiplies on the *right* in this quaternion
-    convention: q maps sample to crystal (Bunge, passive), so a symmetry
-    operator S, which relabels crystal axes, composes as q * S. Multiplying on
-    the left, S * q, would instead rotate the sample frame and yield a
-    physically different orientation. Checked against Neper: for a cell pair
-    (q, q*S) `-statedge theta` under -crysym cubic is 0; for (q, S*q) it is
-    17 degrees.
-    """
-    return qmul(q[:, None, :], sym[None, :, :])
-
-
-def to_fundamental_zone(q, sym, chunk=50_000):
-    """Pick, for each orientation, the symmetry equivalent closest to identity.
-
-    Any equivalent is as correct as any other -- the crysym is declared in the
-    tesr and Neper applies the symmetry itself. The point of choosing this one
-    is that its rotation angle is at most ~62.8 degrees for cubic, so the
-    scalar part never approaches zero and the Rodrigues vector stays finite.
-    """
-    out = np.empty_like(q)
-    for lo in range(0, len(q), chunk):
-        blk = q[lo : lo + chunk]
-        cand = crystal_equivalents(blk, sym)  # (n, 24, 4)
-        best = np.argmax(np.abs(cand[..., 0]), axis=1)
-        picked = cand[np.arange(len(blk)), best]
-        out[lo : lo + chunk] = np.where(picked[..., :1] < 0, -picked, picked)
-    return out
-
-
-def quat_to_rodrigues(q):
-    """Rodrigues vector = (q1, q2, q3) / q0. Requires q already in the FZ."""
-    q0 = q[..., :1]
-    if np.any(np.abs(q0) < 1e-8):
-        raise ValueError("scalar part near zero; reduce to the fundamental zone first")
-    return q[..., 1:] / q0
-
-
-def cubic_disorientation_angle(m):
-    """Disorientation angle (degrees) of a cubic misorientation quaternion.
-
-    Closed form rather than a search over 24 x 24 symmetry pairs: with the
-    absolute components sorted descending as a >= b >= c >= d, the largest
-    attainable cos(omega/2) over the cubic group is
-
-        max( a, (a + b)/sqrt(2), (a + b + c + d)/2 )
-
-    which is the standard result for the cubic misorientation function (Grimmer,
-    Acta Cryst. A36 (1980) 382). Checked in the self-test against two cases with
-    known answers: a 90-degree rotation about <100> (a symmetry operation, so
-    zero) and a 60-degree rotation about <111> (the Sigma-3 twin).
-    """
-    s = np.sort(np.abs(m), axis=-1)[..., ::-1]
-    a, b, c, d = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
-    best = np.maximum.reduce([a, (a + b) / np.sqrt(2.0), 0.5 * (a + b + c + d)])
-    return np.degrees(2.0 * np.arccos(np.clip(best, -1.0, 1.0)))
+    @property
+    def unit(self):
+        return "um" if np.isclose(self.scale, 1.0) else f"x{self.scale:g} um"
 
 
 # --- .ctf parsing ------------------------------------------------------------
@@ -355,7 +309,7 @@ def build_grid(ctf, phase, max_mad, require_zero_error, min_bands):
     qgrid[iy[inside], ix[inside]] = quat[inside]
     ok[iy[good], ix[good]] = True
 
-    # Per-pixel provenance for --diagnostics: what the .ctf itself says about
+    # Per-pixel provenance for diagnostics=True: what the .ctf itself says about
     # each point, so a rejected pixel can be traced to the column that
     # rejected it rather than blamed on the conversion.
     diag = {}
@@ -381,13 +335,13 @@ def crop_grid(qgrid, ok, spec, xstep, ystep):
         to keep orientations, so -V colouring & -S intragranular measures still work.
 
     Bounds are in the .ctf's own 'as- acquired' length units,
-    i.e. before any --flip-y.
+    i.e. before any flip_y.
     """
     try:
         x0, x1, y0, y1 = (float(v) for v in spec.split(","))
     except ValueError:
         raise SystemExit(
-            f"--crop {spec!r}: expected four comma-separated numbers, "
+            f"crop={spec!r}: expected four comma-separated numbers, "
             "xmin,xmax,ymin,ymax, in the same units as XStep"
         )
     ny, nx = ok.shape
@@ -395,7 +349,7 @@ def crop_grid(qgrid, ok, spec, xstep, ystep):
     iy0, iy1 = max(round(y0 / ystep), 0), min(round(y1 / ystep), ny)
     if ix1 - ix0 < 2 or iy1 - iy0 < 2:
         raise SystemExit(
-            f"--crop {spec} keeps {max(ix1 - ix0, 0)} x {max(iy1 - iy0, 0)} "
+            f"crop={spec} keeps {max(ix1 - ix0, 0)} x {max(iy1 - iy0, 0)} "
             f"pixels. The map is {nx} x {ny} pixels of {xstep} x {ystep}, "
             f"i.e. {nx * xstep:g} x {ny * ystep:g} in those units."
         )
@@ -718,50 +672,46 @@ def write_tesr(path, cellids, ori_cell, ori_vox, oridef, voxsize, crysym, precis
         fh.write("***end\n")
 
 
-def write_provenance(path, args, seg, vox):
+def write_provenance(path, opt, seg, vox, log=print):
     """Everything needed to line the .tesr back up with the .ctf, plus the
     segmentation error, as json.
 
-    The window, the mirror and the orientation convention are choices made here
-    and are not recoverable from the .tesr itself, so segmentation_error.py
-    cannot re-measure the conversion without them (`--provenance`). The
-    statistics are copied in so that a later stage can quote stage 1's error
-    without re-reading the .ctf.
+    The window, the mirror and the orientation convention are choices made in
+    `Settings` and are not recoverable from the .tesr itself, so
+    `measure_tesr_against_ctf` cannot re-measure the conversion without them.
+    The statistics are copied in so that a later stage can quote stage 1's
+    error without re-reading the .ctf. Dumping the whole dataclass means a
+    field added to `Settings` reaches the file without a second edit here.
     """
-    import json
-
-    rec = {
-        "ctf": str(args.ctf),
-        "crop": args.crop,
-        "flip_y": bool(args.flip_y),
-        "active": bool(args.active),
-        "phase": args.phase,
-        "threshold": args.threshold,
-        "max_mad": args.max_mad,
-        "min_bands": args.min_bands,
-        "allow_error": bool(args.allow_error),
-        "min_pixels": args.min_pixels,
-        "scale": args.scale,
-        "voxsize": list(vox),
-        "unit": "um" if np.isclose(args.scale, 1.0) else f"x{args.scale:g} um",
-        "ncells": int(seg["ncells"]),
-        "segmentation_error_deg": {
-            k: seg[k] for k in ("all", "indexed", "backfilled") if k in seg
-        },
-    }
+    rec = asdict(opt)
+    rec.update(
+        {
+            "ctf": str(opt.ctf),
+            "unit": opt.unit,
+            "voxsize": list(vox),
+            "ncells": int(seg["ncells"]),
+            "segmentation_error_deg": {
+                k: seg[k] for k in ("all", "indexed", "backfilled") if k in seg
+            },
+        }
+    )
     with open(path, "w") as fh:
         json.dump(rec, fh, indent=1)
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
+
+
+def settings_from_provenance(path):
+    """Rebuild the `Settings` of a conversion from its provenance json."""
+    rec = json.loads(Path(path).read_text())
+    known = {f.name for f in dataclass_fields(Settings)}
+    return Settings(**{k: v for k, v in rec.items() if k in known})
 
 
 # --- diagnostics -------------------------------------------------------------
 def _scale_bar(ax, width, unit):
-    """Scale bar from micrograph.py if it sits next to this script; else none."""
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from micrograph import scale_bar_ax
-    except ImportError:
-        return
+    """Kept as a name the figure code already uses; micrograph does the work."""
     scale_bar_ax(ax, width, unit)
 
 
@@ -923,7 +873,18 @@ def verify_readback(path, qgrid, ok, cellids, flip_y, sym):
 
 
 def write_raw_png(
-    path, qgrid_full, ok_full, window, qgrid, ok, check, ctf, args, vox, unit
+    path,
+    qgrid_full,
+    ok_full,
+    window,
+    qgrid,
+    ok,
+    check,
+    ctf,
+    opt,
+    vox,
+    unit,
+    log=print,
 ):
     """<output>-raw.png: the .ctf as read, and the window that was written.
 
@@ -937,7 +898,7 @@ def write_raw_png(
 
     NY, NX = ok_full.shape
     ny, nx = ok.shape
-    xs, ys = ctf.header["XStep"] * args.scale, ctf.header["YStep"] * args.scale
+    xs, ys = ctf.header["XStep"] * opt.scale, ctf.header["YStep"] * opt.scale
 
     full_rgb = ipf_z_colours(qgrid_full.reshape(-1, 4)).reshape(NY, NX, 3)
     full_rgb[~ok_full] = 0.6
@@ -994,11 +955,13 @@ def write_raw_png(
 
     fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
 def write_quality_png(
-    path, diag, ok, unassigned, cellids, args, vox, unit, flip_y=False
+    path, diag, ok, unassigned, cellids, opt, vox, unit, flip_y=False, log=print
 ):
     """Four panels tracing every grey pixel of `neper -V ... -datavoxcol ori`.
 
@@ -1023,18 +986,18 @@ def write_quality_png(
     # rejection reason, first failing test wins
     reason = np.zeros((ny, nx), dtype=int)  # 0 kept
     if phase is not None:
-        reason[(reason == 0) & (phase != args.phase)] = 4
-    if err is not None and not args.allow_error:
+        reason[(reason == 0) & (phase != opt.phase)] = 4
+    if err is not None and not opt.allow_error:
         reason[(reason == 0) & (err != 0)] = 1
     if mad is not None:
-        reason[(reason == 0) & (mad > args.max_mad)] = 2
-    if bands is not None and args.min_bands:
-        reason[(reason == 0) & (bands < args.min_bands)] = 3
+        reason[(reason == 0) & (mad > opt.max_mad)] = 2
+    if bands is not None and opt.min_bands:
+        reason[(reason == 0) & (bands < opt.min_bands)] = 3
     reason[ok] = 0
     labels = [
         "kept",
         "Error != 0",
-        f"MAD > {args.max_mad:g}",
+        f"MAD > {opt.max_mad:g}",
         "Bands < min",
         "other phase",
     ]
@@ -1062,11 +1025,11 @@ def write_quality_png(
     ax = axes[0, 1]
     if mad is not None:
         im = ax.imshow(
-            orient(mad), cmap="viridis", vmin=0, vmax=max(args.max_mad * 1.5, 1.0), **kw
+            orient(mad), cmap="viridis", vmin=0, vmax=max(opt.max_mad * 1.5, 1.0), **kw
         )
         fig.colorbar(im, ax=ax, fraction=0.046).set_label("MAD (deg)")
-        over = int((mad > args.max_mad).sum())
-        ax.set_title(f"ctf MAD: {over} px above --max-mad {args.max_mad:g}")
+        over = int((mad > opt.max_mad).sum())
+        ax.set_title(f"ctf MAD: {over} px above max_mad {opt.max_mad:g}")
     else:
         ax.set_title("no MAD column")
 
@@ -1104,214 +1067,92 @@ def write_quality_png(
         ax.set_yticks([])
         _scale_bar(ax, nx * vox[0], unit)
     fig.suptitle(
-        f"{Path(args.ctf).name}: \
+        f"{Path(opt.ctf).name}: \
             {', '.join(f'{labels[k]} {counts[k]}' for k in range(5) if counts[k])}"
     )
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  wrote {path}")
+    if log:
+        log(f"  wrote {path}")
+    return path
 
 
-# --- self-test ---------------------------------------------------------------
-def self_test():
-    """Check the conventions against values Neper publishes, on every run.
+def convert(ctf_path=None, output=None, *, settings=None, log=print, **kwargs):
+    """Convert a .ctf into a .tesr, and measure what the segmentation cost.
 
-    Neper's orientation-convention table gives, for a 30-degree rotation about
-    the sample x axis under the passive convention, Bunge angles (0, 30, 0),
-    quaternion (0.965925826, 0.258819045, 0, 0) and Rodrigues vector
-    (0.267949192, 0, 0). If this assertion ever fires, the Euler conversion has
-    drifted away from what the tesr reader will assume.
+    Either give `ctf_path` plus any `Settings` field as a keyword argument, or
+    build a `Settings` yourself and pass it as `settings`. `output` defaults to
+    the .ctf's name with a .tesr suffix. `log` takes every progress line and can
+    be set to None to run silently.
+
+    Returns a dict describing the result: the paths written (`tesr`,
+    `provenance`), the `settings` actually used, and the arrays a caller is
+    likely to want next -- `cellids` and `ok` in the *written* (post flip_y)
+    row order, `qcell` and `ori_cell`, the per-grain voxel counts `npx`, and
+    the `segmentation_error` dict, whose "indexed" entry holds the headline
+    RMS disorientation in degrees.
+
+    Raises ValueError if the map has no cubic phase line or if no grain
+    survives the prune, rather than exiting the interpreter.
     """
-    sym = cubic_symmetry_quaternions()
-    q = euler_bunge_to_quat(np.array([0.0]), np.array([30.0]), np.array([0.0]))
-    assert np.allclose(q[0], [0.965925826, 0.258819045, 0, 0], atol=1e-8), q
-    r = quat_to_rodrigues(to_fundamental_zone(q, sym))
-    assert np.allclose(r[0], [0.267949192, 0, 0], atol=1e-8), r
-
-    # 90 degrees about z is a cubic symmetry operation -> disorientation 0.
-    # The tolerance is loose because arccos has an infinite derivative at 1, so
-    # a rounding error of 1e-16 in the argument surfaces as ~1e-6 degrees. That
-    # amplification is harmless at a 10-degree segmentation threshold but it is
-    # the reason not to compare disorientations to exact zero anywhere.
-    q90 = np.array([[np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)]])
-    assert cubic_disorientation_angle(q90)[0] < 1e-4
-    # R(q) = g^T for Bunge (0, 30, 0): the IPF-Z direction is the third row
-    w, x, y, z = q[0]
-    third_row = np.array(
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]
-    )
-    assert np.allclose(third_row, [0.0, np.sin(np.radians(30)), np.cos(np.radians(30))])
-
-    # 60 degrees about <111> is the Sigma-3 twin -> disorientation 60
-    v = np.sin(np.pi / 6) / np.sqrt(3)
-    q60 = np.array([[np.cos(np.pi / 6), v, v, v]])
-    assert abs(cubic_disorientation_angle(q60)[0] - 60.0) < 1e-6
-
-    # symmetry operators are unit quaternions and closed under multiplication
-    assert np.allclose(np.linalg.norm(sym, axis=1), 1.0)
-
-    # The crystal symmetry acts on the right (see crystal_equivalents): every
-    # equivalent must be at zero disorientation from the original, the
-    # fundamental-zone representative must be the same orientation, and the
-    # left-multiplied version must NOT be (it is a sample-frame rotation). A
-    # regression of the S*q bug that used to corrupt **oridata and *ori.
-    qq = euler_bunge_to_quat(np.array([37.0]), np.array([52.0]), np.array([131.0]))
-    equiv = crystal_equivalents(qq, sym)[0]
-    d = cubic_disorientation_angle(qmul(qconj(np.repeat(qq, 24, 0)), equiv))
-    assert d.max() < 1e-4, d.max()
-    assert (
-        cubic_disorientation_angle(qmul(qconj(qq), to_fundamental_zone(qq, sym)))[0]
-        < 1e-4
-    )
-    wrong = qmul(sym[13][None], qq)
-    assert cubic_disorientation_angle(qmul(qconj(qq), wrong))[0] > 10.0
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("ctf", help="input Channel Text File")
-    p.add_argument("-o", "--output", default=None, help="output .tesr")
-    p.add_argument(
-        "--crop",
-        default=None,
-        help="xmin,xmax,ymin,ymax in the .ctf's own units (microns), applied "
-        "before segmentation. Prefer this to Neper's -transform crop: cropping "
-        "afterwards clips grains into 1-2 pixel slivers that no --min-pixels "
-        "prune has seen, and those degenerate cells abort the tessellation fit",
-    )
-    p.add_argument("--phase", type=int, default=1, help="phase to keep (default 1)")
-    p.add_argument(
-        "--threshold",
-        type=float,
-        default=10.0,
-        help="grain boundary misorientation threshold, degrees (default 10)",
-    )
-    p.add_argument(
-        "--max-mad", type=float, default=1.0, help="MAD cutoff (default 1.0)"
-    )
-    p.add_argument("--min-bands", type=int, default=0, help="minimum Bands (default 0)")
-    p.add_argument(
-        "--allow-error",
-        action="store_true",
-        help="keep points whose Error column is non-zero (default: reject them)",
-    )
-    p.add_argument(
-        "--min-pixels",
-        type=int,
-        default=5,
-        help="discard grains smaller than this many pixels (default 5)",
-    )
-    p.add_argument(
-        "--scale",
-        type=float,
-        default=1.0,
-        help="multiply step sizes by this to get the tesr length unit "
-        "(default 1: keep the .ctf's microns). Do not write metres: Neper's "
-        "fit objective and its val/eps stopping criteria are in absolute "
-        "length units, so a metre-scale map stops the fit at iteration 1. "
-        "The driver rescales to metres after meshing (TESR_UNIT)",
-    )
-    p.add_argument(
-        "--flip-y",
-        action="store_true",
-        help="mirror the map in y. EBSD map coordinates usually run downwards "
-        "while Neper's y runs upwards, so use this if the physical top surface "
-        "of the specimen must end up at y = Ly",
-    )
-    p.add_argument(
-        "--active",
-        action="store_true",
-        help="write orientations under the active convention instead of passive",
-    )
-    p.add_argument(
-        "--no-fill",
-        action="store_true",
-        help="leave unassigned voxels empty instead of growing the cells into "
-        "them. Holes act as interior surfaces in the tessellation fit, so this "
-        "is only useful for inspecting how much of the map was rejected",
-    )
-    p.add_argument(
-        "--no-topology-fix",
-        action="store_true",
-        help="leave enclosed grains and corner-only self-contacts in place. "
-        "They are cleaned up by default because `neper -M` aborts on a face "
-        "whose boundary is not a single loop; keep them only for a consumer "
-        "that can handle it",
-    )
-    p.add_argument(
-        "--no-voxel-ori",
-        action="store_true",
-        help="omit **oridata/**oridef. Much smaller file; keeps the grain "
-        "orientations but loses per-pixel colouring in -V and GOS in -S",
-    )
-    p.add_argument(
-        "--diagnostics",
-        action="store_true",
-        help="also write <output>-quality.png (the .ctf's Error codes and MAD "
-        "over the window, the pixels this script rejected and why -- these are "
-        "the grey pixels in neper -V's orientation map, **oridef = 0 -- and the "
-        "pixels the cell map back-filled) and <output>-raw.png (the whole .ctf "
-        "with the window marked, the window from the raw Euler angles, the "
-        "window read back from the written tesr, and their per-voxel "
-        "disorientation, i.e. proof of a lossless round trip). Needs matplotlib",
-    )
-    args = p.parse_args(argv)
+    opt = settings if settings is not None else Settings(ctf=ctf_path, **kwargs)
+    if kwargs and settings is not None:
+        raise TypeError("pass either a Settings object or keyword arguments")
+    log = log or (lambda *a, **k: None)
 
     self_test()
 
-    ctf = CtfMap(args.ctf)
+    ctf = CtfMap(opt.ctf)
     ny, nx = ctf.shape
-    print(
-        f"{args.ctf}: {nx} x {ny} pixels, step {ctf.header['XStep']} x "
+    log(
+        f"{opt.ctf}: {nx} x {ny} pixels, step {ctf.header['XStep']} x "
         f"{ctf.header['YStep']}, {ctf.npoints} rows"
     )
     if not np.isclose(ctf.header["XStep"], ctf.header["YStep"]):
-        print("  note: XStep != YStep -- voxels will not be square")
+        log("  note: XStep != YStep -- voxels will not be square")
 
-    crysym, phase = ctf.crysym(args.phase)
+    crysym, phase = ctf.crysym(opt.phase)
     if crysym is None:
-        raise SystemExit("no phase line found; cannot determine crystal symmetry")
+        raise ValueError("no phase line found; cannot determine crystal symmetry")
     if phase["laue"] not in CUBIC_LAUE:
-        raise SystemExit(
+        raise ValueError(
             f"phase '{phase['name']}' has Laue group {phase['laue']} -> {crysym}, "
             "which this script cannot segment. The disorientation used here is "
             "specific to the cubic group. Segment in MTEX and write the grain "
             "ids into the **data section instead."
         )
-    print(f"  phase {args.phase}: {phase['name']}, Laue {phase['laue']} -> {crysym}")
+    log(f"  phase {opt.phase}: {phase['name']}, Laue {phase['laue']} -> {crysym}")
 
     sym = cubic_symmetry_quaternions()
     qgrid, ok, diag = build_grid(
-        ctf, args.phase, args.max_mad, not args.allow_error, args.min_bands
+        ctf, opt.phase, opt.max_mad, not opt.allow_error, opt.min_bands
     )
     qgrid_full, ok_full = qgrid, ok
     window = (slice(0, ny), slice(0, nx))
-    if args.crop:
+    if opt.crop:
         qgrid, ok, window = crop_grid(
-            qgrid, ok, args.crop, ctf.header["XStep"], ctf.header["YStep"]
+            qgrid, ok, opt.crop, ctf.header["XStep"], ctf.header["YStep"]
         )
         diag = {k: v[window] for k, v in diag.items()}
         ny, nx = ok.shape
-        print(f"  cropped to {nx} x {ny} pixels ({args.crop})")
+        log(f"  cropped to {nx} x {ny} pixels ({opt.crop})")
     frac = ok.mean()
-    print(
-        f"indexed & above quality cutoffs: {ok.sum()} of {ok.size} ({100 * frac:.1f}%)"
-    )
+    log(f"indexed & above quality cutoffs: {ok.sum()} of {ok.size} ({100 * frac:.1f}%)")
     if frac < 0.8:
-        print(
+        log(
             "  WARNING: a large fraction of the map was rejected. Loosen "
-            "--max-mad or pass --allow-error, or expect a holed tessellation"
+            "max_mad or set allow_error, or expect a holed tessellation"
         )
 
-    labels = segment_grains(qgrid, ok, args.threshold, sym)
-    cellids, ncells, dropped, lost = relabel_and_prune(labels, ok, args.min_pixels)
-    print(
-        f"  grains at {args.threshold:g} deg: {ncells} "
-        f"({dropped} below {args.min_pixels} px dropped, {lost} px)"
+    labels = segment_grains(qgrid, ok, opt.threshold, sym)
+    cellids, ncells, dropped, lost = relabel_and_prune(labels, ok, opt.min_pixels)
+    log(
+        f"  grains at {opt.threshold:g} deg: {ncells} "
+        f"({dropped} below {opt.min_pixels} px dropped, {lost} px)"
     )
     if ncells == 0:
-        raise SystemExit("no grains survived; lower --min-pixels or --threshold")
+        raise ValueError("no grains survived; lower min_pixels or threshold")
 
     # Degenerate cells are what abort `neper -T -n from_morpho` partway through
     # "Listing cell voxels", and the objective function cannot place
@@ -1319,47 +1160,47 @@ def main(argv=None):
     # bottom of the distribution so the failure is visible here, not there.
     unassigned = cellids == 0
     empty_before = int(unassigned.sum())
-    print(
+    log(
         f"  unassigned voxels: {empty_before} of {cellids.size} "
         f"({100 * empty_before / cellids.size:.1f} %)"
     )
-    if not args.no_fill:
+    if opt.fill:
         cellids, filled = fill_holes(cellids)
-        print(f"  filled {filled} voxels from the nearest cell")
+        log(f"  filled {filled} voxels from the nearest cell")
     elif empty_before > 0.05 * cellids.size:
-        print(
-            "  WARNING: the raster has substantial holes and --no-fill was "
+        log(
+            "  WARNING: the raster has substantial holes and fill=False was "
             "given. The tessellation fit will treat hole boundaries as grain "
             "boundaries"
         )
 
-    if not args.no_topology_fix:
+    if opt.topology_fix:
         cellids, absorbed, pinches = make_meshable(cellids)
         ncells = int(cellids.max())
         if absorbed:
-            print(
+            log(
                 f"  absorbed {len(absorbed)} enclosed grain(s) into their "
                 f"surrounding grain: {', '.join(map(str, absorbed))}"
             )
         if pinches:
-            print(f"  unpinched {pinches} corner-only self-contact(s), 1 px each")
+            log(f"  unpinched {pinches} corner-only self-contact(s), 1 px each")
         if absorbed or pinches:
-            print(f"  grains: {ncells}")
+            log(f"  grains: {ncells}")
 
     counts = np.bincount(cellids.ravel())[1:]
-    print(f"  smallest grains (px): {', '.join(str(c) for c in np.sort(counts)[:8])}")
+    log(f"  smallest grains (px): {', '.join(str(c) for c in np.sort(counts)[:8])}")
     if counts.min() < 10:
-        print(
+        log(
             f"  WARNING: {int((counts < 10).sum())} grains under 10 px. Neper's "
             "tessellation fit is liable to abort on these -- raise "
-            "--min-pixels (20 is a reasonable floor)"
+            "min_pixels (20 is a reasonable floor)"
         )
 
     qfz = to_fundamental_zone(qgrid.reshape(-1, 4), sym).reshape(ny, nx, 4)
     qcell = grain_mean_orientations(qgrid, cellids, ncells, sym)
     ori_cell = quat_to_rodrigues(qcell)
-    ori_vox = None if args.no_voxel_ori else quat_to_rodrigues(qfz)
-    vox = (ctf.header["XStep"] * args.scale, ctf.header["YStep"] * args.scale)
+    ori_vox = None if not opt.voxel_ori else quat_to_rodrigues(qfz)
+    vox = (ctf.header["XStep"] * opt.scale, ctf.header["YStep"] * opt.scale)
 
     # What the segmentation cost. Computed here, before --active flips the sign
     # and --flip-y mirrors the arrays, so everything is still in the .ctf's own
@@ -1373,46 +1214,58 @@ def main(argv=None):
         qcell,
         vox,
         ok=ok,
-        threshold=args.threshold,
+        threshold=opt.threshold,
         backfilled=unassigned,
     )
     for line in format_report(seg):
-        print("  " + line)
+        log("  " + line)
 
-    if args.active:  # active is the opposite rotation, i.e. -r
+    if opt.active:  # active is the opposite rotation, i.e. -r
         ori_cell = -ori_cell
         if ori_vox is not None:
             ori_vox = -ori_vox
 
-    if args.flip_y:
+    if opt.flip_y:
         cellids = cellids[::-1]
         ok = ok[::-1]
         if ori_vox is not None:
             ori_vox = ori_vox[::-1]
 
-    out = Path(args.output or Path(args.ctf).with_suffix(".tesr"))
+    out = Path(output or Path(opt.ctf).with_suffix(".tesr"))
     write_tesr(out, cellids, ori_cell, ori_vox, ok, vox, crysym)
-    write_provenance(out.with_name(out.stem + "-provenance.json"), args, seg, vox)
+    write_provenance(
+        out.with_name(out.stem + "-provenance.json"), opt, seg, vox, log=log
+    )
 
-    if args.diagnostics:
-        unit = "um" if np.isclose(args.scale, 1.0) else f"x{args.scale:g} um"
+    if opt.diagnostics:
+        unit = opt.unit
         write_segerr_png(
             out.with_name(out.stem + "-segerror.png"),
             seg,
             # back to the .ctf's row order: `cellids` was mirrored in place
             # above, while seg["theta"] was measured before that
-            cellids[::-1] if args.flip_y else cellids,
+            cellids[::-1] if opt.flip_y else cellids,
             unit=unit,
-            threshold=args.threshold,
+            threshold=opt.threshold,
+            log=log,
         )
-        write_segerr_csv(out.with_name(out.stem + "-segerror.csv"), seg)
+        write_segerr_csv(out.with_name(out.stem + "-segerror.csv"), seg, log=log)
         png = out.with_name(out.stem + "-quality.png")
         write_quality_png(
-            png, diag, ok, unassigned, cellids, args, vox, unit, flip_y=args.flip_y
+            png,
+            diag,
+            ok,
+            unassigned,
+            cellids,
+            opt,
+            vox,
+            unit,
+            flip_y=opt.flip_y,
+            log=log,
         )
-        check = verify_readback(out, qgrid, ok, cellids, args.flip_y, sym)
+        check = verify_readback(out, qgrid, ok, cellids, opt.flip_y, sym)
         for line in check["report"]:
-            print(f"  {line}")
+            log(f"  {line}")
         write_raw_png(
             out.with_name(out.stem + "-raw.png"),
             qgrid_full,
@@ -1422,28 +1275,139 @@ def main(argv=None):
             ok,
             check,
             ctf,
-            args,
+            opt,
             vox,
             unit,
+            log=log,
         )
 
     lx, ly = nx * vox[0], ny * vox[1]
     mean_px = counts.mean()
     grain_size = np.sqrt(mean_px) * vox[0]
-    print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
-    print(f"  domain      : {lx:.4g} x {ly:.4g}")
-    print(f"  grain size  : ~{grain_size:.4g} (equivalent square)")
-    if not args.diagnostics:
-        print("  re-run with --diagnostics to see why pixels are grey in check-ori")
+    log(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
+    log(f"  domain      : {lx:.4g} x {ly:.4g}")
+    log(f"  grain size  : ~{grain_size:.4g} (equivalent square)")
+    if not opt.diagnostics:
+        log("  set diagnostics=True to see why pixels are grey in check-ori")
     if ncells > 400:
         side = grain_size * np.sqrt(250)
-        print(
+        log(
             f"\n{ncells} grains is a long tessellation fit. Crop to ~250 by "
             f"re-running with a window about {side:.3g} x {side:.3g} in the "
-            ".ctf's units, e.g. --crop xmin,xmax,ymin,ymax"
+            f'.ctf\'s units, i.e. crop="x0,x0+{side:.3g},y0,y0+{side:.3g}"'
         )
-    return 0
+
+    return {
+        "tesr": out,
+        "provenance": out.with_name(out.stem + "-provenance.json"),
+        "settings": opt,
+        "crysym": crysym,
+        "ncells": ncells,
+        "voxsize": vox,
+        "extent": (lx, ly),
+        "cellids": cellids,
+        "ok": ok,
+        "ori_cell": ori_cell,
+        "qcell": qcell,
+        "npx": counts,
+        "window": window,
+        "segmentation_error": seg,
+    }
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def measure_tesr_against_ctf(
+    ctf_path,
+    tesr_path,
+    settings=None,
+    provenance=None,
+    against="grain",
+    png=None,
+    csv=None,
+    log=print,
+):
+    """Re-measure the segmentation error of a .ctf/.tesr pair already on disk.
+
+    `convert` reports this as it goes; this is the same measurement made
+    afterwards, straight off the two files, so it also verifies that what was
+    written is what was meant. Give the conversion's `Settings` (or
+    `provenance`, the json path `convert` wrote) so the crop window, the
+    mirror and the orientation convention are known -- none of them is
+    recoverable from the .tesr alone.
+
+    `against` selects what each pixel is compared with: "grain" (default) uses
+    the **cell/*ori orientation of the grain the pixel was put in, which is the
+    segmentation error and the only orientation the rest of the pipeline sees;
+    "voxel" uses the pixel's own **oridata entry, which measures transcription
+    only and should come back at the 1e-6 deg noise floor; "both" reports each.
+
+    Returns the result dict from `segmentation_error`.
+    """
+    log = log or (lambda *a, **k: None)
+    if provenance is not None:
+        settings = settings_from_provenance(provenance)
+    opt = settings or Settings(ctf=str(ctf_path))
+
+    ctf = CtfMap(ctf_path)
+    crysym, phase = ctf.crysym(opt.phase)
+    if phase is None or phase["laue"] not in CUBIC_LAUE:
+        raise ValueError(
+            "cubic phases only: the disorientation used here is cubic-specific"
+        )
+    qgrid, ok, _diag = build_grid(
+        ctf, opt.phase, opt.max_mad, not opt.allow_error, opt.min_bands
+    )
+    if opt.crop:
+        qgrid, ok, _w = crop_grid(
+            qgrid, ok, opt.crop, ctf.header["XStep"], ctf.header["YStep"]
+        )
+
+    t = read_tesr_full(tesr_path)
+    if (t["ny"], t["nx"]) != ok.shape:
+        raise ValueError(
+            f"{tesr_path} is {t['nx']} x {t['ny']} voxels but the .ctf window "
+            f"is {ok.shape[1]} x {ok.shape[0]}. Pass the Settings (or the "
+            "provenance json) of the conversion that wrote it."
+        )
+    cells = t["cells"][::-1] if opt.flip_y else t["cells"]
+    sign = -1.0 if opt.active else 1.0
+    qcell = rodrigues_to_quat(sign * t["cell_ori"])
+
+    qvox = None
+    if against in ("voxel", "both"):
+        if "vox_ori" in t:
+            r = t["vox_ori"][::-1] if opt.flip_y else t["vox_ori"]
+            qvox = rodrigues_to_quat(sign * r).reshape(ok.shape + (4,))
+        else:
+            log("  note: no **oridata in the tesr (voxel_ori=False); check skipped")
+
+    res = segmentation_error(
+        qgrid, cells, qcell, t["vox"], ok=ok, threshold=opt.threshold, qvox=qvox
+    )
+    for line in format_report(res):
+        log("  " + line)
+
+    # `convert` knows which voxels fill_holes back-filled, including the ones
+    # whose grain was pruned by min_pixels; working from the files alone only
+    # the quality rejections are visible, so the two populations differ by the
+    # pruned pixels and the numbers differ with them. Say so rather than leave
+    # two unequal RMS values lying about.
+    ref = {}
+    if provenance is not None:
+        ref = json.loads(Path(provenance).read_text())
+        ref = ref.get("segmentation_error_deg", {}).get("indexed", {})
+    if ref and ref.get("n") != res["indexed"]["n"]:
+        log(
+            f"  note: convert() measured {ref['rms']:.3f} deg over {ref['n']} "
+            f"voxels. The {res['indexed']['n'] - ref['n']} extra voxels here "
+            "belonged to grains the prune removed and were then back-filled; "
+            "only the conversion can tell them apart from voxels in a grain of "
+            "their own."
+        )
+
+    if png:
+        write_segerr_png(
+            png, res, cells, unit=opt.unit, threshold=opt.threshold, log=log
+        )
+    if csv:
+        write_segerr_csv(csv, res, log=log)
+    return res
