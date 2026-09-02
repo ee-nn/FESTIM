@@ -115,12 +115,12 @@ N_GB = N_GB_AREAL / DELTA  # m^-3, volumetric capacity
 LAMBDA_JUMP = 1.12e-10  # m, tetrahedral-site hop in bcc W, for K
 NU_ATTEMPT = 1e13  # s^-1
 
-C_SURF = 5.6e27  # m^-3, their 5.6 H/nm^3 charged-surface concentration
+C_SURF = 5.6e24  # m^-3, their 5.6 H/nm^3 charged-surface concentration
 
-TEMPERATURES = [520.0, 570.0, 615.0, 660.0, 705.0]  # their experimental range
-T_END = 1e-2  # s; end of simulation
+TEMPERATURES = [570.0]  # their experimental range
+T_END = 1e-3  # s; end of simulation
 
-DT0 = 1e-11  # ~d^2/D ~ 6e-4 s at 705 K
+DT0 = 1e-5  # ~d^2/D ~ 6e-4 s at 705 K
 
 DISORDER = 0
 E_M_GB_RANGE = (0.191, 0.547)  # eV, Wei et al. 2026, eight tungsten GBs
@@ -129,11 +129,19 @@ SEED = 0
 
 def s_partition(T):
     """Equilibrium GB/bulk concentration ratio. Thermodynamic, from E_bind."""
+    # return 1.0
     return np.exp(E_BIND / (F.k_B * T))
+
+
+print(f"solubility ratio: K_GB/K_grain = {s_partition(570):.3e}")
+# import sys
+
+# sys.exit()
 
 
 def k_forward(T):
     """Interfacial mass transfer coefficient, m/s. Kinetic, from E_forward."""
+    return 1.0
     return LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * T))
 
 
@@ -291,6 +299,7 @@ def run(T):
                 # the forward term only (the bulk is dilute so reverse
                 # blocking is negligible)
                 value=lambda cb, cg: (
+                    # (2.0 / DELTA) * K * (cb - cg / s)
                     (2.0 / DELTA) * (K * cb * (1.0 - cg / N_GB) - (K / s) * cg)
                 ),
                 species=c_gb,
@@ -302,7 +311,9 @@ def run(T):
             F.ParticleFluxBC(
                 subdomain=network,
                 species=c_b,
-                value=lambda cb, cg: (K / s) * cg - K * cb * (1.0 - cg / N_GB),
+                value=lambda cb, cg: (  # K * ((cg / s) - cb),
+                    (K / s) * cg - K * cb * (1.0 - cg / N_GB)
+                ),
                 species_dependent_value={"cb": c_b, "cg": c_gb},
             ),
             F.FixedConcentrationBC(subdomain=inlet, value=C_SURF, species=c_b),
@@ -312,20 +323,38 @@ def run(T):
         ],
         temperature=T,
         settings=F.Settings(
-            atol=1e-10,
-            rtol=1e-10,
+            atol=1e-6,
+            rtol=1e-6,
             transient=True,
             final_time=T_END,
-            stepsize=F.Stepsize(
-                initial_value=DT0, growth_factor=1.2, target_nb_iterations=5
-            ),
+            max_iterations=50,
+            stepsize=DT0,
+            # stepsize=F.Stepsize(
+            #     initial_value=DT0,
+            #     growth_factor=1.1,
+            #     cutback_factor=0.9,
+            #     target_nb_iterations=5,
+            # ),
         ),
         exports=[],
+        petsc_options={
+            "pc_factor_mat_solver_type": "superlu_dist",
+            "snes_linesearch_type": "bt",
+        },
     )
     model.initialise()
     if DISORDER:
         network.material = F.Material(D_0=gb_diffusivity_field(network, T), E_D=0.0)
         model.initialise()
+
+    # snes = model.solver.solver  # petsc4py SNES
+    # pc = snes.getKSP().getPC()
+    # pc.setFactorSetUpSolverType()  # instantiate the factor Mat now
+    # Fmat = pc.getFactorMatrix()
+    # Fmat.setMumpsIcntl(14, 200)  # % workspace relaxation; default 20
+    # Fmat.setMumpsIcntl(24, 1)  # detect null pivots instead of erroring
+    # Fmat.setMumpsIcntl(8, 77)  # automatic scaling (leave on; see below)
+
     model.run()
 
     cb = c_b.subdomain_to_post_processing_solution[grains]
@@ -397,4 +426,3 @@ if __name__ == "__main__":
         ax.legend()
         fig.tight_layout()
         fig.savefig("diaz-permeability.png", dpi=150)
-        print("wrote diaz-columnar.csv, diaz-flux-fraction.png, diaz-permeability.png")

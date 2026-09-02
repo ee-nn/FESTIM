@@ -27,18 +27,38 @@ from scipy.spatial import Voronoi
 import festim as F
 
 # parameters
-L = 1.0  # specimen size
+L = 1.0e-4  # specimen size, 100 microns for now
 N_SEEDS = 12  # number of grains
 SEED = 3  # rng seed, so the microstructure is reproducible
 
-D_B = 1e-3  # lattice diffusivity
-D_GB = 30.0  # grain-boundary diffusivity, 1e4 x faster
-DELTA = 1e-3  # grain-boundary width
-K_EX = 1.0  # bulk <-> grain-boundary exchange (see the Fisher example on units)
-C0 = 1.0  # surface concentration
+E_M_BULK = 0.20  # eV, DFT, their Fig. 3
+E_M_GB = 0.12  # eV, DFT, their Fig. 3
+E_BIND = 0.0  # eV
+D0_B = 1.9e-7  # m^2/s, assumed
+D0_GB = 1.5 * D0_B  # m^2/s, assumed: 2D vs 3D random-walk prefactor
 
-H_GB, H_BULK = 0.008, 0.04  # mesh size at the boundaries / in the grain interiors
-T_END, DT = 3.0, 0.02
+T = 500  # K
+D_B = D0_B * np.exp(-E_M_BULK / (F.k_B * T))  # lattice diffusivity
+D_GB = D0_GB * np.exp(-E_M_GB / (F.k_B * T))  # grain-boundary diffusivity, 1e4 x faster
+S = np.exp(E_BIND / (F.k_B * T))  # solubility ratio
+
+DELTA = 1e-9  # grain-boundary width
+
+LAMBDA_JUMP = 1.12e-10  # m, tetrahedral-site hop in bcc W, for K
+NU_ATTEMPT = 1e13  # s^-1
+E_FORWARD = 0.145  # eV, bulk->GB approach barrier; Zhou 2010 gives 0.13-0.16
+
+# bulk <-> grain-boundary exchange (see the Fisher example on units)
+K_EX = 3.0  # LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * T))
+C0 = 5.6e27  # surface concentration
+
+# print(LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * 700.0)))
+# import sys
+
+# sys.exit()
+
+H_GB, H_BULK = 0.004 * L, 0.04 * L  # mesh size at the boundaries / grain interiors
+T_END, DT = 1.0, 1e-3
 
 
 # microstructure
@@ -217,10 +237,10 @@ def solve(d_gb):
             F.FixedConcentrationBC(subdomain=top, value=C0, species=c_b),
             F.FixedConcentrationBC(subdomain=mouths, value=C0, species=c_gb),
         ],
-        temperature=500,
+        temperature=T,
         settings=F.Settings(
-            atol=1e-14,
-            rtol=1e-12,
+            atol=1e-8,
+            rtol=1e-6,
             transient=True,
             final_time=T_END,
             stepsize=F.Stepsize(initial_value=DT),
@@ -232,7 +252,6 @@ def solve(d_gb):
         if d_gb != D_B
         else [],
     )
-    model.show_progress_bar = False
     model.initialise()
     model.run()
     return (
