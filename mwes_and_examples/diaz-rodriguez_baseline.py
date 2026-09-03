@@ -86,10 +86,9 @@ import festim as F
 # ----------------------------------------------------------------------------
 L = 100e-9  # column side, m                     (their L, 100 nm case)
 D_THICK = 2e-6  # layer thickness, m             (the experimental 2 um)
-NX = 2  # columns per side; 100 -> 10 um x 10 um
-NY = NX
-CPG = 6  # mesh cells across one column, per axis
-NZ = 50  # mesh cells through the thickness
+NX, NY = 2, 2  # columns per side; 100 -> 10 um x 10 um
+CPG = 4  # mesh cells across one column, per axis
+NZ = 100  # mesh cells through the thickness
 
 # CPG >= 2 is required for the facet locator below: with one cell per column a
 # tetrahedron can have vertices on two different column planes and would be
@@ -108,41 +107,40 @@ E_FORWARD = 0.145  # eV, bulk->GB approach barrier; Zhou 2010 gives 0.13-0.16
 D0_BULK = 1.9e-7  # m^2/s, assumed (see header)
 D0_GB = 1.5 * D0_BULK  # m^2/s, assumed: 2D vs 3D random-walk prefactor
 
-DELTA = 5e-10  # GB slab width, m, assumed
 N_GB_AREAL = 6.25e18  # m^-2, their max occupancy
-N_GB = N_GB_AREAL / DELTA  # m^-3, volumetric capacity
 
 LAMBDA_JUMP = 1.12e-10  # m, tetrahedral-site hop in bcc W, for K
 NU_ATTEMPT = 1e13  # s^-1
 
-C_SURF = 5.6e24  # m^-3, their 5.6 H/nm^3 charged-surface concentration
+C_SURF = 5.6e27  # m^-3, their 5.6 H/nm^3 charged-surface concentration
 
 TEMPERATURES = [570.0]  # their experimental range
-T_END = 1e-3  # s; end of simulation
+T_END = 0.01  # s; end of simulation
 
-DT0 = 1e-5  # ~d^2/D ~ 6e-4 s at 705 K
+DT0 = 1e-4  # ~d^2/D ~ 6e-4 s at 705 K
 
 DISORDER = 0
 E_M_GB_RANGE = (0.191, 0.547)  # eV, Wei et al. 2026, eight tungsten GBs
 SEED = 0
 
+A_LAT = 3.165e-10  # m, their DFT lattice constant (Sect. 2.3)
+N_B_SITES = 6.0 / A_LAT**3  # ~1.9e29 m^-3, tetrahedral sites in bcc W
+N_GB = N_GB_AREAL  # m^-2: c_gb is AREAL now; DELTA is gone
+
 
 def s_partition(T):
-    """Equilibrium GB/bulk concentration ratio. Thermodynamic, from E_bind."""
-    # return 1.0
-    return np.exp(E_BIND / (F.k_B * T))
-
-
-print(f"solubility ratio: K_GB/K_grain = {s_partition(570):.3e}")
-# import sys
-
-# sys.exit()
+    """Segregation length, m. Thermodynamic; McLean prefactor N_s/N_b."""
+    return (N_GB_AREAL / N_B_SITES) * np.exp(E_BIND / (F.k_B * T))
 
 
 def k_forward(T):
-    """Interfacial mass transfer coefficient, m/s. Kinetic, from E_forward."""
-    return 1.0
-    return LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * T))
+    """Absorption coefficient, m/s. Kinetic, from E_forward."""
+    return LAMBDA_JUMP * NU_ATTEMPT * np.exp(-E_FORWARD / (F.k_B * T)) / 100
+
+
+def k_reverse(T):
+    """Escape rate, 1/s. Fixed by detailed balance, never set independently."""
+    return k_forward(T) / s_partition(T)
 
 
 # mesh: a structured box whose node planes fall exactly on the column walls
@@ -265,7 +263,8 @@ def run(T):
     D_b = D0_BULK * np.exp(-E_M_BULK / (F.k_B * T))
     D_g = D0_GB * np.exp(-E_M_GB / (F.k_B * T))
     s = s_partition(T)
-    K = k_forward(T)
+    kf = k_forward(T)
+    kr = k_reverse(T)
 
     grains = F.VolumeSubdomain(
         id=1,
@@ -298,10 +297,7 @@ def run(T):
                 # two faces per slab -> 2/DELTA; one-way fluxes, blocking on
                 # the forward term only (the bulk is dilute so reverse
                 # blocking is negligible)
-                value=lambda cb, cg: (
-                    # (2.0 / DELTA) * K * (cb - cg / s)
-                    (2.0 / DELTA) * (K * cb * (1.0 - cg / N_GB) - (K / s) * cg)
-                ),
+                value=lambda cb, cg: 2.0 * (kf * cb * (1.0 - cg / N_GB) - kr * cg),
                 species=c_gb,
                 volume=network,
                 species_dependent_value={"cb": c_b, "cg": c_gb},
@@ -311,9 +307,7 @@ def run(T):
             F.ParticleFluxBC(
                 subdomain=network,
                 species=c_b,
-                value=lambda cb, cg: (  # K * ((cg / s) - cb),
-                    (K / s) * cg - K * cb * (1.0 - cg / N_GB)
-                ),
+                value=lambda cb, cg: kr * cg - kf * cb * (1.0 - cg / N_GB),
                 species_dependent_value={"cb": c_b, "cg": c_gb},
             ),
             F.FixedConcentrationBC(subdomain=inlet, value=C_SURF, species=c_b),
@@ -327,7 +321,7 @@ def run(T):
             rtol=1e-6,
             transient=True,
             final_time=T_END,
-            max_iterations=50,
+            max_iterations=100,
             stepsize=DT0,
             # stepsize=F.Stepsize(
             #     initial_value=DT0,
@@ -361,7 +355,7 @@ def run(T):
     cg = c_gb.subdomain_to_post_processing_solution[network]
 
     j_bulk = outlet_flux(cb, D_b, D_THICK)
-    j_gb = outlet_flux(cg, D_g, D_THICK, weight=DELTA)
+    j_gb = outlet_flux(cg, D_g, D_THICK, weight=1.0)
     j_tot = j_bulk + j_gb
 
     # what fraction of the network is saturated, since that is what limits it
@@ -374,7 +368,7 @@ def run(T):
         D_b=D_b,
         D_gb=D_g,
         s=s,
-        K=K,
+        K=kf,
         j_bulk=j_bulk,
         j_gb=j_gb,
         j_tot=j_tot,
