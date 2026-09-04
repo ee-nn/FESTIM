@@ -379,7 +379,8 @@ def figure_rve(identifications, path):
         0.008,
         0.905,
         "the two estimators close on the strong axis; on the weak one the window "
-        "estimate is still scattering, so 45 grains is not yet an RVE for it",
+        f"estimate is still scattering, so {grains[-1]} grains is not yet an RVE "
+        "for it",
         color=INK_2,
         fontsize=8.5,
         va="top",

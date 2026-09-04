@@ -94,7 +94,7 @@ def voronoi_segments(n_seeds, size, rng, aspect=1.0):
     return segments
 
 
-def snap_segments(segments, tol):
+def snap_segments(segments, tol, size):
     """Snap ridge endpoints to a grid of size ``tol`` and drop what collapses.
 
     A Voronoi tessellation produces the occasional ridge far shorter than any
@@ -103,14 +103,34 @@ def snap_segments(segments, tol):
     outright would disconnect the network at that junction, which is exactly the
     thing the codim-1 formulation exists to get right. Snapping merges the two
     junctions into one instead, so connectivity survives.
+
+    Endpoints that the clip put *on* the box edge are then put back on it
+    exactly. ``size / tol`` is not a whole number, so rounding moves them off,
+    and when it moves one inward it leaves a gap of a fraction of a nanometre
+    between the ridge and the edge of the cell. OpenCASCADE will not split a face
+    across a gap: the ridge ends up embedded inside the face instead of dividing
+    it, and every grain that ridge should have separated silently merges into one
+    enormous subdomain. It is a spectacular failure from a rounding error a
+    thousand times smaller than an element.
     """
     snapped = []
     for p, q in segments:
-        a = np.round(p / tol) * tol
-        b = np.round(q / tol) * tol
+        a = _clamp_to_box(np.round(p / tol) * tol, tol, size)
+        b = _clamp_to_box(np.round(q / tol) * tol, tol, size)
         if np.linalg.norm(b - a) > 0.5 * tol:
             snapped.append((a, b))
     return snapped
+
+
+def _clamp_to_box(point, tol, size):
+    """Put a point that snapping nudged off the box edge back onto it exactly."""
+    point = point.copy()
+    for i in (0, 1):
+        if abs(point[i]) < tol:
+            point[i] = 0.0
+        elif abs(point[i] - size) < tol:
+            point[i] = size
+    return point
 
 
 def near_segments(points, segments, tol):
@@ -306,7 +326,7 @@ class Microstructure:
         # the short axis of a grain: equal-area grains of aspect ratio `aspect`
         short_axis = np.sqrt(size**2 / n_seeds / aspect)
         h_gb = short_axis / cells_per_grain
-        segments = snap_segments(segments, 0.1 * h_gb)
+        segments = snap_segments(segments, 0.1 * h_gb, size)
         mesh, cell_tags, n_grains = build_mesh(
             segments, size, h_gb, bulk_coarsening * h_gb, comm=comm
         )
@@ -329,6 +349,34 @@ class Microstructure:
     @property
     def grain_ids(self):
         return np.arange(1, self.n_grains + 1)
+
+    def area_fractions(self):
+        """Each tagged piece's share of the cell, from the mesh triangle areas."""
+        mesh = self.mesh
+        mesh.topology.create_connectivity(2, 0)
+        cells = mesh.topology.connectivity(2, 0).array.reshape(-1, 3)
+        corners = mesh.geometry.x[cells][:, :, :2]
+        edge_a = corners[:, 1] - corners[:, 0]
+        edge_b = corners[:, 2] - corners[:, 0]
+        areas = 0.5 * np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0])
+        tags = np.zeros(cells.shape[0], dtype=np.int64)
+        tags[self.cell_tags.indices] = self.cell_tags.values
+        per_grain = np.bincount(tags, weights=areas, minlength=self.n_grains + 1)
+        return per_grain[1:] / per_grain[1:].sum()
+
+    def oversized_pieces(self, factor=3.0):
+        """Pieces holding more than ``factor`` times an average grain's area.
+
+        The guard against a tessellation that did not actually tessellate. If a
+        ridge fails to reach the edge of the cell, OpenCASCADE leaves it embedded
+        inside a face rather than splitting it, and every grain it should have
+        separated merges into one piece. Nothing else here notices: the ridge is
+        still meshed, still in the network, and the check that every grain-grain
+        facet is in the network still passes, because those facets now have the
+        same tag on both sides. Only the *size* of the piece gives it away.
+        """
+        fractions = self.area_fractions()
+        return fractions[fractions > factor / self.n_seeds]
 
     def misorientation(self, grain_a, grain_b):
         """Misorientation angle between two grains, folded into ``[0, pi/2]``.
@@ -375,7 +423,15 @@ class Microstructure:
             f" (of the trace)",
             f"  strong direction               : "
             f"({evecs[0, 1]:+.3f}, {evecs[1, 1]:+.3f})",
-            f"  grains (tagged pieces)         : {self.n_grains}",
+            f"  grains (tagged pieces)         : {self.n_grains}"
+            f" (from {self.n_seeds} seeds)",
+            f"  largest piece / average grain  : "
+            f"{self.area_fractions().max() * self.n_seeds:.2f}"
+            + (
+                "   <-- SUSPECT: a ridge probably failed to split a face"
+                if len(self.oversized_pieces()) > 0
+                else ""
+            ),
             f"  mesh                           : "
             f"{self.mesh.topology.index_map(2).size_global} cells,"
             f" h_gb = {1e9 * self.h_gb:.0f} nm",

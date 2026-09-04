@@ -108,21 +108,18 @@ def homogeneous_model(
 ):
     """A plain rectangle carrying the anisotropic tensor.
 
-    ``festim.Material`` takes ``D`` as a ``fem.Function``, so the constant tensor
-    is stored in a DG0 tensor-valued field -- which is also how a spatially
-    varying effective tensor (a graded microstructure) would be supplied.
+    ``festim.Material`` takes ``D_0`` as a matrix, so the identified tensor goes
+    in directly. (``E_D`` stays a scalar: one activation energy for every
+    direction, the prefactor carrying the anisotropy. A tensor that varies in
+    space -- a graded microstructure -- would be passed as ``D`` instead, as a
+    tensor-valued ``fem.Function``.)
     """
     mesh = dolfinx.mesh.create_rectangle(
         MPI.COMM_WORLD, [np.array([0.0, 0.0]), np.array([size, size])], [n, n]
     )
-    V = dolfinx.fem.functionspace(mesh, ("DG", 0, (2, 2)))
-    D = dolfinx.fem.Function(V, name="D_eff")
-    for component in range(4):
-        D.x.array[component::4] = D_eff.reshape(-1)[component]
-
     volume = F.VolumeSubdomain(
         id=1,
-        material=F.Material(D=D),
+        material=F.Material(D_0=np.asarray(D_eff).tolist(), E_D=0.0),
         locator=lambda x: np.full_like(x[0], True, dtype=bool),
     )
     c = F.Species("c", subdomains=[volume])

@@ -123,12 +123,12 @@ How far to trust that depends on how many grains the cell holds:
 
 | cell | grains | `Dxx/D_b` cell / window | `Dyy/D_b` cell / window |
 |------|--------|-------------------------|-------------------------|
-| 2 um | 24     | 4.204 / 3.398           | 1.364 / 1.117           |
-| 3 um | 43     | 4.121 / 4.056           | 1.339 / 1.486           |
-| 4 um | 45     | 4.031 / 4.056           | 1.325 / 1.274           |
+| 2 um | 24     | 4.205 / 3.390           | 1.364 / 1.116           |
+| 3 um | 43     | 4.122 / 4.057           | 1.339 / 1.486           |
+| 4 um | 64     | 4.031 / 4.056           | 1.325 / 1.274           |
 
 On the strong axis the two estimators close from 24 % apart at 2 um to 0.6 % at
-4 um. On the weak axis the window estimate is still wandering at 45 grains, so it
+4 um. On the weak axis the window estimate is still wandering at 64 grains, so it
 has not reached an RVE there -- which is exactly why both estimates are reported
 rather than one.
 
@@ -167,6 +167,22 @@ Two traps, both from the problem being unscaled (`D ~ 1e-11 m2/s`, cell area
   solution freezes while `t` keeps advancing. It looks exactly like a steady
   state, at the wrong value -- here it saturated at 43 % of the right inventory.
   `ATOL = 1e-25` in `micromodel.py`; nondimensionalising is the better fix.
+* **A tessellation that did not tessellate.** `snap_segments` rounds ridge
+  endpoints onto a grid to merge near-degenerate junctions, and `size / tol` is
+  not a whole number, so endpoints that the clip had put *exactly* on the edge of
+  the cell were nudged off it. Nudged inward, they left a two-nanometre gap;
+  OpenCASCADE will not split a face across a gap, so the ridge ended up embedded
+  inside a face instead of dividing it, and every grain it should have separated
+  merged into one piece holding a quarter of the cell. Nothing else noticed: the
+  ridge was still meshed, still in the network, the total curve length still
+  matched exactly, and the check that every grain-grain facet is in the network
+  still passed -- because those facets now had the same tag on both sides. Only
+  the *size* of the piece gave it away, which is why `Microstructure.report` now
+  prints the largest piece as a multiple of an average grain and flags anything
+  above three. (In the transparent-boundary regime it changed the answer by
+  nothing at all, because the lattice field is continuous across a boundary
+  whether or not the two sides are separate subdomains. It would matter for
+  per-grain orientations, per-grain traps, or any run at low exchange rate.)
 * **`petsc_options` cannot set a MUMPS ICNTL.** FESTIM deletes its PETSc options
   from the database as soon as the solver is built, and `mat_mumps_*` is not read
   until `PCSetUp` at the first solve. One subdomain per grain makes a wide, badly
