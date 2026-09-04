@@ -113,27 +113,6 @@ venv.bak/
 *.xdmf
 *.h5
 *.txt
-*.zip
-*.png
-*.mp4
-*.msh
-*.csv
-*.json
-
-# Neper input/output files
-*.msh4
-*.geo
-*.stedge
-*.stface
-*.stver
-*.tess
-*.ctf
-*.tesr
-*.vtk
-*.sttesr
-*.stcell
-*.stmesh
-*.logval
 
 # Docs files
 docs/source/_build/
@@ -141,6 +120,3 @@ docs/source/_build/
 
 # Visual Studio Code settings
 .vscode/
-
-# Patch files
-*.patch

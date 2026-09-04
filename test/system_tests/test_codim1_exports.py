@@ -222,7 +222,7 @@ def test_flux_on_an_interior_manifold_is_not_silently_zero():
     # even if the closed form above were ever relaxed
     parent = model.mesh.mesh
     n = ufl.FacetNormal(parent)
-    dS_gamma = model.coupling_measure(gamma)
+    dS_gamma = model.facet_measure(gamma)(gamma.id)
     for species, volume, title in (
         (H_l, left, "H_l flux surface 3"),
         (H_r, right, "H_r flux surface 3"),
@@ -335,7 +335,7 @@ def test_outlet_flux_of_a_manifold_carrying_advection():
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma, inlet, outlet, fixed],
-        advection_terms=[F.AdvectionTerm(velocity=vel, subdomain=gamma, species=H_gam)],
+        drift_terms=[F.AdvectionTerm(velocity=vel, subdomain=gamma, species=H_gam)],
         boundary_conditions=[
             F.FixedConcentrationBC(subdomain=inlet, value=1.0, species=H_gam),
             F.FixedConcentrationBC(subdomain=outlet, value=0.0, species=H_gam),
