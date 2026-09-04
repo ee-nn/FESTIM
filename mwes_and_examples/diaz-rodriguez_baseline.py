@@ -153,8 +153,7 @@ mesh = dolfinx.mesh.create_box(
 )
 
 ntet = NX * CPG * NY * CPG * NZ * 6
-print(f"domain {LX * 1e6:.1f} x {LY * 1e6:.1f} x {D_THICK * 1e6:.1f} um")
-print(f"{NX * NY} columns, L = {L * 1e9:.0f} nm, ~{ntet:.3e} tetrahedra")
+print(f" ~{ntet:.3e} tetrahedra")
 
 
 class ColumnWalls(F.VolumeSubdomain):
