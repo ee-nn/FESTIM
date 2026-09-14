@@ -66,11 +66,23 @@ class _LegacyIntegralCompute:
     """
 
     def compute(
-        self, u, measure=None, entity_maps=None, *, dx=None, ds=None, restriction=None
+        self,
+        u,
+        measure=None,
+        entity_maps=None,
+        *,
+        dx=None,
+        ds=None,
+        restriction=None,
+        subdomain_id=None,
     ):
         measure = next(m for m in (measure, dx, ds) if m is not None)
         return super().compute(
-            u=u, measure=measure, entity_maps=entity_maps, restriction=restriction
+            u=u,
+            measure=measure,
+            entity_maps=entity_maps,
+            restriction=restriction,
+            subdomain_id=subdomain_id,
         )
 
 
@@ -89,11 +101,13 @@ class _LegacyExtremumCompute:
 
     def compute(self, u=None, meshtags=None, entity_dim=None):
         if u is None:
-            u = self.field.post_processing_solution
+            u = self.field.subdomain_to_post_processing_solution.get(
+                self.domain, self.field.post_processing_solution
+            )
             if not hasattr(u, "function_space"):
                 u = self.field.sub_function_space
         if meshtags is None:
-            meshtags = getattr(self, self._legacy_meshtags_attr)
+            meshtags = getattr(self, self._legacy_meshtags_attr, None)
         if entity_dim is None:
             entity_dim = u.function_space.mesh.topology.dim - self._legacy_codim
         return super().compute(u=u, meshtags=meshtags, entity_dim=entity_dim)

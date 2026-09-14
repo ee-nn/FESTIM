@@ -1,5 +1,14 @@
 from .custom_quantity import CustomQuantity
 from .derived_quantity import DerivedQuantity
+from .field import (
+    CustomFieldExport,
+    FieldExportBase,
+    ReactionRateExport,
+    SpeciesExport,
+    TemperatureExport,
+    VTXSpeciesExport,
+    VTXTemperatureExport,
+)
 from .gas_pressure import GasPressure
 from .legacy_quantities import (
     AverageSurface,
@@ -24,13 +33,6 @@ from .quantity import (
 from .surface_flux import SurfaceFlux
 from .surface_quantity import SurfaceQuantity
 from .volume_quantity import VolumeQuantity
-from .vtx import (
-    CustomFieldExport,
-    ExportBaseClass,
-    ReactionRateExport,
-    VTXSpeciesExport,
-    VTXTemperatureExport,
-)
 from .xdmf import XDMFExport
 
 __all__ = [
@@ -40,8 +42,8 @@ __all__ = [
     "CustomFieldExport",
     "CustomQuantity",
     "DerivedQuantity",
-    "ExportBaseClass",
     "ExtremumQuantity",
+    "FieldExportBase",
     "FieldQuantity",
     "GasPressure",
     "IntegralQuantity",
@@ -53,8 +55,10 @@ __all__ = [
     "MinimumVolume",
     "Profile1DExport",
     "ReactionRateExport",
+    "SpeciesExport",
     "SurfaceFlux",
     "SurfaceQuantity",
+    "TemperatureExport",
     "Total",
     "TotalSurface",
     "TotalVolume",

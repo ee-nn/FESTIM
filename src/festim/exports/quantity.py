@@ -147,7 +147,14 @@ class IntegralQuantity(FieldQuantity):
     ``problem.measure_for(domain)`` serves every integral quantity.
     """
 
-    def compute(self, u, measure: ufl.Measure, entity_maps=None, restriction=None):
+    def compute(
+        self,
+        u,
+        measure: ufl.Measure,
+        entity_maps=None,
+        restriction=None,
+        subdomain_id=None,
+    ):
         """Assembles the quantity and appends it to :attr:`data`.
 
         Args:
@@ -161,9 +168,9 @@ class IntegralQuantity(FieldQuantity):
                 Supplied by the problem via ``restriction_for``; ``None`` for every
                 cell and exterior facet integral, where nothing needs restricting
         """
-        self.value = self.integrate(
-            u, measure(self.domain.id), entity_maps, restriction
-        )
+        if subdomain_id is None:
+            subdomain_id = self.domain.id
+        self.value = self.integrate(u, measure(subdomain_id), entity_maps, restriction)
         self.data.append(self.value)
         return self.value
 
@@ -184,22 +191,30 @@ class ExtremumQuantity(FieldQuantity):
     #: the matching MPI reduction, eg. ``MPI.MAX``
     _mpi_op = None
 
-    def compute(self, u: dolfinx.fem.Function, meshtags, entity_dim: int):
+    def compute(
+        self,
+        u: dolfinx.fem.Function,
+        meshtags: dolfinx.mesh.MeshTags | None,
+        entity_dim: int,
+    ):
         """Reduces the field over the domain and appends the result to :attr:`data`.
 
         Args:
             u: the field, as a collapsed function whose dofs can be indexed
-            meshtags: tags, on the mesh of ``u``, in which the domain is tagged
+            meshtags: tags, on the mesh of ``u``, in which the domain is tagged.
+                ``None`` means the field's mesh already is the whole domain.
             entity_dim: the dimension of the tagged entities
         """
         V = u.function_space
         mesh = V.mesh
-        mesh.topology.create_connectivity(entity_dim, mesh.topology.dim)
-        dofs = dolfinx.fem.locate_dofs_topological(
-            V=V, entity_dim=entity_dim, entities=meshtags.find(self.domain.id)
-        )
-
-        local = u.x.array[dofs]
+        if meshtags is None:
+            local = u.x.array
+        else:
+            mesh.topology.create_connectivity(entity_dim, mesh.topology.dim)
+            dofs = dolfinx.fem.locate_dofs_topological(
+                V=V, entity_dim=entity_dim, entities=meshtags.find(self.domain.id)
+            )
+            local = u.x.array[dofs]
         # a rank may hold none of the domain, and numpy has no identity for an empty
         # reduction -- let the MPI reduction supply it instead
         sentinel = np.inf if self._mpi_op is MPI.MIN else -np.inf

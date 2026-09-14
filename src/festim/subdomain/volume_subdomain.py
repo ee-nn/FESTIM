@@ -37,11 +37,6 @@ class VolumeSubdomain:
             constant
         sub_dt: for a manifold (codim-1) subdomain, the timestep as a constant living on
             its submesh. ``None`` for a codim-0 subdomain
-        submesh_cell_tag: cell tags of the submesh, every cell marked with ``id``. They
-            let a ``dx`` measure be built on the submesh that responds to ``dx(id)``
-            just like the parent-mesh measure does. A manifold is tagged in the *facet*
-            meshtags of the parent mesh, so the parent ``dx(id)`` selects nothing and
-            an integral over a manifold has to be assembled on its own submesh
         dim: the topological dimension of the subdomain. Defaults to ``None``, meaning
             the dimension of the mesh. Set it to ``mesh_dim - 1`` to solve a transport
             equation on a manifold embedded in the mesh (a line in a 2D mesh, a surface
@@ -56,7 +51,6 @@ class VolumeSubdomain:
     v_map: "entity_map_type"
     n_map: np.ndarray
     ft: dolfinx.mesh.MeshTags
-    submesh_cell_tag: dolfinx.mesh.MeshTags
     u: dolfinx.fem.Function
     u_n: dolfinx.fem.Function
     material: Material
@@ -146,20 +140,6 @@ class VolumeSubdomain:
         entities = marker.find(self.id)
         self.submesh, self.cell_map, self.v_map, self.n_map = (
             dolfinx.mesh.create_submesh(mesh, marker.dim, entities)
-        )
-
-        # mark every cell of the submesh with the subdomain id so that a measure built
-        # on the submesh can be restricted with ``dx(id)``. Ghost cells are included:
-        # DOLFINx drops them when it builds the cell integration domains, so they do
-        # not double count, and the tags stay usable for interpolation
-        tdim = self.submesh.topology.dim
-        imap = self.submesh.topology.index_map(tdim)
-        n = imap.size_local + imap.num_ghosts
-        self.submesh_cell_tag = dolfinx.mesh.meshtags(
-            self.submesh,
-            tdim,
-            np.arange(n, dtype=np.int32),
-            np.full(n, self.id, dtype=np.int32),
         )
 
     def transfer_meshtag(self, mesh: dolfinx.mesh.Mesh, tag: dolfinx.mesh.MeshTags):
@@ -394,8 +374,10 @@ def map_manifold_to_volume_subdomains(
     comm=None,
 ) -> dict[VolumeSubdomain, list[VolumeSubdomain]]:
     """Maps each codim-1 (manifold) volume subdomain to the volume subdomains it is
-    adjacent to: one for a manifold on the boundary of the domain, two for one sitting
-    on an interior interface.
+    adjacent to: one for a manifold on the boundary of the domain or buried inside a
+    single subdomain, two for one sitting on an interface, and as many as there are
+    grains for a boundary network threading a polycrystal in which every grain is its
+    own subdomain.
 
     Args:
         ft: the facet meshtags of the parent mesh
@@ -410,7 +392,7 @@ def map_manifold_to_volume_subdomains(
         sorted by id
 
     Raises:
-        ValueError: if a manifold is adjacent to no volume, or to more than two
+        ValueError: if a manifold is adjacent to no volume subdomain at all
     """
     unique_pairs = _facet_cell_tag_pairs(ft, ct, facet_to_cell, comm)
     bulk = [v for v in volume_subdomains if v not in manifold_subdomains]
@@ -419,11 +401,9 @@ def map_manifold_to_volume_subdomains(
     )
 
     for manifold in manifold_subdomains:
-        volumes = adjacency.get(manifold, [])
-        if not 1 <= len(volumes) <= 2:
+        if not adjacency.get(manifold, []):
             raise ValueError(
-                f"codim-1 volume subdomain {manifold.id} is adjacent to "
-                f"{len(volumes)} volume subdomains; expected 1 (on the boundary of the "
-                "domain) or 2 (on an interface)"
+                f"codim-1 volume subdomain {manifold.id} is not adjacent to any volume "
+                "subdomain; its facets must bound at least one of them"
             )
     return adjacency

@@ -2,7 +2,9 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 import dolfinx
+import numpy as np
 import ufl
+from dolfinx.cpp.fem import compute_integration_domains
 from scifem.mesh import compute_interface_data
 
 from festim.material import SolubilityLaw
@@ -65,6 +67,59 @@ def compute_ordered_interior_facet_data(
         )
 
     return (tag, integration_data.reshape(-1))
+
+
+def compute_one_sided_interior_facet_data(
+    cell_tags: "dolfinx.mesh.MeshTags",
+    facets,
+    subdomain: VolumeSubdomain,
+):
+    """Integration data for the facets of a manifold that touch ``subdomain``, ordered
+    so that ``"+"`` is always ``subdomain``.
+
+    :func:`compute_ordered_interior_facet_data` orders the two sides of facets that all
+    separate the *same* pair of subdomains. That is not enough for a manifold adjacent
+    to more than two volumes -- a grain-boundary network in a polycrystal where every
+    grain is its own subdomain -- whose facets separate a different pair from one grain
+    to the next. There, one integral per adjacent grain is used instead of one per
+    manifold: this selects the facets that grain lies on and puts it on ``"+"``, so
+    every coupling term is written against a single restriction.
+
+    A facet between grains ``i`` and ``j`` is returned by both calls, once with ``i`` on
+    ``"+"`` and once with ``j``, which is what lets each side carry its own exchange
+    law. A facet with the same subdomain on both sides is returned unswapped.
+
+    Args:
+        cell_tags: the cell meshtags of the parent mesh
+        facets: the facets of the manifold, as returned by ``MeshTags.find``
+        subdomain: the volume subdomain to place on the ``"+"`` restriction
+
+    Returns:
+        a flat array of ``(cell_plus, local_facet_plus, cell_minus, local_facet_minus)``
+        quadruples, the form accepted by ``ufl.Measure("dS", subdomain_data=...)``
+    """
+    topology = cell_tags.topology
+    topology.create_connectivity(topology.dim - 1, topology.dim)
+
+    # MeshTags.topology is already the C++ object compute_integration_domains wants
+    data = compute_integration_domains(
+        dolfinx.fem.IntegralType.interior_facet, topology, facets
+    ).reshape(-1, 4)
+
+    # cell index -> volume subdomain id. MeshTags are not necessarily ordered by cell,
+    # nor do they necessarily cover every cell, so indexing values directly would be
+    # wrong for a mesh whose cells are not all tagged in order
+    cell_map = topology.index_map(topology.dim)
+    lookup = np.full(cell_map.size_local + cell_map.num_ghosts, -1, dtype=np.int32)
+    lookup[cell_tags.indices] = cell_tags.values
+
+    sides = lookup[data[:, [0, 2]]]
+    on_plus, on_minus = sides[:, 0] == subdomain.id, sides[:, 1] == subdomain.id
+    data = data[on_plus | on_minus]
+    # only the facets that have subdomain on "-" alone need their sides swapped
+    swap = on_minus[on_plus | on_minus] & ~on_plus[on_plus | on_minus]
+    data[swap] = data[swap][:, [2, 3, 0, 1]]
+    return data.reshape(-1)
 
 
 class InterfaceMethod(Enum):
@@ -286,6 +341,102 @@ class Interface(InterfaceBase):
             for i, subdomain in enumerate(self.subdomains)
         )
 
+    def Ds(self, species: "Species", temperature):
+        """Get diffusion coefficients for both sides of the interface.
+
+        Args:
+            species: The species for which to compute diffusivity.
+            temperature: A function that returns temperature at given restrictions.
+
+        Returns:
+            Diffusion coefficients (D_0, D_1) for subdomains 0 and 1.
+        """
+        return tuple(
+            subdomain.material.get_diffusion_coefficient(
+                self.parent_mesh, temperature(self.restriction[i]), species
+            )
+            for i, subdomain in enumerate(self.subdomains)
+        )
+
+    def equality(self, species: "Species", temperature):
+        """The interface constraint, as a residual that vanishes at equilibrium.
+
+        Both sides are expressed in the same quantity so that the difference is
+        meaningful: the partial pressure when the two materials obey different
+        solubility laws (``c/K`` for Henry, ``(c/K)**2`` for Sievert), and plainly
+        ``c/K`` when they obey the same one -- for a matching pair the squared and
+        unsquared constraints have the same non-negative roots, so the linear form
+        is preferred as it keeps the coupling linear.
+
+        Note that ``penalty_term`` therefore carries different units in the two
+        cases, and its values are not comparable across law pairs.
+
+        Args:
+            species: The species for which to compute the constraint.
+            temperature: A function that returns temperature at given restrictions.
+
+        Returns:
+            The constraint residual, zero when the two sides are in equilibrium.
+
+        Raises:
+            ValueError: If either material has an unsupported solubility law.
+        """
+        subdomain_0, subdomain_1 = self.subdomains
+        u_0, u_1 = self.us(species)
+        K_0, K_1 = self.Ks(species, temperature)
+
+        if subdomain_0.material.solubility_law == subdomain_1.material.solubility_law:
+            return u_0 / K_0 - u_1 / K_1
+
+        def partial_pressure(subdomain, u, K):
+            match subdomain.material.solubility_law:
+                case SolubilityLaw.HENRY:
+                    return u / K
+                case SolubilityLaw.SIEVERT:
+                    return (u / K) ** 2
+                case _:
+                    raise ValueError(
+                        "Unsupported material law "
+                        + f"{subdomain.material.solubility_law}"
+                    )
+
+        return partial_pressure(subdomain_0, u_0, K_0) - partial_pressure(
+            subdomain_1, u_1, K_1
+        )
+
+    def equality_scale(self, species: "Species", temperature):
+        """The factor that converts :meth:`equality` into concentration units.
+
+        ``equality`` is written in potential units -- ``c/K`` for a matching pair,
+        a partial pressure for a mixed one -- so it cannot be compared to a flux
+        directly. Nitsche's stabilisation and adjoint terms need it in concentration
+        units, so that ``penalty_term * D / h * scale * equality`` is a flux and
+        ``penalty_term`` is the dimensionless O(10) stabilisation parameter Nitsche's
+        theory calls for, whatever units the problem is posed in.
+
+        For a matching pair the scale is the mean solubility, which recovers the
+        textbook jump ``c_0 - c_1`` when the two materials share a solubility. For a
+        Sievert/Henry pair it is the Henry coefficient, exactly ``dc/dP`` on that
+        side, so ``scale * equality`` reads as the concentration the Henry side is
+        missing relative to equilibrium -- polynomial in both unknowns, with none of
+        the degeneracy of the Sievert side's ``dc/dP = K**2/(2c)`` at ``c = 0``.
+
+        Args:
+            species: The species for which to compute the scale.
+            temperature: A function that returns temperature at given restrictions.
+
+        Returns:
+            A factor with units of concentration over ``equality``'s units.
+        """
+        subdomain_0, subdomain_1 = self.subdomains
+        K_0, K_1 = self.Ks(species, temperature)
+
+        if subdomain_0.material.solubility_law == subdomain_1.material.solubility_law:
+            return 0.5 * (K_0 + K_1)
+        if subdomain_0.material.solubility_law == SolubilityLaw.HENRY:
+            return K_0
+        return K_1
+
     def get_formulation(
         self,
         dS: ufl.Measure,
@@ -332,9 +483,10 @@ class Interface(InterfaceBase):
     def penalty_method(self, dS, species, temperature):
         """Generate interface formulation using the penalty method.
 
-        The penalty method enforces interface continuity through a penalty term:
-        penalty_term * (u_1/K_1 - u_0/K_0) applied symmetrically to both sides.
-        Handles different solubility laws (Henry vs Sievert) on each side.
+        The interface is modelled as a surface exchange: the same flux
+        ``penalty_term * equality`` leaves one side and enters the other, so the
+        chemical potential drops across the interface by ``flux / penalty_term``
+        and particles are conserved exactly at any ``penalty_term``.
 
         Args:
             dS: Integration measure for the interface.
@@ -344,37 +496,8 @@ class Interface(InterfaceBase):
         Returns:
             Variational forms for subdomains 0 and 1.
         """
-        subdomain_0, subdomain_1 = self.subdomains
-        u_0, u_1 = self.us(species)
         v_0, v_1 = self.vs(species)
-        K_0, K_1 = self.Ks(species, temperature)
-        if subdomain_0.material.solubility_law == subdomain_1.material.solubility_law:
-            left = u_0 / K_0
-            right = u_1 / K_1
-        else:
-            match subdomain_0.material.solubility_law:
-                case SolubilityLaw.HENRY:
-                    left = u_0 / K_0
-                case SolubilityLaw.SIEVERT:
-                    left = (u_0 / K_0) ** 2
-                case _:
-                    raise ValueError(
-                        "Unsupported material law "
-                        + f"{subdomain_0.material.solubility_law}"
-                    )
-
-            match subdomain_1.material.solubility_law:
-                case SolubilityLaw.HENRY:
-                    right = u_1 / K_1
-                case SolubilityLaw.SIEVERT:
-                    right = (u_1 / K_1) ** 2
-                case _:
-                    raise ValueError(
-                        f"Unsupported material law "
-                        f"{subdomain_1.material.solubility_law}"
-                    )
-
-        equality = right - left
+        equality = self.equality(species, temperature)
 
         F_0 = self.penalty_term * ufl.inner(equality, v_0) * dS(self.id)
         F_1 = -self.penalty_term * ufl.inner(equality, v_1) * dS(self.id)
@@ -384,12 +507,22 @@ class Interface(InterfaceBase):
     def nitsche_method(self, dS, species, temperature):
         """Generate interface formulation using the Nitsche method.
 
-        The Nitsche method is a stabilized discontinuous Galerkin approach that
-        enforces interface continuity through a combination of:
-        - Average gradient terms
-        - Jump-based penalty stabilization
+        Nitsche's method adds, on top of the penalty stabilisation, the term that
+        makes the formulation *consistent*: the flux the two sides must agree on,
+        ``{D grad(c) . n}``, appears explicitly, so the exact solution satisfies the
+        discrete form for any ``penalty_term``. The penalty then only has to make the
+        system stable rather than to enforce the interface condition on its own,
+        which is why a value of order 10-100 reaches an accuracy the pure penalty
+        needs orders of magnitude more for.
 
-        This method is more stable for certain problems compared to pure penalty.
+        The symmetric (adjoint-consistent) variant is used. Like the penalty, both
+        the consistency and the stabilisation term enter the two sides equally and
+        oppositely, so particles are conserved exactly whatever ``equality`` is; and
+        like the penalty it goes through :meth:`equality`, so a Sievert/Henry pair is
+        coupled through partial pressures rather than through ``c/K``. Unlike the
+        penalty, ``penalty_term`` is dimensionless here: the constraint is brought
+        into concentration units by :meth:`equality_scale` first, so the same value
+        of order 10 works whatever units the problem is posed in.
 
         Args:
             dS: Integration measure for the interface.
@@ -400,27 +533,38 @@ class Interface(InterfaceBase):
             Variational forms for subdomains 0 and 1.
         """
         u_0, u_1 = self.us(species)
-        K_0, K_1 = self.Ks(species, temperature)
         v_0, v_1 = self.vs(species)
-
-        def mixed_term(u, v, n):
-            return ufl.dot(ufl.grad(u), n) * v
+        D_0, D_1 = self.Ds(species, temperature)
+        # in concentration units, so that the two terms below are fluxes and
+        # penalty_term stays a dimensionless stabilisation parameter
+        jump = self.equality_scale(species, temperature) * self.equality(
+            species, temperature
+        )
 
         res = self.restriction
-        n = ufl.FacetNormal(dS.ufl_domain())
+        n_0 = ufl.FacetNormal(dS.ufl_domain())(res[0])
         cr = ufl.Circumradius(dS.ufl_domain())
-        n_0 = n(res[0])
         h_0 = 2 * cr(res[0])
         h_1 = 2 * cr(res[1])
-        gamma = self.penalty_term
-        F_0 = -0.5 * mixed_term((u_0 + u_1), v_0, n_0) * dS(self.id) - 0.5 * mixed_term(
-            v_0, (u_0 / K_0 - u_1 / K_1), n_0
-        ) * dS(self.id)
 
-        F_1 = +0.5 * mixed_term((u_0 + u_1), v_1, n_0) * dS(self.id) - 0.5 * mixed_term(
-            v_1, (u_0 / K_0 - u_1 / K_1), n_0
-        ) * dS(self.id)
-        F_0 += 2 * gamma / (h_0 + h_1) * (u_0 / K_0 - u_1 / K_1) * v_0 * dS(self.id)
-        F_1 += -2 * gamma / (h_0 + h_1) * (u_0 / K_0 - u_1 / K_1) * v_1 * dS(self.id)
+        def flux(u, D):
+            """The diffusive flux of ``u`` through the interface, along n_0."""
+            return D * ufl.dot(ufl.grad(u), n_0)
+
+        # {D grad(u) . n}: at the exact solution both sides equal the transmitted
+        # flux, so this term reproduces it and the two below vanish
+        avg_flux = 0.5 * (flux(u_0, D_0) + flux(u_1, D_1))
+        # gamma * D / h : turns the concentration jump into a flux
+        stabilisation = self.penalty_term * (D_0 + D_1) / (h_0 + h_1)
+
+        # consistency
+        F_0 = -avg_flux * v_0 * dS(self.id)
+        F_1 = +avg_flux * v_1 * dS(self.id)
+        # adjoint consistency (symmetric variant)
+        F_0 += -0.5 * flux(v_0, D_0) * jump * dS(self.id)
+        F_1 += -0.5 * flux(v_1, D_1) * jump * dS(self.id)
+        # stabilisation
+        F_0 += stabilisation * jump * v_0 * dS(self.id)
+        F_1 += -stabilisation * jump * v_1 * dS(self.id)
 
         return F_0, F_1

@@ -6,7 +6,6 @@ from petsc4py import PETSc
 
 import basix
 import dolfinx
-import io4dolfinx
 import numpy as np
 import numpy.typing as npt
 import scifem
@@ -164,6 +163,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
             my_model.initialise()
     """
 
+    drift_terms: list[_drift.DriftTermBase]
     _temperature_as_function: fem.Function
     _species_to_D_global: dict[_species.Species, fem.Function]
     _species_to_D_global_expr: dict[_species.Species, fem.Expression]
@@ -393,7 +393,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         self.convert_reaction_rates_to_fenics_objects()
         self.create_sources_from_reactions()
         self.convert_source_input_values_to_fenics_objects()
-        self.convert_advection_term_to_fenics_objects()
+        self.convert_drift_terms_to_fenics_objects()
         self.create_flux_values_fenics()
         self.create_initial_conditions()
         self.create_formulation()
@@ -481,69 +481,84 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 )
                 self.temperature_fenics.interpolate(self.temperature_expr)
 
+    def _export_context(
+        self, export
+    ) -> tuple[list[fem.Function], list[str], dolfinx.mesh.Mesh]:
+        """Resolve what a field export should write.
+
+        Args:
+            export: the export to resolve
+
+        Returns:
+            the functions to write, the name to store each one under, and the mesh
+            they live on
+        """
+        if isinstance(export, exports.TemperatureExport):
+            self._temperature_as_function = self._get_temperature_field_as_function()
+            return (
+                [self._temperature_as_function],
+                [self._temperature_as_function.name],
+                self._temperature_as_function.function_space.mesh,
+            )
+        elif isinstance(export, exports.SpeciesExport):
+            functions = export.get_functions()
+            names = [species.name for species in export.field]
+            return functions, names, self.mesh.mesh
+        elif isinstance(export, exports.CustomFieldExport):
+            export.function = fem.Function(self.V_CG_1)
+            export.set_dolfinx_expression(
+                temperature=self.temperature_fenics,
+                time=self.t,
+            )
+            return (
+                [export.function],
+                [export.filename.stem],
+                export.function.function_space.mesh,
+            )
+        raise NotImplementedError(f"Export type {type(export)} not implemented")
+
     def initialise_exports(self):
         """Defines the export writers of the model, if field is given as a string, find
         species object in self.species."""
 
+        # formats that hold several meshes in one file (vtkhdf) let exports share a
+        # filename: the first one to claim it truncates, the rest append as new blocks
+        initialised_files = set()
         for export in self.exports:
-            if isinstance(export, exports.ExportBaseClass):
-                if export.times:
-                    for time in export.times:
-                        if time not in self.settings.stepsize.milestones:
-                            msg = "To ensure that the exports data at the desired times"
-                            msg += "the values in export.times are added to milestones"
-                            warnings.warn(msg)
-                            self.settings.stepsize.milestones.append(time)
-                    self.settings.stepsize.milestones.sort()
-
-                if isinstance(export, exports.VTXTemperatureExport):
-                    self._temperature_as_function = (
-                        self._get_temperature_field_as_function()
-                    )
-                    export.writer = dolfinx.io.VTXWriter(
-                        comm=self._temperature_as_function.function_space.mesh.comm,
-                        filename=export.filename,
-                        output=self._temperature_as_function,
-                        engine="BP5",
-                    )
-                    continue
-
-                elif isinstance(export, exports.VTXSpeciesExport):
-                    functions = export.get_functions()
-                    if not export._checkpoint:
-                        export.writer = dolfinx.io.VTXWriter(
-                            comm=functions[0].function_space.mesh.comm,
-                            filename=export.filename,
-                            output=functions,
-                            engine="BP5",
-                        )
-
-                    else:
-                        io4dolfinx.write_mesh(
-                            filename=export.filename,
-                            mesh=self.mesh.mesh,
-                            backend="adios2",
-                        )
-
-                elif isinstance(export, exports.CustomFieldExport):
-                    export.function = fem.Function(self.V_CG_1)
-                    export.set_dolfinx_expression(
-                        temperature=self.temperature_fenics,
-                        time=self.t,
+            # if name of species is given then replace with species object. Done first
+            # so that the writers below get real Species to work from.
+            if hasattr(export, "field"):
+                if isinstance(export.field, list):
+                    for idx, field in enumerate(export.field):
+                        if isinstance(field, str):
+                            export.field[idx] = _species.find_species_from_name(
+                                field, self.species
+                            )
+                elif isinstance(export.field, str):
+                    export.field = _species.find_species_from_name(
+                        export.field, self.species
                     )
 
-                    export.writer = dolfinx.io.VTXWriter(
-                        comm=export.function.function_space.mesh.comm,
-                        filename=export.filename,
-                        output=export.function,
-                        engine="BP5",
-                    )
-                    continue
+            if isinstance(export, exports.FieldExportBase):
+                self._register_export_milestones(export)
+                functions, names, mesh = self._export_context(export)
+                # everything lives on the parent mesh here, so a single block per file
+                export.define_writer(
+                    functions,
+                    names,
+                    mesh,
+                    overwrite=export.filename not in initialised_files,
+                )
+                initialised_files.add(export.filename)
 
             elif isinstance(export, exports.DerivedQuantity):
                 # raise not implemented error if the derived quantity don't match the
-                # type of mesh eg. SurfaceFlux is used with cylindrical mesh
-                if self.mesh.coordinate_system != CoordinateSystem.CARTESIAN:
+                # type of mesh eg. TotalVolume is not implemented for cylindrical
+                # or spherical meshes. SurfaceFlux supports all coordinate systems.
+                if (
+                    self.mesh.coordinate_system != CoordinateSystem.CARTESIAN
+                    and not isinstance(export, exports.SurfaceFlux)
+                ):
                     raise NotImplementedError(
                         f"Derived quantity exports are not implemented for "
                         f"{self.mesh.coordinate_system!s} meshes"
@@ -562,23 +577,6 @@ class HydrogenTransportProblem(problem.ProblemBase):
                         "subdomains are only supported by "
                         "HydrogenTransportProblemDiscontinuous"
                     )
-
-            # if name of species is given then replace with species object
-            if hasattr(export, "field"):
-                if isinstance(export.field, list):
-                    for idx, field in enumerate(export.field):
-                        if isinstance(field, str):
-                            export.field[idx] = _species.find_species_from_name(
-                                field, self.species
-                            )
-                elif isinstance(export.field, str):
-                    export.field = _species.find_species_from_name(
-                        export.field, self.species
-                    )
-
-            # Initialize XDMFFile for writer
-            if isinstance(export, exports.XDMFExport):
-                export.define_writer(MPI.COMM_WORLD)
 
             # clean data for profile1D export
             if isinstance(export, exports.Profile1DExport):
@@ -603,6 +601,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 # add the global D to the export
                 export.D = self._species_to_D_global.get(export.field)
                 export.D_expr = self._species_to_D_global_expr.get(export.field)
+                export.coordinate_system = self.mesh.coordinate_system
             # a model without drift terms must not pay for the surface-to-volume
             # lookup, which needs meshtags this one does not otherwise require
             if self.drift_terms and isinstance(export, exports.SurfaceFlux):
@@ -962,7 +961,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         for reaction in self.reactions:
             self._unpacked_sources += reaction.create_sources()
 
-    def convert_advection_term_to_fenics_objects(self):
+    def convert_drift_terms_to_fenics_objects(self):
         """For each drift term convert its user-given coefficients.
 
         Runs after ``define_temperature`` so that a coefficient given as a function of
@@ -1103,8 +1102,10 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 velocity = drift_term.drift_velocity(
                     D=D, temperature=self.temperature_fenics
                 )
-                if _drift.warn_if_no_effect(drift_term, species, velocity):
-                    continue
+                # a term whose velocity is identically zero is still assembled: it costs
+                # nothing (UFL folds the zero into the integrand it shares a measure
+                # with) and dropping it would change the user's model behind their back
+                _drift.warn_if_no_effect(drift_term, species, velocity)
                 self.formulation += _drift.drift_form(
                     concentration=species.solution,
                     test_function=species.test_function,
@@ -1264,6 +1265,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 measure=self.measure_for(domain, export.field),
                 entity_maps=self.entity_maps_for(domain, export.field),
                 restriction=self.restriction_for(domain, export.field),
+                subdomain_id=self.measure_id_for(domain, export.field),
             )
         elif isinstance(export, exports.ExtremumQuantity):
             meshtags, entity_dim = self.entities_for(domain, export.field)
@@ -1281,6 +1283,10 @@ class HydrogenTransportProblem(problem.ProblemBase):
         """Entity maps relating the integration domain to the meshes the coefficients
         live on. A single-mesh problem needs none."""
         return None
+
+    def measure_id_for(self, domain, field=None) -> int:
+        """The id with which a derived quantity indexes its resolved measure."""
+        return domain.id
 
     def restriction_for(self, domain, field=None) -> str | None:
         """Which side of an interior facet an integral over ``domain`` is read on.
@@ -1313,31 +1319,17 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 ):
                     continue
 
-            # handle VTX exports
-            if isinstance(export, exports.ExportBaseClass):
-                if isinstance(export, exports.VTXSpeciesExport):
-                    if export._checkpoint:
-                        for field in export.field:
-                            io4dolfinx.write_function(
-                                filename=export.filename,
-                                u=field.post_processing_solution,
-                                time=float(self.t),
-                                name=field.name,
-                            )
-                    else:
-                        export.writer.write(float(self.t))
-                elif (
-                    isinstance(export, exports.VTXTemperatureExport)
-                    and self.temperature_time_dependent
-                ):
+            # handle field exports
+            if isinstance(export, exports.FieldExportBase):
+                if isinstance(export, exports.TemperatureExport):
+                    if not self.temperature_time_dependent:
+                        # nothing changed since the last write
+                        continue
                     self._temperature_as_function.interpolate(
                         self._get_temperature_field_as_function()
                     )
-                    export.writer.write(float(self.t))
-                elif isinstance(export, exports.CustomFieldExport):
-                    # update internal function
-                    export.function.interpolate(export.dolfinx_expression)
-                    export.writer.write(float(self.t))
+                export.update()
+                export.write(float(self.t))
 
             computed = True
             if isinstance(export, exports.SurfaceFlux):
@@ -1359,9 +1351,6 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 export.t.append(float(self.t))
                 if export.filename is not None:
                     export.write(t=float(self.t))
-
-            if isinstance(export, exports.XDMFExport):
-                export.write(float(self.t))
 
             if isinstance(export, exports.Profile1DExport):
                 # computing dofs at each time step is costly so storing it in the export
@@ -1387,9 +1376,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
 class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
     interfaces: list[_subdomain.Interface]
     surface_to_volume: dict
-    _method_interface: _subdomain.interface.InterfaceMethod = (
-        _subdomain.interface.InterfaceMethod.penalty
-    )
+    # None unless the user sets the deprecated problem-level attribute; only then
+    # does initialise() push it onto the interfaces (see method_interface)
+    _method_interface: _subdomain.interface.InterfaceMethod | None = None
     subdomain_to_species: dict
 
     def __init__(
@@ -1483,6 +1472,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             "please use the method_interface attribute of each interface instead",
             DeprecationWarning,
         )
+        if self._method_interface is None:
+            return _subdomain.interface.InterfaceMethod.penalty
         return self._method_interface
 
     @method_interface.setter
@@ -1498,15 +1489,16 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
     def initialise(self):
         # if method_interface is given as an attribute of Problem class, then pass it to
-        # each interface and raise a deprecation warning
-        if hasattr(self, "method_interface"):
+        # each interface and raise a deprecation warning. ``hasattr`` cannot be used to
+        # detect that: method_interface is a property, so it is always present
+        if self._method_interface is not None:
             warnings.warn(
                 "The method_interface attribute of the Problem class is deprecated, "
                 "please set the method_interface attribute of each interface instead",
                 DeprecationWarning,
             )
             for interface in self.interfaces:
-                interface.method = self.method_interface
+                interface.method = self._method_interface
 
         # check that all species have a list of F.VolumeSubdomain as this is
         # different from F.HydrogenTransportProblem
@@ -1544,15 +1536,17 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 comm=self.mesh.mesh.comm,
             )
 
-        # a manifold may sit on the boundary of the domain (one adjacent volume) or on
-        # an interface (two), so it needs a multi-valued mapping of its own rather than
-        # the one-to-one surface_to_volume
+        # a manifold may sit on the boundary of the domain (one adjacent volume), on an
+        # interface (two), or thread a polycrystal of one subdomain per grain (as many
+        # as it touches), so it needs a multi-valued mapping of its own rather than the
+        # one-to-one surface_to_volume
         facet_to_cell = self.mesh.mesh.topology.connectivity(
             self.mesh.mesh.topology.dim - 1, self.mesh.mesh.topology.dim
         )
-        self._coupling_measures = {}
+        self.interior_facet_measure = None
         self._manifold_is_interior = {}
         self._manifold_export_measures = {}
+        self._manifold_side_ids = {}
         self.manifold_to_volumes = _subdomain.map_manifold_to_volume_subdomains(
             ft=self.facet_meshtags,
             ct=self.volume_meshtags,
@@ -1575,8 +1569,15 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             subdomain.transfer_meshtag(self.mesh.mesh, self.facet_meshtags)
 
         for interface in self.interfaces:
-            interface.mt = self.volume_meshtags
+            # ``mt`` is read as ``mt.find(interface.id)`` to get the facets the
+            # interface occupies, so it is the facet tags
+            interface.mt = self.facet_meshtags
+            interface.mesh = self.mesh.mesh
             interface.parent_mesh = self.mesh.mesh
+
+        # every interior-facet integrand of the parent mesh is known by now, and they
+        # all have to share one measure (see :meth:`build_interior_facet_measure`)
+        self.build_interior_facet_measure()
 
         self.create_species_from_traps()
         self.link_enclosures()
@@ -1619,7 +1620,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         self.convert_reaction_rates_to_fenics_objects()
         self.create_sources_from_reactions()
         self.convert_source_input_values_to_fenics_objects()
-        self.convert_advection_term_to_fenics_objects()
+        self.convert_drift_terms_to_fenics_objects()
         self.define_boundary_conditions()
         self.create_flux_values_fenics()
         self.create_initial_conditions()
@@ -1801,14 +1802,19 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             else:
                 V = condition.species.subdomain_to_function_space[condition.volume]
 
+                if isinstance(self.temperature_fenics, fem.Function):
+                    temperature = condition.volume.sub_T
+                else:
+                    temperature = self.temperature_fenics
+
                 condition.create_expr_fenics(
-                    mesh=self.mesh.mesh,
-                    temperature=self.temperature_fenics,
+                    mesh=condition.volume.submesh,
+                    temperature=temperature,
                     function_space=V,
                 )
 
-                # assign to previous solution of species. The expression already lives
-                # on the subdomain's submesh, so the whole submesh is interpolated into
+                # assign to previous solution of species; the expression already
+                # lives on the subdomain's submesh, so no cell restriction is needed
                 condition.volume.u_n.sub(idx).interpolate(condition.expr_fenics)
 
         for gas_species in self.gas_species:
@@ -1885,13 +1891,23 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             name = f"{species.name}_{subdomain.id}"
             species.subdomain_to_post_processing_solution[subdomain].name = name
 
+    def source_integration_mesh(self, source) -> dolfinx.mesh.Mesh:
+        """The mesh the integral carrying ``source`` is assembled over.
+
+        A source involving only fields of a manifold subdomain is integrated over that
+        manifold's submesh (:meth:`subdomain_measure`); one coupling the manifold to
+        the bulk is a facet integral of the parent mesh (:meth:`facet_measure`).
+        """
+        if self.is_manifold_self_source(source):
+            return source.volume.submesh
+        if source.volume in self.manifold_to_volumes:
+            return self.mesh.mesh
+        return source.species.subdomain_to_function_space[source.volume].mesh
+
     def convert_source_input_values_to_fenics_objects(self):
         """For each source create the value_fenics."""
         for source in self._unpacked_sources:
-            # create value_fenics for all F.ParticleSource objects
             if isinstance(source, _source.ParticleSource):
-                V = source.species.subdomain_to_function_space[source.volume]
-
                 # a self source on a manifold is integrated over its submesh, so its
                 # time and temperature must live there; a coupling source is integrated
                 # on the parent mesh and keeps the parent-mesh ones
@@ -1901,23 +1917,20 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 else:
                     t = self.t
                     temperature = self.temperature_fenics
-                    if source.volume in self.manifold_to_volumes:
-                        # a coupling source is integrated on the parent mesh, so its
-                        # spatial coordinate has to be the parent mesh's as well --
-                        # ufl.SpatialCoordinate of the manifold's submesh is silently
-                        # wrong under the "+"/"-" restriction of an interior manifold.
-                        # only function_space.mesh is read on the up_to_ufl_expr path
-                        V = dolfinx.fem.functionspace(self.mesh.mesh, ("CG", 1))
 
                 source.value.convert_input_value(
-                    function_space=V,
+                    function_space=source.species.subdomain_to_function_space[
+                        source.volume
+                    ],
+                    mesh=self.source_integration_mesh(source),
                     t=t,
                     temperature=temperature,
                     up_to_ufl_expr=True,
                     subdomain=source.volume,
+                    foreign_subdomain=self.source_coupling_side(source),
                 )
 
-    def convert_advection_term_to_fenics_objects(self):
+    def convert_drift_terms_to_fenics_objects(self):
         """As the base class, but on the function space of the term's own subdomain.
 
         Every coefficient of a submesh integral has to be built on that submesh -- FFCx
@@ -1964,7 +1977,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
         Terms coupling a manifold to the bulk cannot use this measure -- a bulk field
         cannot be resolved inside a codim-1 integral -- and use
-        :meth:`coupling_measure` instead.
+        :meth:`facet_measure` instead.
         """
         if subdomain.codim(self.mesh.vdim) == 1:
             return ufl.Measure("dx", domain=subdomain.submesh)
@@ -2024,7 +2037,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 # a bulk field over a manifold's facets. The parent ds integrates to
                 # exactly zero over interior facets, so this has to be the dS coupling
                 # measure -- a silent zero rather than an error otherwise
-                return self.unindexed_coupling_measure(domain)
+                return self.facet_measure(domain)
             # export_volume_measure builds and caches exactly this measure, tagging
             # owned cells only so a ghost is not counted twice in parallel. Building a
             # fresh ufl.Measure per timestep here would also defeat form caching.
@@ -2054,7 +2067,9 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             return self.volume_of(domain, field).submesh
         return super().integration_mesh_for(domain, field)
 
-    def entities_for(self, domain, field=None) -> tuple[dolfinx.mesh.MeshTags, int]:
+    def entities_for(
+        self, domain, field=None
+    ) -> tuple[dolfinx.mesh.MeshTags | None, int]:
         """The meshtags in which ``domain`` is tagged, and the dimension of its
         entities -- on the *submesh*, because that is where the fields live.
 
@@ -2063,7 +2078,16 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         bounds. Using the parent-mesh tags here would locate dofs of the wrong mesh.
         """
         if isinstance(domain, _subdomain.VolumeSubdomain):
-            return domain.submesh_cell_tag, domain.submesh.topology.dim
+            if self._reads_domain_itself(domain, field):
+                # The submesh already is exactly this domain, so all its dofs belong to
+                # the reduction and no tag is needed.
+                return None, domain.submesh.topology.dim
+            volume = self.volume_of(domain, field)
+            if volume.ft is None:
+                raise NotImplementedError(
+                    f"volume subdomain {volume.id} has no facet tags on its submesh"
+                )
+            return volume.ft, volume.submesh.topology.dim - 1
 
         volume = self.volume_of(domain, field)
         if domain.codim(self.mesh.vdim) == 2:
@@ -2093,6 +2117,13 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
     def entity_maps_for(self, domain, field=None):
         return [sd.cell_map for sd in self.volume_subdomains]
+
+    def measure_id_for(self, domain, field=None) -> int:
+        if isinstance(domain, _subdomain.VolumeSubdomain) and not (
+            self._reads_domain_itself(domain, field)
+        ):
+            return self.coupling_measure_id(domain, self.volume_of(domain, field))
+        return domain.id
 
     def restriction_for(self, domain, field=None) -> str | None:
         """Which side of an interior facet a quantity over ``domain`` is read on.
@@ -2179,7 +2210,12 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             mesh.topology.create_connectivity(tdim - 1, tdim)
             facet_to_cell = mesh.topology.connectivity(tdim - 1, tdim)
             facets = self.facet_meshtags.find(manifold.id)
-            n_interior = sum(len(facet_to_cell.links(f)) == 2 for f in facets)
+            # vectorised: the number of cells a facet connects to is the width of
+            # its slice in the adjacency list, and there can be tens of thousands
+            # of facets in a manifold
+            offsets = facet_to_cell.offsets
+            n_cells = offsets[facets + 1] - offsets[facets]
+            n_interior = int(np.count_nonzero(n_cells == 2))
 
             comm = mesh.comm
             total = comm.allreduce(len(facets), op=MPI.SUM)
@@ -2194,55 +2230,155 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             self._manifold_is_interior[manifold] = interior > 0
         return self._manifold_is_interior[manifold]
 
-    def coupling_measure(self, manifold: _subdomain.VolumeSubdomain):
-        """The parent-mesh measure the terms coupling ``manifold`` to the bulk are
-        integrated over.
+    def facet_measure(self, manifold: _subdomain.VolumeSubdomain):
+        """The parent-mesh measure the facets of ``manifold`` are integrated in: the
+        terms coupling it to the bulk, and the derived quantities exported on it.
 
-        A manifold on the boundary of the mesh uses ``ds``; one inside the mesh uses
-        ``dS``. When it separates two different volume subdomains the integration
-        entities are ordered so that ``"+"`` is the first of them (see
-        :meth:`restriction_of`); when the same subdomain lies on both sides there is
-        nothing to order, because the bulk field is single-valued across the facet.
-        """
-        return self.unindexed_coupling_measure(manifold)(manifold.id)
+        A manifold on the boundary of the mesh is integrated with ``ds``, one inside
+        the mesh with the shared ``dS`` (see :meth:`build_interior_facet_measure`),
+        whose entities are ordered so that ``"+"`` is the first of the two volume
+        subdomains it separates (see :meth:`restriction_of`).
 
-    def unindexed_coupling_measure(self, manifold: _subdomain.VolumeSubdomain):
-        """As :meth:`coupling_measure`, but not yet restricted to the manifold's id.
-
-        Derived quantities index the measure they are handed by the id of the subdomain
-        they export, exactly as they do with the parent ``ds``, so they need the measure
-        itself rather than an integral over it.
+        The measure is **not** restricted to the manifold: index it with
+        ``manifold.id``, as the derived quantities do with the parent ``ds``. Left
+        unindexed in a form it integrates over everything the measure carries data
+        for -- every tagged facet of the mesh for ``ds``, every interior manifold and
+        interface for the shared ``dS``.
         """
         if not self.manifold_is_interior(manifold):
             return self.ds
+        return self.interior_facet_measure
 
-        # memoised: DOLFINx requires every integral of a compiled form to share the
-        # *same* subdomain_data object, not merely an equal one
-        if manifold not in self._coupling_measures:
+    def build_interior_facet_measure(self):
+        """Builds the single ``dS`` measure that every interior-facet integral of the
+        parent mesh shares, and stores it in ``interior_facet_measure``.
+
+        The coupling terms of an interior manifold and the continuity terms of an
+        :class:`festim.Interface` are both ``dS`` integrals of the parent mesh, and
+        both need integration data of their own so that ``"+"`` and ``"-"`` land on the
+        sides they are meant to. They cannot each carry their own measure: UFL collects
+        one ``subdomain_data`` entry per integral of a form, and ``dolfinx.fem.form``
+        asserts that they are all the *same* object before using the first of them for
+        every id. A measure per manifold therefore breaks as soon as one volume
+        subdomain touches two interior manifolds, or an interface and an interior
+        manifold -- both integrals end up in that subdomain's ``F``. So the data of
+        every interior-facet integral goes into one list, and the measure built from it
+        is handed to all of them, each indexing it by its own id.
+        """
+        self._allocate_manifold_side_ids()
+        integral_data = [
+            entry
+            for manifold in self.manifold_subdomains
+            if self.manifold_is_interior(manifold)
+            for entry in self._manifold_integration_data(manifold)
+        ]
+        integral_data += [
+            interface.compute_mapped_interior_facet_data(self.volume_meshtags)
+            for interface in self.interfaces
+        ]
+        self.interior_facet_measure = ufl.Measure(
+            "dS", domain=self.mesh.mesh, subdomain_data=integral_data
+        )
+
+    def _allocate_manifold_side_ids(self):
+        """Gives each side of a manifold adjacent to more than two volume subdomains an
+        integration id of its own, in ``_manifold_side_ids``.
+
+        Two sides fit in one integral: the facets are ordered once and the two coupling
+        terms are told apart by ``"+"`` and ``"-"``. Beyond two there is no such
+        ordering, because the facets of the manifold no longer separate the same pair of
+        subdomains all the way along -- a grain-boundary network runs between a
+        different pair of grains on either side of every triple junction. So each
+        adjacent volume gets one integral over the facets it touches, ordered so that it
+        is on ``"+"`` (see
+        :func:`festim.subdomain.compute_one_sided_interior_facet_data`), and a facet
+        shared by two grains is integrated once per grain.
+
+        The ids are allocated above every id the user has declared, so that they cannot
+        collide with another manifold, an interface or a surface in the shared ``dS``
+        measure.
+        """
+        self._manifold_side_ids = {}
+        declared = {v.id for v in self.volume_subdomains}
+        declared |= {s.id for s in self.surface_subdomains}
+        declared |= {i.id for i in self.interfaces}
+        next_id = max(declared, default=0) + 1
+        for manifold in self.manifold_subdomains:
             volumes = self.manifold_to_volumes[manifold]
-            if len(volumes) == 2:
-                integral_data = _subdomain.compute_ordered_interior_facet_data(
+            if len(volumes) <= 2:
+                continue
+            self._manifold_side_ids[manifold] = {}
+            for volume in volumes:
+                self._manifold_side_ids[manifold][volume] = next_id
+                next_id += 1
+
+    def _manifold_integration_data(self, manifold: _subdomain.VolumeSubdomain):
+        """The ``(id, entities)`` pairs putting the coupling terms of an interior
+        ``manifold`` on the facets it occupies.
+
+        One pair, tagged with the manifold's own id, while it is adjacent to at most two
+        volume subdomains. When it separates two of them the entities are ordered so
+        that ``"+"`` is the first (see :meth:`restriction_of`); when the same subdomain
+        lies on both sides there is nothing to order, because the bulk field is
+        single-valued across the facet.
+
+        Beyond two adjacent subdomains there is one pair *per side*, tagged with the ids
+        allocated by :meth:`_allocate_manifold_side_ids`.
+        """
+        volumes = self.manifold_to_volumes[manifold]
+        if len(volumes) > 2:
+            facets = self.facet_meshtags.find(manifold.id)
+            return [
+                (
+                    self._manifold_side_ids[manifold][volume],
+                    _subdomain.compute_one_sided_interior_facet_data(
+                        self.volume_meshtags, facets, volume
+                    ),
+                )
+                for volume in volumes
+            ]
+        if len(volumes) == 2:
+            return [
+                _subdomain.compute_ordered_interior_facet_data(
                     self.volume_meshtags,
                     self.facet_meshtags,
                     manifold.id,
                     volumes[0],
                     volumes[1],
                 )
-            else:
-                # one subdomain on both sides: either restriction reads the same value,
-                # so the entities are taken in whatever order DOLFINx gives them
-                integral_data = (
-                    manifold.id,
-                    compute_integration_domains(
-                        dolfinx.fem.IntegralType.interior_facet,
-                        self.mesh.mesh.topology._cpp_object,
-                        self.facet_meshtags.find(manifold.id),
-                    ),
-                )
-            self._coupling_measures[manifold] = ufl.Measure(
-                "dS", domain=self.mesh.mesh, subdomain_data=[integral_data]
+            ]
+        # one subdomain on both sides: either restriction reads the same value, so the
+        # entities are taken in whatever order DOLFINx gives them
+        return [
+            (
+                manifold.id,
+                compute_integration_domains(
+                    dolfinx.fem.IntegralType.interior_facet,
+                    self.mesh.mesh.topology._cpp_object,
+                    self.facet_meshtags.find(manifold.id),
+                ),
             )
-        return self._coupling_measures[manifold]
+        ]
+
+    def coupling_measure_id(
+        self, manifold: _subdomain.VolumeSubdomain, volume: _subdomain.VolumeSubdomain
+    ) -> int:
+        """The id the terms coupling ``manifold`` to ``volume`` index the measure of
+        :meth:`facet_measure` with.
+
+        The manifold's own id while it is adjacent to at most two volume subdomains --
+        one integral carries both sides, told apart by their restriction. Beyond that
+        each side has an integral of its own (see :meth:`_allocate_manifold_side_ids`).
+        """
+        side_ids = self._manifold_side_ids.get(manifold)
+        return manifold.id if side_ids is None else side_ids[volume]
+
+    def coupling_measure(
+        self, manifold: _subdomain.VolumeSubdomain, volume: _subdomain.VolumeSubdomain
+    ):
+        """The measure, indexed, that the terms coupling ``manifold`` to ``volume`` are
+        integrated over. Pair it with :meth:`restriction_of`."""
+        return self.facet_measure(manifold)(self.coupling_measure_id(manifold, volume))
 
     def restriction_of(
         self, manifold: _subdomain.VolumeSubdomain, volume: _subdomain.VolumeSubdomain
@@ -2252,12 +2388,15 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         ``None`` when the manifold is on the boundary of the mesh, where the coupling is
         an exterior-facet integral and nothing needs restricting. ``"+"`` when the same
         subdomain lies on both sides: the bulk field is continuous across the facet, so
-        both restrictions read the same value and the exchange is applied once.
+        both restrictions read the same value and the exchange is applied once. ``"+"``
+        again when the manifold is adjacent to more than two subdomains, where each side
+        has an integral of its own on which it is the ``"+"`` one -- so this must always
+        be read together with :meth:`coupling_measure_id`.
         """
         if not self.manifold_is_interior(manifold):
             return None
         volumes = self.manifold_to_volumes[manifold]
-        if len(volumes) == 1:
+        if len(volumes) != 2:
             return "+"
         return "+" if volume is volumes[0] else "-"
 
@@ -2348,7 +2487,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             target = self.coupling_side(bc.subdomain, bc.species)
             return (
                 target,
-                self.coupling_measure(bc.subdomain),
+                self.coupling_measure(bc.subdomain, target),
                 self.restriction_of(bc.subdomain, target),
             )
         return self.surface_to_volume[bc.subdomain], self.ds(bc.subdomain.id), None
@@ -2471,8 +2610,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     raise NotImplementedError(
                         f"implicit species {reactant.name} is used by reactions on a "
                         "codim-1 subdomain and on another subdomain, which are "
-                        "integrated over different meshes. Declare one implicit "
-                        "species per subdomain."
+                        "integrated over different meshes. Declare a separate "
+                        "implicit species for each subdomain."
                     )
 
                 reactant.create_value_fenics(mesh=mesh, t=t)
@@ -2497,6 +2636,24 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             return False
         return not self.foreign_species(source, source.volume)
 
+    def source_coupling_side(self, source) -> _subdomain.VolumeSubdomain | None:
+        """The bulk subdomain a coupling source on a manifold reads, or ``None`` if
+        ``source`` is not one half of a codimensional coupling.
+
+        Which side of the manifold the term belongs to is decided by the bulk species
+        the source names (see :meth:`coupling_side`), and the expression has to read
+        that species' solution *there*. It cannot work that out for itself: a bulk
+        species defined on several subdomains -- because it is continuous across an
+        interface, say -- has a solution on each of them.
+        """
+        if source.volume not in self.manifold_to_volumes:
+            return None
+        foreign = self.foreign_species(source, source.volume)
+        if not foreign:
+            return None
+        # foreign_species has already checked that they all resolve to the same side
+        return self.coupling_side(source.volume, foreign[0])
+
     def diffusion_coefficient(self, subdomain: _subdomain.VolumeSubdomain, species):
         """The diffusion coefficient of ``species`` for the gradient terms of
         ``subdomain``, defined on the mesh those terms are integrated over."""
@@ -2518,7 +2675,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         ``subdomain`` -- are integrated over :meth:`subdomain_measure`, which for a
         manifold subdomain is its own submesh. *Coupling* terms, which mix a manifold
         field with a bulk field, cannot live there (a bulk function cannot be resolved
-        inside a codim-1 integral) and use :meth:`coupling_measure` on the parent mesh.
+        inside a codim-1 integral) and use :meth:`facet_measure` on the parent mesh.
 
         For a regular volume subdomain both measures are on the parent mesh and the
         whole formulation ends up in ``subdomain.F``. For a manifold subdomain they are
@@ -2536,13 +2693,11 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 f"not {self.mesh.coordinate_system}"
             )
         dx = self.subdomain_measure(subdomain)
-        dx_grad = dx
         # the self terms are integrated over subdomain's own mesh, so their coefficients
         # must live there too -- for a manifold that is its submesh, not the parent mesh
         dt = self.subdomain_dt(subdomain) if self.settings.transient else None
 
-        form = 0
-        form_grad = 0
+        self_form = 0
         form_coupling = 0
         # add diffusion and time derivative for each species
         for spe in self.species:
@@ -2553,32 +2708,52 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             v = spe.subdomain_to_test_function[subdomain]
 
             if self.settings.transient:
-                form += ((u - u_n) / dt) * v * dx
+                self_form += ((u - u_n) / dt) * v * dx
 
             if spe.mobile:
                 D = self.diffusion_coefficient(subdomain, spe)
                 match self.mesh.coordinate_system:
                     case CoordinateSystem.CARTESIAN:
-                        form_grad += ufl.dot(D * ufl.grad(u), ufl.grad(v)) * dx_grad
+                        self_form += ufl.dot(D * ufl.grad(u), ufl.grad(v)) * dx
                     case CoordinateSystem.CYLINDRICAL:
                         r = ufl.SpatialCoordinate(self.mesh.mesh)[0]
-                        form_grad += (
-                            r * ufl.dot(D * ufl.grad(u), ufl.grad(v / r)) * dx_grad
-                        )
+                        self_form += r * ufl.dot(D * ufl.grad(u), ufl.grad(v / r)) * dx
                     case CoordinateSystem.SPHERICAL:
                         r = ufl.SpatialCoordinate(self.mesh.mesh)[0]
-                        form_grad += (
-                            r**2
-                            * ufl.dot(D * ufl.grad(u), ufl.grad(v / r**2))
-                            * dx_grad
+                        self_form += (
+                            r**2 * ufl.dot(D * ufl.grad(u), ufl.grad(v / r**2)) * dx
                         )
                     case _:
                         raise ValueError(
                             f"Unsupported coordinate system {self.mesh.coordinate_system}"  # noqa: E501
                         )
 
-        # reactions are expanded into particle sources (_unpacked_sources, see
-        # create_sources_from_reactions), so they are handled by the source loop
+        # add drift (advection, Soret, electromigration)
+        for drift_term in self.drift_terms:
+            if drift_term.subdomain != subdomain:
+                continue
+
+            for spe in drift_term.species:
+                velocity = drift_term.drift_velocity(
+                    D=self.diffusion_coefficient(subdomain, spe),
+                    temperature=self.subdomain_temperature(subdomain),
+                )
+                # unlike the base class this one does skip a zero term, because
+                # self_form may have no other integral: a manifold that carries drift
+                # and nothing else would end up a form with no arguments, which
+                # compiles but cannot be assembled
+                if _drift.warn_if_no_effect(drift_term, spe, velocity):
+                    continue
+                # on a manifold both grad(c) and grad(w) are tangential, so the form
+                # already picks out the tangential part of the velocity
+                self_form += _drift.drift_form(
+                    concentration=spe.subdomain_to_solution[subdomain],
+                    test_function=spe.subdomain_to_test_function[subdomain],
+                    velocity=velocity,
+                    dx=dx,
+                    coordinate_system=self.mesh.coordinate_system,
+                    mesh=self.mesh.mesh,
+                )
 
         # add fluxes. These are always parent-mesh integrals: a flux on a manifold
         # subdomain mixes the bulk and manifold fields, so it goes into form_coupling
@@ -2606,59 +2781,34 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     )
                     form_coupling += bc.weak_formulation(u, v, self.ds, D)
 
+            # let drift carry the species out where the user says it flows out
+            if isinstance(bc, boundary_conditions.OutflowBC):
+                outflow = self.outflow_form(bc, subdomain)
+                if outflow is not None:
+                    self_form += outflow
+
         # add volumetric sources
+        # reactions are expanded into particle sources (_unpacked_sources, see
+        # create_sources_from_reactions), so they are handled by the source loop
         for source in self._unpacked_sources:
             if source.volume != subdomain:
                 continue
             v = source.species.subdomain_to_test_function[subdomain]
-            foreign = self.foreign_species(source, subdomain) if is_manifold else []
-            if foreign:
+            bulk = self.source_coupling_side(source) if is_manifold else None
+            if bulk is not None:
                 # a source on a manifold that reads a bulk concentration: the exchange
                 # half that feeds the manifold. It must be integrated on the parent
                 # mesh, and restricted to the side the bulk species lives on
-                bulk = self.coupling_side(subdomain, foreign[0])
                 restriction = self.restriction_of(subdomain, bulk)
                 form_coupling -= (
                     self.restrict(source.value.fenics_object, restriction)
                     * self.restrict(v, restriction)
-                    * self.coupling_measure(subdomain)
+                    * self.coupling_measure(subdomain, bulk)
                 )
             else:
-                form -= source.value.fenics_object * v * dx
-
-        # add drift (advection, Soret, electromigration)
-        for drift_term in self.drift_terms:
-            if drift_term.subdomain != subdomain:
-                continue
-
-            for spe in drift_term.species:
-                velocity = drift_term.drift_velocity(
-                    D=self.diffusion_coefficient(subdomain, spe),
-                    temperature=self.subdomain_temperature(subdomain),
-                )
-                if _drift.warn_if_no_effect(drift_term, spe, velocity):
-                    continue
-                # on a manifold both grad(c) and grad(w) are tangential, so the form
-                # already picks out the tangential part of the velocity
-                form_grad += _drift.drift_form(
-                    concentration=spe.subdomain_to_solution[subdomain],
-                    test_function=spe.subdomain_to_test_function[subdomain],
-                    velocity=velocity,
-                    dx=dx_grad,
-                    coordinate_system=self.mesh.coordinate_system,
-                    mesh=self.mesh.mesh,
-                )
-
-        # let drift carry the species out where the user says it flows out
-        for bc in self.boundary_conditions:
-            if not isinstance(bc, boundary_conditions.OutflowBC):
-                continue
-            outflow = self.outflow_form(bc, subdomain)
-            if outflow is not None:
-                form_grad += outflow
+                self_form -= source.value.fenics_object * v * dx
 
         # store the form(s) in the subdomain object
-        self_form = form + form_grad
         if is_manifold:
             subdomain.F = form_coupling
             # self_form is still the integer 0 if the manifold carries no equation of
@@ -2928,6 +3078,41 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
         gas_species.F = form
 
+    def interface_species(self, interface: _subdomain.Interface):
+        """The mobile species whose continuity ``interface`` enforces.
+
+        An interface condition relates the two solutions of one species across the
+        facets, so it applies to a species that has a solution on both of its volume
+        subdomains. In a model with codim-1 subdomains most species do not: a
+        manifold's own species lives on a subdomain that is not a volume of any
+        interface, and a bulk species may be confined to one side of a manifold. Those
+        are simply not part of this interface's condition.
+
+        A species present on exactly one of the two sides is the ambiguous case. It is
+        either deliberately absent from the neighbouring material or a subdomain
+        missing from its ``subdomains``, and only the user can tell which, so it is
+        skipped with a warning rather than silently.
+        """
+        subdomain_0, subdomain_1 = interface.subdomains
+        coupled = []
+        for species in self.species:
+            if not species.mobile:
+                continue
+            present = [s for s in (subdomain_0, subdomain_1) if s in species.subdomains]
+            if len(present) == 2:
+                coupled.append(species)
+            elif present:
+                missing = subdomain_1 if present[0] is subdomain_0 else subdomain_0
+                warnings.warn(
+                    f"species {species.name} lives on volume subdomain "
+                    f"{present[0].id} but not on {missing.id}, the other side of "
+                    f"interface {interface.id}, so the interface condition is not "
+                    "applied to it. Add the missing subdomain to its `subdomains` if "
+                    "it was meant to be continuous across that interface.",
+                    stacklevel=2,
+                )
+        return coupled
+
     def create_formulation(self):
         """Takes all the formulations for each subdomain and adds the interface
         conditions.
@@ -2935,24 +3120,15 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         Finally compute the jacobian matrix and store it in the ``J`` attribute,
         adds the ``entity_maps`` to the forms and store them in the ``forms`` attribute
         """
-        mesh = self.mesh.mesh
-        mt = self.facet_meshtags
+        # the interfaces were wired and their integration data folded into the shared
+        # dS measure in initialise(), so that an interface and an interior manifold
+        # bounding the same volume subdomain still agree on their subdomain data
+        dInterface = self.interior_facet_measure
 
-        for interface in self.interfaces:
-            interface.mesh = mesh
-            interface.mt = mt
-
-        integral_data = [
-            interface.compute_mapped_interior_facet_data(self.volume_meshtags)
-            for interface in self.interfaces
-        ]
-        dInterface = ufl.Measure("dS", domain=mesh, subdomain_data=integral_data)
-
-        all_mobile_species = [spe for spe in self.species if spe.mobile]
         for interface in self.interfaces:
             F_0, F_1 = interface.get_formulation(
                 dInterface,
-                species=all_mobile_species,
+                species=self.interface_species(interface),
                 temperature=self.temperature_fenics,
             )
             subdomain_0, subdomain_1 = interface.subdomains
@@ -3201,10 +3377,12 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
           ``export.field`` lives on, integrated on that manifold's submesh.
 
         Returns:
-            ``(volume, mesh, measure, restriction, entity_maps)`` where ``volume`` is
-            the subdomain whose solution and material the quantity reads, and ``mesh``
-            the one the integral is taken on -- the parent mesh except on the boundary
-            of a manifold.
+            ``(volume, mesh, measure, subdomain_id, restriction, entity_maps)`` where
+            ``volume`` is the subdomain whose solution and material the quantity reads,
+            ``mesh`` the one the integral is taken on -- the parent mesh except on the
+            boundary of a manifold -- and ``subdomain_id`` the id to index ``measure``
+            with, which is the surface's own except on a side of a manifold adjacent to
+            more than two volume subdomains (see :meth:`coupling_measure_id`).
 
         Raises:
             ValueError: if the volume subdomain given as a surface is not a manifold, or
@@ -3234,7 +3412,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             return (
                 volume,
                 parent,
-                self.unindexed_coupling_measure(surface),
+                self.facet_measure(surface),
+                self.coupling_measure_id(surface, volume),
                 self.restriction_of(surface, volume),
                 entity_maps,
             )
@@ -3246,24 +3425,70 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 manifold,
                 manifold.submesh,
                 self._manifold_boundary_measure(surface, manifold),
+                surface.id,
                 None,
                 None,
             )
 
-        return self.surface_to_volume[surface], parent, self.ds, None, entity_maps
+        return (
+            self.surface_to_volume[surface],
+            parent,
+            self.ds,
+            surface.id,
+            None,
+            entity_maps,
+        )
+
+    def _export_context(
+        self, export
+    ) -> tuple[list[fem.Function], list[str], dolfinx.mesh.Mesh]:
+        """Resolve what a field export should write.
+
+        Species and custom fields live on submeshes here, so each export writes on the
+        mesh of its own subdomain rather than on the parent mesh.
+
+        Args:
+            export: the export to resolve
+
+        Returns:
+            the functions to write, the name to store each one under, and the mesh
+            they live on
+        """
+        if isinstance(export, exports.SpeciesExport):
+            functions = export.get_functions()
+            # NOTE: names are deliberately un-suffixed (`H`, not `H_1`) even though the
+            # collapsed functions are named per subdomain: checkpoints written before
+            # this refactor used the bare species name and are read back by name.
+            names = [species.name for species in export.field]
+            return functions, names, functions[0].function_space.mesh
+        elif isinstance(export, exports.TemperatureExport):
+            assert isinstance(self.temperature_fenics, fem.Function), (
+                "Temperature must be space-dependent to be exported as "
+                "TemperatureExport"
+            )
+            return (
+                [self.temperature_fenics],
+                [self.temperature_fenics.name],
+                self.temperature_fenics.function_space.mesh,
+            )
+        elif isinstance(export, exports.CustomFieldExport):
+            # need to find an appropriate function space on the right submesh
+            V = self.subdomain_to_V_CG1[export.subdomain]
+            export.function = fem.Function(V)
+            export.set_dolfinx_expression(
+                # need to pass the right temperature
+                temperature=self.temperature_fenics,
+                time=self.t,
+            )
+            return (
+                [export.function],
+                [export.filename.stem],
+                export.function.function_space.mesh,
+            )
+        raise NotImplementedError(f"Export type {type(export)} not implemented")
 
     def check_export_compatibility(self):
-        """Rejects the derived quantities that cannot yet be computed on a
-        codimensional subdomain.
-
-        Only ``CustomQuantity`` on a codim-2 surface is left. Every other quantity now
-        resolves that case: ``SurfaceFlux`` through :meth:`export_surface_context`, and
-        the field quantities through :meth:`measure_for` and :meth:`entities_for`, both
-        of which reach the bounded manifold via :meth:`manifold_of`. That resolution is
-        keyed on the quantity's ``field``, and a ``CustomQuantity`` has none -- its
-        integrand may name any number of species -- so there is nothing to pick the
-        manifold with when a surface bounds more than one.
-        """
+        """Reject codim-2 custom quantities, whose manifold cannot be inferred."""
         for export in self.exports:
             if not isinstance(export, exports.CustomQuantity):
                 continue
@@ -3295,49 +3520,25 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
     def initialise_exports(self):
         self.check_export_compatibility()
+        # formats that hold several meshes in one file (vtkhdf) let exports share a
+        # filename: the first one to claim it truncates, the rest append as new blocks
+        initialised_files = set()
         for export in self.exports:
-            if isinstance(export, exports.VTXSpeciesExport):
-                functions = export.get_functions()
-                if not export._checkpoint:
-                    export.writer = dolfinx.io.VTXWriter(
-                        functions[0].function_space.mesh.comm,
-                        export.filename,
-                        functions,
-                        engine="BP5",
-                    )
-                else:
-                    io4dolfinx.write_mesh(
-                        filename=export.filename,
-                        mesh=functions[0].function_space.mesh,
-                        backend="adios2",
-                    )
-            elif isinstance(export, exports.VTXTemperatureExport):
-                assert isinstance(self.temperature_fenics, fem.Function), (
-                    "Temperature must be space-dependent to be exported as "
-                    "VTXTemperatureExport"
+            if isinstance(export, exports.FieldExportBase):
+                self._register_export_milestones(export)
+                functions, names, mesh = self._export_context(export)
+                # exports on different submeshes share a file as separate blocks
+                subdomain = getattr(export, "subdomain", None)
+                export.define_writer(
+                    functions,
+                    names,
+                    mesh,
+                    block_name=(
+                        "mesh" if subdomain is None else f"subdomain_{subdomain.id}"
+                    ),
+                    overwrite=export.filename not in initialised_files,
                 )
-                export.writer = dolfinx.io.VTXWriter(
-                    self.temperature_fenics.function_space.mesh.comm,
-                    export.filename,
-                    self.temperature_fenics,
-                    engine="BP5",
-                )
-            elif isinstance(export, exports.CustomFieldExport):
-                # need to find an appropriate function space on the right submesh
-                V = self.subdomain_to_V_CG1[export.subdomain]
-                export.function = fem.Function(V)
-                export.set_dolfinx_expression(
-                    # need to pass the right temperature
-                    temperature=self.temperature_fenics,
-                    time=self.t,
-                )
-
-                export.writer = dolfinx.io.VTXWriter(
-                    comm=export.function.function_space.mesh.comm,
-                    filename=export.filename,
-                    output=export.function,
-                    engine="BP5",
-                )
+                initialised_files.add(export.filename)
 
         # compute diffusivity function for surface fluxes
         # for the discontinuous case, we don't use D_global as in
@@ -3359,6 +3560,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 # NOTE: maybe we need to make sure there are no functionspace clashes?
 
                 export.D = D
+                export.coordinate_system = self.mesh.coordinate_system
 
                 if self.drift_terms and isinstance(export, exports.SurfaceFlux):
                     export.drift_velocity = self.drift_velocity_in(
@@ -3399,41 +3601,17 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     current_time=float(self.t), times=export.times
                 ):
                     continue
-            # handle VTX exports
-            if isinstance(export, exports.ExportBaseClass):
-                if isinstance(export, exports.CustomFieldExport):
-                    # update internal function
-                    export.function.interpolate(export.dolfinx_expression)
-                    export.writer.write(float(self.t))
-                elif isinstance(export, exports.VTXSpeciesExport):
-                    if export._checkpoint:
-                        for species in export.field:
-                            post_processing_solution = (
-                                species.subdomain_to_post_processing_solution[
-                                    export._subdomain
-                                ]
-                            )
-                            io4dolfinx.write_function(
-                                filename=export.filename,
-                                u=post_processing_solution,
-                                time=float(self.t),
-                                name=species.name,
-                            )
-                    else:
-                        export.writer.write(float(self.t))
-                elif isinstance(export, exports.VTXTemperatureExport):
-                    export.writer.write(float(self.t))
-                else:
-                    raise NotImplementedError(
-                        f"Export type {type(export)} not implemented"
-                    )
+            # handle field exports
+            if isinstance(export, exports.FieldExportBase):
+                export.update()
+                export.write(float(self.t))
             # handle derived quantities
             if isinstance(export, exports.SurfaceFlux):
                 # SurfaceFlux is not a FieldQuantity: it keeps its own `surface`
                 # attribute, and since the drift PR that surface may be a manifold or
                 # the boundary of one, so it needs the full export context rather than
                 # the parent ds
-                volume, _, measure, restriction, entity_maps = (
+                volume, _, measure, subdomain_id, restriction, entity_maps = (
                     self.export_surface_context(export)
                 )
                 export.compute(
@@ -3441,8 +3619,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     ds=measure,
                     entity_maps=entity_maps,
                     restriction=restriction,
+                    subdomain_id=subdomain_id,
                 )
-
             elif isinstance(export, exports.FieldQuantity):
                 self.compute_derived_quantity(export)
 
@@ -3508,6 +3686,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 # a manifold mirrors a constant temperature onto its own submesh, and
                 # that mirror has to follow the parent constant
                 for subdomain in self.manifold_subdomains:
+                    # NOTE: current limitation for manifolds: temperature on the
+                    # manifold has to be homogeneous (ie. fem.Constant)
                     subdomain.sub_T.value = float(self.temperature_fenics)
 
     def iterate(self):
@@ -3565,9 +3745,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
     def __del__(self):
         for export in self.exports:
-            if isinstance(export, exports.ExportBaseClass):
-                if hasattr(export, "writer") and export.writer is not None:
-                    export.writer.close()
+            if isinstance(export, exports.FieldExportBase):
+                export.close()
 
 
 class HydrogenTransportProblemDiscontinuousChangeVar(HydrogenTransportProblem):
@@ -3658,8 +3837,8 @@ class HydrogenTransportProblemDiscontinuousChangeVar(HydrogenTransportProblem):
                 velocity = drift_term.drift_velocity(
                     D=D, temperature=self.temperature_fenics
                 )
-                if _drift.warn_if_no_effect(drift_term, spe, velocity):
-                    continue
+                # assembled even when identically zero, as in the base class
+                _drift.warn_if_no_effect(drift_term, spe, velocity)
                 self.formulation += _drift.drift_form(
                     concentration=conc,
                     test_function=spe.test_function,

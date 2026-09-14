@@ -38,6 +38,15 @@ from .enclosure.openings import (
 )
 from .exports.custom_quantity import CustomQuantity
 from .exports.derived_quantity import DerivedQuantity
+from .exports.field import (
+    CustomFieldExport,
+    FieldExportBase,
+    ReactionRateExport,
+    SpeciesExport,
+    TemperatureExport,
+    VTXSpeciesExport,
+    VTXTemperatureExport,
+)
 from .exports.gas_pressure import GasPressure
 from .exports.legacy_quantities import (
     AverageSurface,
@@ -62,13 +71,6 @@ from .exports.quantity import (
 from .exports.surface_flux import SurfaceFlux
 from .exports.surface_quantity import SurfaceQuantity
 from .exports.volume_quantity import VolumeQuantity
-from .exports.vtx import (
-    CustomFieldExport,
-    ExportBaseClass,
-    ReactionRateExport,
-    VTXSpeciesExport,
-    VTXTemperatureExport,
-)
 from .exports.xdmf import XDMFExport
 from .heat_transfer_problem import HeatTransferProblem
 from .helpers import (

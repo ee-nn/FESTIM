@@ -141,9 +141,10 @@ def test_create_value_fenics_initial_temperature(input_value, expected_type):
     assert isinstance(init_cond.expr_fenics, expected_type)
 
 
-def test_checkpointing_single_species(tmpdir):
+@pytest.mark.parametrize("backend, ext", [("adios2", ".bp"), ("h5py", ".h5")])
+def test_checkpointing_single_species(tmpdir, backend, ext):
     """Writes a P1 function to a file and reads it back in as initial condition for one
-    species."""
+    species. Covers both checkpoint backends."""
     # build initial condition
     mesh = dolfinx.mesh.create_unit_square(
         MPI.COMM_WORLD, nx=6, ny=6, cell_type=dolfinx.cpp.mesh.CellType.quadrilateral
@@ -157,10 +158,12 @@ def test_checkpointing_single_species(tmpdir):
 
     u_ref = dolfinx.fem.Function(V)
     u_ref.interpolate(f)
-    filename = tmpdir.join("initial_condition.bp")
+    filename = tmpdir.join(f"initial_condition{ext}")
 
-    io4dolfinx.write_mesh(filename, mesh)
-    io4dolfinx.write_function(filename, u_ref, name="my_function", time=0.2)
+    io4dolfinx.write_mesh(filename, mesh, backend=backend)
+    io4dolfinx.write_function(
+        filename, u_ref, name="my_function", time=0.2, backend=backend
+    )
 
     # create problem
     my_problem = F.HydrogenTransportProblem()
@@ -173,7 +176,7 @@ def test_checkpointing_single_species(tmpdir):
     my_problem.subdomains = [vol]
 
     function_initial_value = F.read_function_from_file(
-        filename=filename, name="my_function", timestamp=0.2, mesh=mesh
+        filename=filename, name="my_function", timestamp=0.2, mesh=mesh, backend=backend
     )
     my_problem.initial_conditions = [
         F.InitialConcentration(value=function_initial_value, species=H, volume=vol)
@@ -188,6 +191,18 @@ def test_checkpointing_single_species(tmpdir):
     # test that the initial condition is correct
     u_prev = my_problem.u_n.sub(0)
     np.testing.assert_allclose(u_ref.x.array, u_prev.x.array, atol=1e-14)
+
+
+def test_read_function_from_file_rejects_non_checkpoint_backend():
+    """Only the backends that can store a checkpoint are accepted.
+
+    The visualisation backends store nodal values and no dofmap, so io4dolfinx cannot
+    read a function back from them; catch that here rather than deep inside the backend.
+    """
+    with pytest.raises(ValueError, match="Unknown backend 'vtkhdf'"):
+        F.read_function_from_file(
+            filename="unused.vtkhdf", name="H", timestamp=0.0, backend="vtkhdf"
+        )
 
 
 def test_checkpointing_multiple_species(tmpdir):
@@ -381,6 +396,60 @@ def test_initial_condition_discontinuous():
     assert np.allclose(prev_solution_spe2_left, 0)
     assert np.allclose(prev_solution_spe1_right, 0)
     assert np.allclose(prev_solution_spe2_right, intial_cond_value)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (lambda x: 1 + 2 * x[0], lambda x: 1 + 2 * x),
+        (lambda x, T: x[0] + T, lambda x: x + 300 + 10 * x),
+    ],
+)
+def test_initial_condition_discontinuous_space_dependent(value, expected):
+    """Test that a space (and temperature) dependent initial condition is applied on
+    the submesh of its volume only, in the discontinuous case."""
+
+    # BUILD
+    my_model = F.HydrogenTransportProblemDiscontinuous()
+
+    vertices = np.concatenate((np.linspace(0, 0.5, 50), np.linspace(0.5, 1, 50)))
+    my_model.mesh = F.Mesh1D(vertices)
+
+    left_surf = F.SurfaceSubdomain1D(id=1, x=0)
+    right_surf = F.SurfaceSubdomain1D(id=2, x=1)
+
+    material = F.Material(D_0=1e-01, E_D=0, K_S_0=1, E_K_S=0)
+    vol1 = F.VolumeSubdomain1D(id=1, borders=[0, 0.5], material=material)
+    vol2 = F.VolumeSubdomain1D(id=2, borders=[0.5, 1], material=material)
+    my_model.subdomains = [vol1, vol2, left_surf, right_surf]
+
+    spe = F.Species("H", mobile=True, subdomains=[vol1, vol2])
+    my_model.species = [spe]
+
+    my_model.interfaces = [
+        F.Interface(id=3, subdomains=[vol1, vol2], penalty_term=1000)
+    ]
+
+    # a temperature given as a function lives on the parent mesh, the initial
+    # condition on the submesh: the sub_T of the volume has to be used (issue #1007)
+    my_model.temperature = lambda x: 300 + 10 * x[0]
+
+    my_model.initial_conditions = [
+        F.InitialConcentration(value=value, species=spe, volume=vol1),
+    ]
+
+    my_model.settings = F.Settings(
+        atol=1e-10, rtol=1e-10, final_time=5, transient=True, stepsize=F.Stepsize(0.1)
+    )
+
+    # RUN
+    my_model.initialise()
+
+    # TEST
+    V_vol1, dofs_vol1 = vol1.u_n.function_space.sub(0).collapse()
+    x_vol1 = V_vol1.tabulate_dof_coordinates()[:, 0]
+
+    assert np.allclose(vol1.u_n.x.array[dofs_vol1], expected(x_vol1))
 
 
 def test_initial_condition_continuous_multimaterial():

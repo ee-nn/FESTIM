@@ -45,6 +45,8 @@ def as_mapped_function(
     temperature: fem.Function | fem.Constant | ufl.core.expr.Expr | None = None,
     species_dependent_value: dict[str, "Species"] | None = None,
     subdomain: "VolumeSubdomain | None" = None,
+    mesh: dolfinx.mesh.Mesh | None = None,
+    foreign_subdomain: "VolumeSubdomain | None" = None,
 ) -> ufl.core.expr.Expr:
     """Maps a user given callable function to the mesh, time, temperature or the
     concentration of other species within festim as needed.
@@ -74,6 +76,10 @@ def as_mapped_function(
         kwargs["x"] = x
     if "T" in arguments:
         kwargs["T"] = temperature
+    if "x" in arguments:
+        # the spatial coordinate must come from the mesh the integral is assembled
+        # over, which is not always the mesh the unknown lives on
+        kwargs["x"] = ufl.SpatialCoordinate(mesh or function_space.mesh)
 
     for name, species in (species_dependent_value or {}).items():
         # only pass the species the callable actually declares, as done above for
@@ -83,33 +89,43 @@ def as_mapped_function(
         if species.concentration is not None:
             kwargs[name] = species.concentration
         else:  # discontinuous case: the species has one solution per subdomain
-            kwargs[name] = solution_on(species, subdomain)
+            kwargs[name] = solution_on(species, subdomain, foreign_subdomain)
 
     return value(**kwargs)
 
 
-def solution_on(species: "Species", subdomain: "VolumeSubdomain"):
+def solution_on(
+    species: "Species",
+    subdomain: "VolumeSubdomain",
+    foreign_subdomain: "VolumeSubdomain | None" = None,
+):
     """The solution of ``species`` to use in an expression assembled for ``subdomain``.
 
     Usually the species lives on ``subdomain`` and this is just a dictionary lookup.
     In a codimensional coupling the expression deliberately reaches across meshes -- a
     source on a manifold subdomain depending on the bulk concentration, say -- and the
-    species then has a single solution elsewhere, which is the one to use.
+    solution to read is the one on the side of the manifold the term belongs to. The
+    caller knows which side that is and passes it as ``foreign_subdomain``; failing
+    that, a species with a single solution has only one it could mean.
 
     Args:
         species: the species whose solution is needed
         subdomain: the volume subdomain the expression is assembled for
+        foreign_subdomain: where to read a species that does not live on ``subdomain``,
+            optional
 
     Returns:
         The ufl expression of the species solution
 
     Raises:
         ValueError: if the species lives on several subdomains, none of which is
-            ``subdomain``, so the choice would be arbitrary
+            ``subdomain`` or ``foreign_subdomain``, so the choice would be arbitrary
     """
     solutions = species.subdomain_to_solution
     if subdomain in solutions:
         return solutions[subdomain]
+    if foreign_subdomain in solutions:
+        return solutions[foreign_subdomain]
     if len(solutions) == 1:
         return next(iter(solutions.values()))
     others = [s.id for s in solutions]
@@ -309,6 +325,8 @@ class Value:
         temperature: fem.Function | fem.Constant | ufl.core.expr.Expr | None = None,
         up_to_ufl_expr: bool | None = False,
         subdomain: "VolumeSubdomain | None" = None,
+        mesh: dolfinx.mesh.Mesh | None = None,
+        foreign_subdomain: "VolumeSubdomain | None" = None,
     ):
         """Converts a user given value to a relevent fenics object depending on the type
         of the value provided.
@@ -322,7 +340,21 @@ class Value:
             subdomain: the volume subdomain on which the value is evaluated. Only needed
                 in the discontinuous case to select the correct species solution,
                 optional
+            mesh: the mesh the integral carrying this value is assembled over.
+                Defaults to ``function_space.mesh``. Pass it explicitly when the two
+                differ -- a term coupling a codim-1 subdomain to the bulk is a
+                parent-mesh facet integral although its unknowns live on submeshes --
+                so that ``ufl.SpatialCoordinate`` and any ``fem.Constant`` are built
+                on the integration domain, not on the space of the unknown. Only
+                meaningful with ``up_to_ufl_expr=True``.
+            foreign_subdomain: where to read a species that does not live on
+                ``subdomain``. A term coupling a codim-1 subdomain to the bulk reaches
+                into one particular side of it, and a bulk species defined on several
+                subdomains has a solution on each; see :func:`solution_on`. Optional.
         """
+        if mesh is None and function_space is not None:
+            mesh = function_space.mesh
+
         if isinstance(
             self.input_value, fem.Constant | fem.Function | ufl.core.expr.Expr
         ):
@@ -338,7 +370,6 @@ class Value:
 
         elif callable(self.input_value):
             args = self.input_value.__code__.co_varnames
-            # if only t is an argument, create constant object
             if (
                 "t" in args
                 and "x" not in args
@@ -350,22 +381,28 @@ class Value:
                         "self.value should return a float or an int, not "
                         + f"{type(self.input_value(t=float(t)))} "
                     )
-
                 self.fenics_object = as_fenics_constant(
-                    value=self.input_value(t=float(t)), mesh=function_space.mesh
+                    value=self.input_value(t=float(t)), mesh=mesh
                 )
-
             elif up_to_ufl_expr:
                 self.fenics_object = as_mapped_function(
                     value=self.input_value,
                     function_space=function_space,
+                    mesh=mesh,
                     t=t,
                     temperature=temperature,
                     species_dependent_value=self.species_dependent_value,
                     subdomain=subdomain,
+                    foreign_subdomain=foreign_subdomain,
                 )
 
             else:
+                if mesh is not function_space.mesh:
+                    raise ValueError(
+                        "a value interpolated into `function_space` must be built on "
+                        "that space's mesh; `mesh` may only differ from "
+                        "`function_space.mesh` with `up_to_ufl_expr=True`."
+                    )
                 self.fenics_interpolation_expression, self.fenics_object = (
                     as_fenics_interp_expr_and_function(
                         value=self.input_value,
@@ -472,7 +509,7 @@ def convergenceTest(snes, it, norms):
         return snes.ConvergedReason.CONVERGED_FNORM_ABS
     elif f / _residual0 < rtol:
         return snes.ConvergedReason.CONVERGED_FNORM_RELATIVE
-    elif gnorm < stol and it > 0:
+    elif gnorm < stol * _xnorm and it > 0:
         return snes.ConvergedReason.CONVERGED_SNORM_RELATIVE
     else:
         return snes.ConvergedReason.ITERATING
@@ -480,11 +517,13 @@ def convergenceTest(snes, it, norms):
 
 def SnesMonitor(snes, iter, rnorm):
     global _prev_xnorm
-    if MPI.COMM_WORLD.rank == 0:
-        rtol, atol, stol, _max_its = snes.getTolerances()
-        x = snes.getSolution()
-        xnorm = x.norm()
+    # Vec.norm() is collective: every rank must call it, so it cannot sit behind
+    # a rank 0 guard. Only the logging below is rank 0 only.
+    rtol, atol, stol, _max_its = snes.getTolerances()
+    x = snes.getSolution()
+    xnorm = x.norm()
 
+    if MPI.COMM_WORLD.rank == 0:
         stepsize_rel = abs(xnorm - _prev_xnorm) / xnorm if iter > 0 else float("inf")
         if iter == 0:
             relative_residual = float("inf")
@@ -496,8 +535,8 @@ def SnesMonitor(snes, iter, rnorm):
             f"SNES {iter=} ; {rnorm=:.5e} ({atol=}) ; {relative_residual=:.5e} ({rtol=}) ; {stepsize_rel=:.5e} ({stol=:.5e})",  # noqa: E501
         )
 
-        # Update previous xnorm
-        _prev_xnorm = xnorm
+    # Update previous xnorm
+    _prev_xnorm = xnorm
 
 
 def KSPMonitor(ksp, iter, rnorm):
