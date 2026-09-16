@@ -190,7 +190,6 @@ def test_interior_manifold_conserves_particles():
     assert np.isclose(into_gamma_from_left, through_left_wall, rtol=1e-6)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_inside_a_single_subdomain():
     """A manifold can sit inside one volume subdomain rather than between two.
 

@@ -1911,7 +1911,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
         Raises:
             ValueError: if the manifold mixes interior and exterior facets, which would
-                need two measures at once
+                need two measures at once, or an owned internal facet lacks its
+                second adjacent cell (shared-facet ghosting is required)
         """
         if manifold not in self._manifold_is_interior:
             mesh = self.mesh.mesh
@@ -1919,11 +1920,22 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             mesh.topology.create_connectivity(tdim - 1, tdim)
             facet_to_cell = mesh.topology.connectivity(tdim - 1, tdim)
             facets = self.facet_meshtags.find(manifold.id)
+            # Ghost facets can have incomplete adjacency. Count each facet once,
+            # on its owner, and distinguish physical boundaries from partition cuts.
+            facets = facets[facets < mesh.topology.index_map(tdim - 1).size_local]
+            exterior = dolfinx.mesh.exterior_facet_indices(mesh.topology)
             # vectorised: the number of cells a facet connects to is the width of
             # its slice in the adjacency list, and there can be tens of thousands
             # of facets in a manifold
             offsets = facet_to_cell.offsets
             n_cells = offsets[facets + 1] - offsets[facets]
+            missing = (n_cells != 2) & ~np.isin(facets, exterior)
+            if mesh.comm.allreduce(bool(np.any(missing)), op=MPI.LOR):
+                raise ValueError(
+                    f"Internal manifold {manifold.id} needs both adjacent cells on "
+                    "the rank owning each facet. Create or read the mesh with "
+                    "GhostMode.shared_facet ghosting."
+                )
             n_interior = int(np.count_nonzero(n_cells == 2))
 
             comm = mesh.comm

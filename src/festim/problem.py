@@ -9,6 +9,7 @@ import tqdm.auto
 import ufl
 
 import festim as F
+from festim.helpers import meshtags_with_ghosts
 from festim.mesh.mesh import Mesh as _Mesh
 from festim.source import SourceBase as _SourceBase
 from festim.subdomain.volume_subdomain import (
@@ -166,6 +167,16 @@ class ProblemBase:
                 volume_subdomains=self.volume_subdomains,
                 # if self has attribute interfaces pass it
                 interfaces=getattr(self, "interfaces", None),
+            )
+
+        # Imported and user-provided tags may cover owned entities only. Submesh
+        # extraction and interior-facet integration also need the ghost tags.
+        if self.manifold_subdomains:
+            self.facet_meshtags = meshtags_with_ghosts(
+                self.mesh.mesh, self.facet_meshtags
+            )
+            self.volume_meshtags = meshtags_with_ghosts(
+                self.mesh.mesh, self.volume_meshtags
             )
 
         # check volume ids are unique

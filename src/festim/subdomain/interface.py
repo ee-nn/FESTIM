@@ -5,7 +5,6 @@ import dolfinx
 import numpy as np
 import ufl
 from dolfinx.cpp.fem import compute_integration_domains
-from scifem.mesh import compute_interface_data
 
 from festim.material import SolubilityLaw
 from festim.subdomain.volume_subdomain import VolumeSubdomain
@@ -50,15 +49,19 @@ def compute_ordered_interior_facet_data(
     topology = cell_tags.topology
     topology.create_connectivity(topology.dim - 1, topology.dim)
 
-    # scifem orders the two cells of a facet by their cell tag, lowest one on "+"
-    integration_data = compute_interface_data(cell_tags, facet_tags.find(tag))
-    if subdomain_plus.id > subdomain_minus.id:
-        integration_data = integration_data[:, [2, 3, 0, 1]]
+    integration_data = compute_integration_domains(
+        dolfinx.fem.IntegralType.interior_facet, topology, facet_tags.find(tag)
+    ).reshape(-1, 4)
+    cell_map = topology.index_map(topology.dim)
+    lookup = np.full(cell_map.size_local + cell_map.num_ghosts, -1, dtype=np.int32)
+    lookup[cell_tags.indices] = cell_tags.values
+    swap = lookup[integration_data[:, 2]] == subdomain_plus.id
+    integration_data[swap] = integration_data[swap][:, [2, 3, 0, 1]]
 
     # A wrong ordering is silent, so rather than trust the tags, check that the two
     # cells of every facet really do lie one in each subdomain. A bare assert would
     # vanish under ``python -O``.
-    sides = cell_tags.values[integration_data[:, [0, 2]]]
+    sides = lookup[integration_data[:, [0, 2]]]
     if not (sides == [subdomain_plus.id, subdomain_minus.id]).all():
         raise ValueError(
             f"facets tagged {tag} do not all separate volume subdomain "

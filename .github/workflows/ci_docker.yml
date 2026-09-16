@@ -40,6 +40,14 @@ jobs:
       - name: Run tests
         run: |
           xvfb-run -a python3 -m pytest test/ --cov festim --cov-report xml --cov-report term
+
+      - name: Check distributed manifold topology and coupling
+        timeout-minutes: 5
+        env:
+          OMPI_ALLOW_RUN_AS_ROOT: "1"
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+        run: |
+          mpirun -np 2 python3 -m pytest -q test/system_tests/test_codim1_parallel.py test/system_tests/test_codim1_interface.py::test_interior_manifold_inside_a_single_subdomain
       
       - name: Upload to codecov
         uses: codecov/codecov-action@v7

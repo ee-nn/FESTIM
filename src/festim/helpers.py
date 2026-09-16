@@ -13,6 +13,29 @@ if TYPE_CHECKING:
     from festim.subdomain.volume_subdomain import VolumeSubdomain
 
 
+def meshtags_with_ghosts(mesh, tags):
+    """Copy owner tags to ghost entities, preserving sparse and zero-valued tags.
+
+    Collective on the mesh communicator. Owners are authoritative, as for meshtags
+    read from a distributed mesh file; ghost-only markings are not input tags.
+    """
+    index_map = mesh.topology.index_map(tags.dim)
+    values = dolfinx.la.vector(index_map, dtype=tags.values.dtype)
+    present = dolfinx.la.vector(index_map, dtype=np.int32)
+    values.array[:] = 0
+    present.array[:] = 0
+    owned = tags.indices < index_map.size_local
+    indices = tags.indices[owned]
+    values.array[indices] = tags.values[owned]
+    present.array[indices] = 1
+    values.scatter_forward()
+    present.scatter_forward()
+    indices = np.flatnonzero(present.array).astype(np.int32)
+    result = dolfinx.mesh.meshtags(mesh, tags.dim, indices, values.array[indices])
+    result.name = tags.name
+    return result
+
+
 def as_fenics_constant(
     value: float | int | fem.Constant, mesh: dolfinx.mesh.Mesh
 ) -> fem.Constant:

@@ -17,9 +17,15 @@ On the other hand, the arrays of the solution (``species.solution.x.array``) onl
 
     Not every feature of FESTIM supports parallel runs yet. In particular:
 
-    * Codimensional (manifold) subdomains lying *inside* the mesh (either manifolds through 
-      a single volume subdomain or along the interface between 2+ volume subdomains, see :ref:`Codimensional (manifold) Subdomains`) cannot be used in parallel: ``initialise()``
-      raises an error. Manifolds lying on the outer boundary of the domain are not affected.
+    * Parallel support for codimensional (manifold) subdomains lying *inside* the
+      mesh is experimental (see :ref:`Codimensional (manifold) Subdomains`). Basic
+      steady coupling through one bulk subdomain or between two bulk subdomains
+      is tested under MPI. Broader coupled-solver and derived-quantity validation
+      is still pending. Internal manifold facets require both adjacent cells on
+      their owning rank: create or read the mesh with
+      ``dolfinx.mesh.GhostMode.shared_facet`` ghosting. Missing adjacent cells
+      cause ``initialise()`` to raise an error. Manifolds lying on the outer
+      boundary of the domain are not affected by this requirement.
     * :class:`festim.Profile1DExport` only collects the part of the profile owned by each process, without raising an error.
     * The ``filename`` of derived quantities (:class:`festim.SurfaceFlux`, :class:`festim.TotalVolume`...) is written by every process, so the CSV file contains duplicated rows.
       The ``value`` attribute of these exports is correct.
