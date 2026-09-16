@@ -15,10 +15,12 @@ from mpi4py import MPI
 
 import dolfinx
 import numpy as np
-import pytest
 import ufl
 
 import festim as F
+from festim.mixed_dimensional_assembly import _get_dofmap
+
+from .tools import global_max
 
 WALL_ID, FLUID_ID, INLET_ID, OUTLET_ID, OUTER_ID = 1, 2, 3, 4, 5
 
@@ -92,10 +94,9 @@ def advection_diffusion_along_gamma(n, length=1.0, height=1.0, D=1.0, v_x=1.0):
     # -D c'' + v c' = 0, c(0) = 1, c(length) = 0
     peclet = v_x * length / D
     exact = (np.exp(peclet) - np.exp(v_x * x / D)) / (np.exp(peclet) - 1)
-    return np.max(np.abs(c.x.array - exact))
+    return global_max(np.abs(c.x.array - exact))
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_dirichlet_on_manifold_ends_matches_analytical():
     """Both endpoint values are attained and the profile between them converges."""
     refinements = [10, 20, 40]
@@ -110,7 +111,6 @@ def test_dirichlet_on_manifold_ends_matches_analytical():
     assert errors[-1] < 1e-5, errors
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_pipe_inlet_concentration():
     """The motivating case: a 1D fluid on a 2D pipe wall, fed at the inlet.
 
@@ -186,8 +186,14 @@ def test_pipe_inlet_concentration():
     model.run()
 
     c = c_inf.subdomain_to_post_processing_solution[fluid]
-    order = np.argsort(c.function_space.tabulate_dof_coordinates()[:, 0])
-    profile = c.x.array[order]
+    # Gather owned dofs only, so partition boundaries do not duplicate points.
+    dofmap = _get_dofmap(c.function_space)
+    owned = dofmap.index_map.size_local * dofmap.index_map_bs
+    x = c.function_space.tabulate_dof_coordinates()[:owned, 0]
+    points = np.concatenate(
+        mesh.comm.allgather(np.column_stack((x, c.x.array[:owned])))
+    )
+    profile = points[np.argsort(points[:, 0]), 1]
 
     assert np.isclose(profile[0], c_in, atol=1e-12), (
         "the inlet value is imposed exactly"

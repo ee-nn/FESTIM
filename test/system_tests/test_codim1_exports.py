@@ -108,7 +108,6 @@ def by_title(model):
     return {e.title: e.data[-1] for e in model.exports}
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_quantities_on_an_exterior_manifold():
     """Bulk quantities on the facets of a manifold, and manifold quantities over it.
 
@@ -134,7 +133,6 @@ def test_quantities_on_an_exterior_manifold():
     assert np.isclose(got["Average H_gam volume 2"], 1.0, atol=1e-6)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_flux_on_an_exterior_manifold_matches_the_exchange():
     """The bulk flux on Gamma's facets is the exchange term that drives the coupling.
 
@@ -167,13 +165,13 @@ def test_flux_on_an_exterior_manifold_matches_the_exchange():
                 entity_maps=[sd.cell_map for sd in model.volume_subdomains],
             )
         )
+        weighted = parent.comm.allreduce(weighted, op=MPI.SUM)
         errors.append(abs(weighted - D_O / 2))
 
     rates = [np.log(e0 / e1) / np.log(2) for e0, e1 in pairwise(errors)]
     assert all(r > 1.8 for r in rates), rates
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_flux_on_an_interior_manifold_is_not_silently_zero():
     """The case the parent ``ds`` gets wrong without failing.
 
@@ -238,10 +236,10 @@ def test_flux_on_an_interior_manifold_is_not_silently_zero():
                 entity_maps=[sd.cell_map for sd in model.volume_subdomains],
             )
         )
+        by_hand = parent.comm.allreduce(by_hand, op=MPI.SUM)
         assert np.isclose(by_hand, got[title], atol=1e-10)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_flux_balance():
     """What the manifold takes from one side it gives to the other, at steady state
     with no source on it. This is the check that catches a restriction applied to only
@@ -261,7 +259,6 @@ def test_interior_manifold_flux_balance():
     assert np.isclose(into_gamma + out_of_gamma, 0.0, atol=1e-10)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_quantities_on_the_boundary_of_a_manifold():
     """Gamma's own endpoint: an exterior facet integral on Gamma's submesh.
 
@@ -294,7 +291,6 @@ def test_quantities_on_the_boundary_of_a_manifold():
     assert all(f1 < 0.6 * f0 for f0, f1 in pairwise(fluxes)), fluxes
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_outlet_flux_of_a_manifold_carrying_advection():
     """A manifold's endpoint flux against a closed form that is not zero.
 
@@ -356,7 +352,6 @@ def test_outlet_flux_of_a_manifold_carrying_advection():
     )
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_manifolds_own_species_on_its_own_facets_raises():
     """A manifold's species has no flux *across* the manifold -- the quantity the user
     means is a volume one over it."""
@@ -367,7 +362,6 @@ def test_manifolds_own_species_on_its_own_facets_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_export_on_a_manifold_boundary_locator_matching_nothing_raises():
     """A locator selecting a point interior to Gamma would otherwise report zero."""
     model, (_omega, _gamma, _right), (_H_om, H_gam) = exterior_model(n=8)
@@ -380,7 +374,6 @@ def test_export_on_a_manifold_boundary_locator_matching_nothing_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_ordinary_volume_subdomain_as_a_surface_raises():
     """Only a codim-1 volume subdomain occupies facets."""
     model, (omega, _gamma, _right), (H_om, _H_gam) = exterior_model(n=8)
@@ -390,7 +383,6 @@ def test_ordinary_volume_subdomain_as_a_surface_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_volume_as_a_surface_raises_in_a_problem_without_manifolds():
     """Only HydrogenTransportProblemDiscontinuous supports manifolds.
 
@@ -419,5 +411,5 @@ def test_volume_as_a_surface_raises_in_a_problem_without_manifolds():
         temperature=500,
         settings=F.Settings(atol=1e-10, rtol=1e-10, transient=False),
     )
-    with pytest.raises(TypeError, match="only supported by .*Discontinuous"):
+    with pytest.raises(TypeError, match=r"only supported by .*Discontinuous"):
         model.initialise()

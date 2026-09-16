@@ -13,10 +13,12 @@ from mpi4py import MPI
 
 import dolfinx
 import numpy as np
-import pytest
 import ufl
+from scifem import assemble_scalar
 
 import festim as F
+
+from .tools import global_max, global_min
 
 D_BULK, D_GAMMA = 1.5, 0.7
 NETWORK_ID = 100
@@ -101,7 +103,6 @@ def strips(n=24, k=(2.0, 5.0, 3.0)):
     return model, grains, network, species, c_gb
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_three_grains_match_the_series_chain():
     """The steady state of the three-strip chain is closed-form.
 
@@ -129,12 +130,12 @@ def test_three_grains_match_the_series_chain():
     c3_left = c_gamma_b - j / k3
 
     c = [s.subdomain_to_post_processing_solution[g] for s, g in zip(species, grains)]
-    assert np.isclose(c[0].x.array.max(), 2.0, atol=1e-10)
-    assert np.isclose(c[0].x.array.min(), c1_right, atol=1e-8)
-    assert np.isclose(c[1].x.array.max(), c2_left, atol=1e-8)
-    assert np.isclose(c[1].x.array.min(), c2_right, atol=1e-8)
-    assert np.isclose(c[2].x.array.max(), c3_left, atol=1e-8)
-    assert np.isclose(c[2].x.array.min(), 0.0, atol=1e-10)
+    assert np.isclose(global_max(c[0].x.array), 2.0, atol=1e-10)
+    assert np.isclose(global_min(c[0].x.array), c1_right, atol=1e-8)
+    assert np.isclose(global_max(c[1].x.array), c2_left, atol=1e-8)
+    assert np.isclose(global_min(c[1].x.array), c2_right, atol=1e-8)
+    assert np.isclose(global_max(c[2].x.array), c3_left, atol=1e-8)
+    assert np.isclose(global_min(c[2].x.array), 0.0, atol=1e-10)
 
     # the two branches are one function space but two disconnected components, so each
     # sits at its own level
@@ -163,7 +164,6 @@ def test_three_grains_match_the_series_chain():
     assert np.isclose(-wall_flux(species[2], grains[2], 5), j, rtol=1e-6)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_three_grains_allocate_one_measure_id_per_side():
     """Each side gets an integration id of its own, above every id the user declared."""
     model, grains, network, _, _ = strips(n=12)
@@ -193,13 +193,8 @@ class TNetwork(F.VolumeSubdomain):
 
     def locate_subdomain_entities(self, mesh):
         tdim = mesh.topology.dim
-        mesh.topology.create_connectivity(tdim - 1, 0)
-        facet_to_vertex = mesh.topology.connectivity(tdim - 1, 0)
         candidates = dolfinx.mesh.locate_entities(mesh, tdim - 1, on_t_junction)
-        x = mesh.geometry.x
-        midpoints = np.array(
-            [x[facet_to_vertex.links(f)].mean(axis=0) for f in candidates]
-        )
+        midpoints = dolfinx.mesh.compute_midpoints(mesh, tdim - 1, candidates)
         return candidates[on_t_junction(midpoints.T)].astype(np.int32)
 
 
@@ -267,7 +262,6 @@ def t_junction(n=24, rates=(1.0, 1.0, 1.0)):
     return model, grains, network, species, c_gb
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_triple_junction_feeds_every_grain_through_one_network():
     """Charging one grain fills the other two, through the junction.
 
@@ -287,13 +281,8 @@ def test_triple_junction_feeds_every_grain_through_one_network():
     # locator passed straight to locate_entities also picks up the diagonal joining
     # the two branches near the junction, which is a facet on neither of them
     sub = network.submesh
-    sub.topology.create_connectivity(1, 0)
-    cell_to_vertex = sub.topology.connectivity(1, 0)
-    length = sum(
-        float(np.linalg.norm(np.diff(sub.geometry.x[cell_to_vertex.links(c)], axis=0)))
-        for c in range(sub.topology.index_map(1).size_local)
-    )
-    assert np.isclose(length, 1.5)
+    # Topology vertex indices need not index geometry coordinates in parallel.
+    assert np.isclose(assemble_scalar(1 * ufl.dx(domain=sub)), 1.5)
 
     model.run()
 
@@ -304,7 +293,6 @@ def test_triple_junction_feeds_every_grain_through_one_network():
     assert np.allclose(gb, 2.0, atol=1e-8)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_one_grain_can_be_blocked_off_from_the_network():
     """A near-zero exchange rate for a single grain keeps that grain -- and only that
     grain -- empty.
@@ -329,8 +317,8 @@ def test_one_grain_can_be_blocked_off_from_the_network():
     gb = c_gb.subdomain_to_post_processing_solution[network].x.array
 
     # the charged grain and the network fill, and the grain coupled normally follows
-    assert bottom_left.max() > 1.5
-    assert gb.max() > 0.2
-    assert top.max() > 0.05
+    assert global_max(bottom_left) > 1.5
+    assert global_max(gb) > 0.2
+    assert global_max(top) > 0.05
     # the blocked one stays essentially empty, two orders of magnitude below the rest
-    assert bottom_right.max() < 1e-2 * top.max()
+    assert global_max(bottom_right) < 1e-2 * global_max(top)

@@ -2,6 +2,39 @@
 Post-processing
 ===============
 
+Derived quantities on manifolds
+------------------------------
+
+In a :class:`festim.HydrogenTransportProblemDiscontinuous`, use volume quantities
+for a manifold's own species and surface quantities for a bulk species on the
+facets occupied by the manifold. A codim-2 ``SurfaceSubdomain`` selects the
+manifold's boundary. Totals, averages, extrema and fluxes are global under MPI;
+CSV files are written by rank zero of the simulation communicator.
+
+Custom quantities follow the same integration domains. With ``gamma`` a manifold,
+``bulk`` an adjacent bulk subdomain, and ``end`` a boundary of ``gamma``::
+
+    # Integral of the manifold's own field.
+    inventory = F.CustomQuantity(
+        expr=lambda **kw: kw["H_gamma"], subdomain=gamma,
+    )
+
+    # Integral of the bulk trace, choosing the side explicitly.
+    bulk_trace = F.CustomQuantity(
+        expr=lambda **kw: kw["H_bulk"], subdomain=gamma, volume=bulk,
+    )
+
+    # Integral over the manifold boundary.
+    endpoint = F.CustomQuantity(
+        expr=lambda **kw: kw["H_gamma"], subdomain=end, volume=gamma,
+    )
+
+``volume`` selects whose fields are supplied to the expression. Only species on
+that volume are available; coordinates, temperature, time, diffusion coefficients
+and normals use the integration mesh. FESTIM applies the appropriate ``+`` or ``-``
+restriction automatically for an internal bulk trace. For a manifold boundary,
+``volume`` may be omitted when the problem contains exactly one manifold.
+
 Exporting fields
 ----------------
 

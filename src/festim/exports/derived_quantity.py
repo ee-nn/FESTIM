@@ -1,6 +1,8 @@
 import csv
 from abc import ABC, abstractmethod
 
+from mpi4py import MPI
+
 
 class DerivedQuantity(ABC):
     """Base class for all derived quantities.
@@ -9,11 +11,15 @@ class DerivedQuantity(ABC):
         filename: name of the file to which the quantity is exported
         t: list of time values
         data: list of values of the quantity
+        comm: simulation communicator; only its rank zero writes files. Defaults
+            to ``MPI.COMM_WORLD`` for quantities used outside a problem.
     """
 
     filename: str | None
     t: list[float]
     data: list[float]
+    # Set to the simulation communicator when exports are initialised.
+    comm: MPI.Comm = MPI.COMM_WORLD
 
     def __init__(self, filename: str | None = None) -> None:
         self.filename = filename
@@ -45,10 +51,12 @@ class DerivedQuantity(ABC):
         self._filename = value
 
     def write(self, t):
-        """If the filename doesnt exist yet, create it and write the header, then append
-        the time and value to the file."""
+        """Write on communicator rank zero, creating the header on the first call.
 
-        if self.filename is not None:
+        Computation and the in-memory history remain available on every rank.
+        """
+
+        if self.filename is not None and self.comm.rank == 0:
             if self._first_time_export:
                 header = ["t(s)", f"{self.title}"]
                 with open(self.filename, mode="w+", newline="") as file:

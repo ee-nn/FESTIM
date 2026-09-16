@@ -36,6 +36,34 @@ def meshtags_with_ghosts(mesh, tags):
     return result
 
 
+def locate_manifold_boundary_entities(surface, mesh):
+    """Locate owned physical boundary facets of a distributed manifold submesh.
+
+    Submesh exterior-facet flags can include partition cuts. Accumulate incident
+    *owned* cells on each facet's owner to distinguish those cuts from physical
+    endpoints or edges. Collective on the submesh communicator.
+    """
+    if surface.locator is None:
+        raise ValueError("No locator function provided for locating boundary facets.")
+    tdim = mesh.topology.dim
+    fdim = tdim - 1
+    mesh.topology.create_connectivity(fdim, tdim)
+    connectivity = mesh.topology.connectivity(fdim, tdim)
+    facet_map = mesh.topology.index_map(fdim)
+    owned_cells = mesh.topology.index_map(tdim).size_local
+    counts = dolfinx.la.vector(facet_map, dtype=np.int32)
+    counts.array[:] = np.bincount(
+        np.repeat(
+            np.arange(len(connectivity.offsets) - 1), np.diff(connectivity.offsets)
+        )[connectivity.array < owned_cells],
+        minlength=len(counts.array),
+    )
+    counts.scatter_reverse(dolfinx.la.InsertMode.add)
+    candidates = dolfinx.mesh.locate_entities(mesh, fdim, surface.locator)
+    candidates = candidates[candidates < facet_map.size_local]
+    return candidates[counts.array[candidates] == 1]
+
+
 def as_fenics_constant(
     value: float | int | fem.Constant, mesh: dolfinx.mesh.Mesh
 ) -> fem.Constant:

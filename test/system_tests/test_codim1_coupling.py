@@ -360,7 +360,6 @@ def uncoupled(stepsize, final_time, source_value, reactions=None, extra_species=
     return model, gamma, H_gam
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_transient_manifold_integrates_dt_exactly():
     """A transient manifold must use a timestep living on its own submesh.
 
@@ -394,7 +393,6 @@ def test_transient_manifold_integrates_dt_exactly():
     assert float(model.dt) > 0.05
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_time_dependent_source_on_manifold():
     """An explicitly time-dependent source on a manifold needs a submesh-resident ``t``.
 
@@ -424,7 +422,6 @@ def test_time_dependent_source_on_manifold():
     assert np.allclose(c_gam, expected, rtol=1e-10)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_reaction_on_manifold():
     """A reaction on a manifold reads the temperature inside a submesh integral.
 

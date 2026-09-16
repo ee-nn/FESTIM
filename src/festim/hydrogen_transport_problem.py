@@ -47,6 +47,7 @@ from festim.helpers import (
     as_fenics_constant,
     convergenceTest,
     is_it_time_to_export,
+    locate_manifold_boundary_entities,
     nmm_interpolate,
 )
 from festim.helpers import (
@@ -552,6 +553,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 initialised_files.add(export.filename)
 
             elif isinstance(export, exports.DerivedQuantity):
+                export.comm = self.mesh.mesh.comm
                 # raise not implemented error if the derived quantity don't match the
                 # type of mesh eg. TotalVolume is not implemented for cylindrical
                 # or spherical meshes. SurfaceFlux supports all coordinate systems.
@@ -620,6 +622,11 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 export.data = []
 
             if isinstance(export, exports.CustomQuantity):
+                if export.volume is not None:
+                    raise ValueError(
+                        "CustomQuantity volume selection requires a "
+                        "discontinuous problem"
+                    )
                 kwargs = {
                     species.name: species.post_processing_solution
                     for species in self.species
@@ -1651,8 +1658,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
             # located directly on the manifold's submesh -- no tag to look up, and no
             # codim-2 entity of the parent mesh is ever needed
-            entities = bc.subdomain.locate_boundary_facet_indices(
-                volume_subdomain.submesh
+            entities = locate_manifold_boundary_entities(
+                bc.subdomain, volume_subdomain.submesh
             )
             # a locator that matches nothing, or matches only points interior to the
             # manifold, would otherwise leave the bc silently doing nothing
@@ -3060,7 +3067,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             submesh = manifold.submesh
             fdim = submesh.topology.dim - 1
             submesh.topology.create_connectivity(fdim, submesh.topology.dim)
-            entities = surface.locate_boundary_facet_indices(submesh)
+            entities = locate_manifold_boundary_entities(surface, submesh)
             # a locator matching nothing, or only points interior to the manifold, would
             # otherwise leave the export quietly reporting zero
             if self.mesh.mesh.comm.allreduce(len(entities), op=MPI.SUM) == 0:
@@ -3159,6 +3166,66 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             None,
             entity_maps,
         )
+
+    def custom_quantity_context(self, export):
+        """Resolve the fields, integration mesh and side of a custom quantity."""
+        target, volume = export.subdomain, export.volume
+        parent = self.mesh.mesh
+        maps = [sd.cell_map for sd in self.volume_subdomains]
+        if volume is not None and volume not in self.volume_subdomains:
+            raise ValueError("CustomQuantity volume must belong to the problem")
+        if isinstance(target, _subdomain.VolumeSubdomain):
+            if target not in self.volume_subdomains:
+                raise ValueError("CustomQuantity subdomain must belong to the problem")
+            if volume is None or volume is target:
+                manifold = target in self.manifold_subdomains
+                return (
+                    target,
+                    target.submesh if manifold else parent,
+                    self.export_volume_measure(target),
+                    target.id,
+                    None,
+                    None if manifold else maps,
+                )
+            if (
+                target not in self.manifold_subdomains
+                or volume not in self.manifold_to_volumes[target]
+            ):
+                raise ValueError(
+                    "CustomQuantity volume must be adjacent to its manifold"
+                )
+            return (
+                volume,
+                parent,
+                self.facet_measure(target),
+                self.coupling_measure_id(target, volume),
+                self.restriction_of(target, volume),
+                maps,
+            )
+        if target.codim(self.mesh.vdim) == 2:
+            if volume is None:
+                if len(self.manifold_subdomains) != 1:
+                    raise ValueError(
+                        "Set CustomQuantity volume to select the manifold "
+                        "whose boundary is exported"
+                    )
+                volume = self.manifold_subdomains[0]
+            if volume not in self.manifold_subdomains:
+                raise ValueError("A codim-2 CustomQuantity requires a manifold volume")
+            return (
+                volume,
+                volume.submesh,
+                self._manifold_boundary_measure(target, volume),
+                target.id,
+                None,
+                None,
+            )
+        adjacent = self.surface_to_volume[target]
+        if volume is not None and volume is not adjacent:
+            raise ValueError(
+                "CustomQuantity volume does not bound the selected surface"
+            )
+        return adjacent, parent, self.ds, target.id, None, maps
 
     def _export_context(
         self, export
@@ -3272,7 +3339,15 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             if is_extremum:
                 if isinstance(export, exports.SurfaceQuantity):
                     export.facet_meshtags = self.facet_meshtags
-                    export.volume = self.surface_to_volume[export.surface]
+                    export.volume = volume
+                    export.facet_indices = None
+                    if export.surface.codim(self.mesh.vdim) == 2:
+                        measure = self._manifold_boundary_measure(
+                            export.surface, volume
+                        )
+                        export.facet_indices = measure.subdomain_data().find(
+                            export.surface.id
+                        )
                     location = f"surface {export.surface.id}"
                 else:
                     export.volume_meshtags = self.volume_meshtags
@@ -3289,43 +3364,38 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
             # reset the data and time for SurfaceQuantity and VolumeQuantity
             if isinstance(export, exports.DerivedQuantity):
+                export.comm = self.mesh.mesh.comm
                 export.t = []
                 export.data = []
 
             if isinstance(export, exports.CustomQuantity):
-                volume = (
-                    export.subdomain
-                    if not isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                    else self.surface_to_volume[
-                        export.subdomain
-                        if isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                        else next(
-                            s
-                            for s in self.surface_subdomains
-                            if s.id == export.subdomain
-                        )
-                    ]
+                volume, mesh, *_ = self.custom_quantity_context(export)
+                local_species = [sp for sp in self.species if volume in sp.subdomains]
+                temperature = (
+                    self.subdomain_temperature(volume)
+                    if mesh is volume.submesh
+                    else self.temperature_fenics
                 )
-
                 kwargs = {
-                    species.name: species.subdomain_to_post_processing_solution[volume]
-                    for species in self.species
+                    sp.name: sp.subdomain_to_post_processing_solution[volume]
+                    for sp in local_species
                 }
-                kwargs["n"] = ufl.FacetNormal(self.mesh.mesh)
-                kwargs["t"] = self.t
-                kwargs["T"] = self.temperature_fenics
-
-                D_kwargs = {
-                    f"D_{sp.name}": volume.material.get_diffusion_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, sp
+                kwargs["n"] = ufl.FacetNormal(mesh)
+                kwargs["t"] = (
+                    self.subdomain_time(volume) if mesh is volume.submesh else self.t
+                )
+                kwargs["T"] = temperature
+                diffusion = {
+                    sp.name: volume.material.get_diffusion_coefficient(
+                        mesh, temperature, sp
                     )
-                    for sp in self.species
+                    for sp in local_species
                 }
-                kwargs.update(D_kwargs)
-                kwargs["D"] = {sp.name: D_kwargs[f"D_{sp.name}"] for sp in self.species}
-                if len(self.species) == 1:
-                    kwargs["D"] = kwargs[f"D_{self.species[0].name}"]
-                kwargs["x"] = ufl.SpatialCoordinate(self.mesh.mesh)
+                kwargs.update({f"D_{name}": D for name, D in diffusion.items()})
+                kwargs["D"] = (
+                    next(iter(diffusion.values())) if len(diffusion) == 1 else diffusion
+                )
+                kwargs["x"] = ufl.SpatialCoordinate(mesh)
                 export.ufl_expr = export.expr(**kwargs)
 
     def post_processing(self):
@@ -3391,12 +3461,15 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     export.compute()
 
             elif isinstance(export, exports.CustomQuantity):
-                is_surface = isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                measure = self.ds if is_surface else self.dx
-
-                # getting entity_maps
-                entity_maps = [sd.cell_map for sd in self.volume_subdomains]
-                export.compute(measure, entity_maps=entity_maps)
+                _, _, measure, tag, restriction, entity_maps = (
+                    self.custom_quantity_context(export)
+                )
+                export.compute(
+                    measure,
+                    entity_maps=entity_maps,
+                    subdomain_id=tag,
+                    restriction=restriction,
+                )
 
             elif isinstance(export, exports.GasPressure):
                 export.compute()
@@ -3454,8 +3527,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 # a manifold mirrors a constant temperature onto its own submesh, and
                 # that mirror has to follow the parent constant
                 for subdomain in self.manifold_subdomains:
-                    # NOTE: current limitation for manifolds, temperature on the manifold
-                    # has to be homogeneous (ie. fem.Constant)
+                    # Manifold temperature currently has to be homogeneous
+                    # (a fem.Constant).
                     subdomain.sub_T.value = float(self.temperature_fenics)
 
     def iterate(self):

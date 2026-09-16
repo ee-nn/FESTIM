@@ -15,7 +15,7 @@ import ufl
 
 import festim as F
 
-from .tools import error_L2
+from .tools import error_L2, global_max, global_min
 
 D_BULK, D_GAMMA = 1.5, 0.7
 K_LEFT, K_RIGHT = 2.0, 3.0
@@ -98,7 +98,6 @@ def build(n=20, mesh=None, plane=0.5, swap_declaration_order=False):
     return model, (left, right, gamma), (H_l, H_r, H_g)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_matches_analytical_solution():
     """A 1D steady problem across the interface has a closed-form solution.
 
@@ -118,14 +117,13 @@ def test_interior_manifold_matches_analytical_solution():
     c_r = H_r.subdomain_to_post_processing_solution[right].x.array
     c_g = H_g.subdomain_to_post_processing_solution[gamma].x.array
 
-    assert np.isclose(c_l.max(), 2.0, atol=1e-10)
-    assert np.isclose(c_l.min(), 14 / 9, atol=1e-8)
-    assert np.isclose(c_r.max(), 4 / 9, atol=1e-8)
-    assert np.isclose(c_r.min(), 0.0, atol=1e-10)
+    assert np.isclose(global_max(c_l), 2.0, atol=1e-10)
+    assert np.isclose(global_min(c_l), 14 / 9, atol=1e-8)
+    assert np.isclose(global_max(c_r), 4 / 9, atol=1e-8)
+    assert np.isclose(global_min(c_r), 0.0, atol=1e-10)
     assert np.allclose(c_g, 8 / 9, atol=1e-8)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_ordering_is_independent_of_declaration_order():
     """Which bulk subdomain is "+" must not depend on the order the user declares them.
 
@@ -148,7 +146,6 @@ def test_interior_manifold_ordering_is_independent_of_declaration_order():
     assert np.allclose(results[0][1], results[1][1], atol=1e-12)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_conserves_particles():
     """What leaves the left bulk enters the manifold and leaves through the right.
 
@@ -258,7 +255,6 @@ def test_interior_manifold_inside_a_single_subdomain():
     assert np.allclose(c_g, 2.0, atol=1e-8)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_manifold_mixing_interior_and_exterior_facets_raises():
     """A manifold has to be wholly inside the mesh or wholly on its boundary: the two
     need different measures, and one of them would be silently dropped."""
@@ -289,7 +285,6 @@ def test_manifold_mixing_interior_and_exterior_facets_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_transient_reaches_steady_state():
     """The same interface, run in time from a zero initial condition.
 
@@ -310,12 +305,11 @@ def test_interior_manifold_transient_reaches_steady_state():
     c_r = H_r.subdomain_to_post_processing_solution[right].x.array
     c_g = H_g.subdomain_to_post_processing_solution[gamma].x.array
 
-    assert np.isclose(c_l.min(), 14 / 9, atol=1e-5)
-    assert np.isclose(c_r.max(), 4 / 9, atol=1e-5)
+    assert np.isclose(global_min(c_l), 14 / 9, atol=1e-5)
+    assert np.isclose(global_max(c_r), 4 / 9, atol=1e-5)
     assert np.allclose(c_g, 8 / 9, atol=1e-5)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_source_spanning_both_sides_raises():
     """A single manifold source cannot read both sides: it has no single restriction."""
     model, (_, _, gamma), (H_l, H_r, H_g) = build()
@@ -331,7 +325,6 @@ def test_source_spanning_both_sides_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interface_and_manifold_on_the_same_facets_raises():
     """A concentration jump or a manifold equation, across a pair of volumes -- not
     both."""
@@ -341,7 +334,6 @@ def test_interface_and_manifold_on_the_same_facets_raises():
         model.initialise()
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interior_manifold_3d_tilted_mms():
     """MMS on a tilted 2-manifold sandwiched inside a 3D mesh.
 
@@ -656,7 +648,6 @@ def assert_subdomain_data_is_shared(form, name):
             )
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_two_interior_manifolds_bounding_one_subdomain():
     """A strip between two grain boundaries couples to both at once.
 
@@ -697,14 +688,14 @@ def test_two_interior_manifolds_bounding_one_subdomain():
     def values(spe, subdomain):
         return spe.subdomain_to_post_processing_solution[subdomain].x.array
 
-    assert np.isclose(values(H_l, left).max(), 2.0, atol=1e-10)
-    assert np.isclose(values(H_l, left).min(), c_left_min, atol=1e-8)
+    assert np.isclose(global_max(values(H_l, left)), 2.0, atol=1e-10)
+    assert np.isclose(global_min(values(H_l, left)), c_left_min, atol=1e-8)
     assert np.allclose(values(H_g1, gamma_1), c_gamma_1, atol=1e-8)
-    assert np.isclose(values(H_m, middle).max(), c_mid_max, atol=1e-8)
-    assert np.isclose(values(H_m, middle).min(), c_mid_min, atol=1e-8)
+    assert np.isclose(global_max(values(H_m, middle)), c_mid_max, atol=1e-8)
+    assert np.isclose(global_min(values(H_m, middle)), c_mid_min, atol=1e-8)
     assert np.allclose(values(H_g2, gamma_2), c_gamma_2, atol=1e-8)
-    assert np.isclose(values(H_r, right).max(), c_right_max, atol=1e-8)
-    assert np.isclose(values(H_r, right).min(), 0.0, atol=1e-10)
+    assert np.isclose(global_max(values(H_r, right)), c_right_max, atol=1e-8)
+    assert np.isclose(global_min(values(H_r, right)), 0.0, atol=1e-10)
 
 
 # --- a bulk species that lives on more than one subdomain -------------------------
@@ -769,7 +760,6 @@ def build_shared_bulk_species(n=12):
     return model, (left, middle, right, gamma), (H_l, H_mr, H_g)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_coupling_reads_the_species_solution_on_the_manifold_s_own_side():
     """``H_mr`` has a solution on the middle strip and another on the right one, and
     the exchange with the manifold reads the middle.
@@ -861,7 +851,6 @@ def build_interface_and_manifold(n=12):
     return model, (left, middle, right, gamma), (H_l, H_mr, H_g)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_interface_and_interior_manifold_bounding_one_subdomain(recwarn):
     """A strip may have a manifold on one side and an interface on the other.
 
@@ -899,25 +888,24 @@ def test_interface_and_interior_manifold_bounding_one_subdomain(recwarn):
     c_middle, c_right = values(H_mr, middle), values(H_mr, right)
 
     # monotone step down from the fed wall to the empty one
-    assert np.isclose(c_left.max(), 2.0, atol=1e-10)
-    assert c_left.min() > c_g.max()
-    assert c_g.min() > c_middle.max()
-    assert c_middle.min() > c_right.max()
-    assert np.isclose(c_right.min(), 0.0, atol=1e-10)
+    assert np.isclose(global_max(c_left), 2.0, atol=1e-10)
+    assert global_min(c_left) > global_max(c_g)
+    assert global_min(c_g) > global_max(c_middle)
+    assert global_min(c_middle) > global_max(c_right)
+    assert np.isclose(global_min(c_right), 0.0, atol=1e-10)
 
     # the same flux through both bulk strips and both faces of the manifold
     bulk_conductance = 3 * D_BULK
     fluxes = [
-        bulk_conductance * (2.0 - c_left.min()),
-        K1_LEFT * (c_left.min() - c_g.max()),
-        K1_RIGHT * (c_g.min() - c_middle.max()),
-        bulk_conductance * (c_middle.max() - c_middle.min()),
-        bulk_conductance * (c_right.max() - 0.0),
+        bulk_conductance * (2.0 - global_min(c_left)),
+        K1_LEFT * (global_min(c_left) - global_max(c_g)),
+        K1_RIGHT * (global_min(c_g) - global_max(c_middle)),
+        bulk_conductance * (global_max(c_middle) - global_min(c_middle)),
+        bulk_conductance * (global_max(c_right) - 0.0),
     ]
     assert np.allclose(fluxes, fluxes[0], rtol=1e-6)
 
 
-@pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_species_on_one_side_of_an_interface_warns():
     """A species on exactly one of an interface's subdomains cannot be made continuous
     across it. That is either deliberate -- a species absent from the neighbouring

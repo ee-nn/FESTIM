@@ -25,6 +25,7 @@ class MinimumSurface(SurfaceQuantity):
 
     facet_meshtags: dolfinx.mesh.MeshTags | None = None
     volume: VolumeSubdomain | None = None
+    facet_indices: np.ndarray | None = None
 
     @property
     def title(self):
@@ -54,7 +55,7 @@ class MinimumSurface(SurfaceQuantity):
         """Computes the minimum value of the field on the defined surface subdomain, and
         appends it to the data list.
         """
-        assert self.meshtags is not None, (
+        assert self.facet_indices is not None or self.meshtags is not None, (
             "facet meshtags must be set before computing the min surface value"
         )
         solution = self.solution
@@ -67,7 +68,13 @@ class MinimumSurface(SurfaceQuantity):
         fdim = mesh.topology.dim - 1
         mesh.topology.create_connectivity(fdim, mesh.topology.dim)
         dofs = dolfinx.fem.locate_dofs_topological(
-            V=V, entity_dim=fdim, entities=self.meshtags.find(self.surface.id)
+            V=V,
+            entity_dim=fdim,
+            entities=(
+                self.facet_indices
+                if self.facet_indices is not None
+                else self.meshtags.find(self.surface.id)
+            ),
         )
         values = solution.x.array[dofs]
 

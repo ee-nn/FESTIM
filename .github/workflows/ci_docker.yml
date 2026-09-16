@@ -41,13 +41,28 @@ jobs:
         run: |
           xvfb-run -a python3 -m pytest test/ --cov festim --cov-report xml --cov-report term
 
-      - name: Check distributed manifold topology and coupling
-        timeout-minutes: 5
+      - name: Check distributed manifold topology and solver
+        timeout-minutes: 15
         env:
           OMPI_ALLOW_RUN_AS_ROOT: "1"
           OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+          OMPI_MCA_rmaps_base_oversubscribe: "1"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
         run: |
-          mpirun -np 2 python3 -m pytest -q test/system_tests/test_codim1_parallel.py test/system_tests/test_codim1_interface.py::test_interior_manifold_inside_a_single_subdomain
+          for ranks in 2 4; do
+            mpirun -np "$ranks" python3 -m pytest -q \
+              test/system_tests/test_codim1_parallel.py \
+              test/system_tests/test_codim1_interface.py \
+              test/system_tests/test_codim1_polycrystal.py \
+              test/system_tests/test_codim1_boundary.py \
+              test/system_tests/test_codim1_assembly.py \
+              test/system_tests/test_codim1_exports.py \
+              test/system_tests/test_codim1_derived_parallel.py \
+              test/system_tests/test_codim1_coupling.py::test_transient_manifold_integrates_dt_exactly \
+              test/system_tests/test_codim1_coupling.py::test_time_dependent_source_on_manifold \
+              test/system_tests/test_codim1_coupling.py::test_reaction_on_manifold
+          done
       
       - name: Upload to codecov
         uses: codecov/codecov-action@v7

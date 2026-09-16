@@ -7,6 +7,17 @@ from dolfinx.mesh import create_unit_cube, create_unit_square
 
 from festim import Mesh1D
 
+
+def global_min(values):
+    """Minimum over all test ranks, including ranks without local dofs."""
+    return MPI.COMM_WORLD.allreduce(np.min(values, initial=np.inf), op=MPI.MIN)
+
+
+def global_max(values):
+    """Maximum over all test ranks, including ranks without local dofs."""
+    return MPI.COMM_WORLD.allreduce(np.max(values, initial=-np.inf), op=MPI.MAX)
+
+
 test_mesh_1d = Mesh1D(np.linspace(0, 1, 10000))
 test_mesh_2d = create_unit_square(MPI.COMM_WORLD, 50, 50)
 test_mesh_3d = create_unit_cube(MPI.COMM_WORLD, 20, 20, 20)
