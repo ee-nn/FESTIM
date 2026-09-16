@@ -68,6 +68,22 @@ def test_codim1_subdomain_is_tagged_in_facet_meshtags():
     assert np.all(ct.values == omega.id)
 
 
+def test_mesh1d_border_check_ignores_point_subdomains():
+    """Point subdomains have no borders and must not enter the bulk border check."""
+    mesh = F.Mesh1D(vertices=[0, 0.5, 1])
+    bulk = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=None)
+    point = F.VolumeSubdomain(
+        id=2, dim=0, material=None, locator=lambda x: np.isclose(x[0], 0.5)
+    )
+
+    ft, ct = mesh.define_meshtags(
+        surface_subdomains=[], volume_subdomains=[bulk, point]
+    )
+
+    assert np.all(ct.values == bulk.id)
+    assert MPI.COMM_WORLD.allreduce(len(ft.find(point.id)), op=MPI.SUM) > 0
+
+
 def test_codim1_subdomain_id_clashing_with_a_surface_raises():
     """Manifold subdomains share the facet-tag namespace with surface subdomains."""
     omega = F.VolumeSubdomain(
