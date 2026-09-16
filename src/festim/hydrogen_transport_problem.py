@@ -2449,6 +2449,11 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 continue
             if subdomain.submesh.topology.dim == 0:
                 # A point has no tangential direction in which a species can drift.
+                warnings.warn(
+                    f"{type(drift_term).__name__} is ignored on volume subdomain"
+                    f" {subdomain.id} with dimension zero.",
+                    stacklevel=2,
+                )
                 continue
 
             for spe in drift_term.species:
