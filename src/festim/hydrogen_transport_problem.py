@@ -553,8 +553,12 @@ class HydrogenTransportProblem(problem.ProblemBase):
 
             elif isinstance(export, exports.DerivedQuantity):
                 # raise not implemented error if the derived quantity don't match the
-                # type of mesh eg. SurfaceFlux is used with cylindrical mesh
-                if self.mesh.coordinate_system != CoordinateSystem.CARTESIAN:
+                # type of mesh eg. TotalVolume is not implemented for cylindrical
+                # or spherical meshes. SurfaceFlux supports all coordinate systems.
+                if (
+                    self.mesh.coordinate_system != CoordinateSystem.CARTESIAN
+                    and not isinstance(export, exports.SurfaceFlux)
+                ):
                     raise NotImplementedError(
                         f"Derived quantity exports are not implemented for "
                         f"{self.mesh.coordinate_system!s} meshes"
@@ -597,6 +601,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 # add the global D to the export
                 export.D = self._species_to_D_global.get(export.field)
                 export.D_expr = self._species_to_D_global_expr.get(export.field)
+                export.coordinate_system = self.mesh.coordinate_system
             # a model without drift terms must not pay for the surface-to-volume
             # lookup, which needs meshtags this one does not otherwise require
             if self.drift_terms and isinstance(export, exports.SurfaceFlux):
@@ -2881,7 +2886,21 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 if form is None or (group is all_forms and i in padded):
                     J.append([None] * len(all_unknowns))
                     continue
-                J.append([ufl.derivative(form, unknown) for unknown in all_unknowns])
+                # Differentiate only with respect to the unknowns this residual
+                # actually contains: any other block is identically zero. Building
+                # and then expanding every block costs O(n_subdomains**2) symbolic
+                # work, which dominates initialise() for problems with many
+                # subdomains (e.g. one subdomain per grain). The diagonal block is
+                # always kept because it carries the block's function spaces.
+                present = set(ufl.algorithms.extract_coefficients(form))
+                J.append(
+                    [
+                        ufl.derivative(form, unknown)
+                        if unknown in present or (group is all_forms and j == i)
+                        else None
+                        for j, unknown in enumerate(all_unknowns)
+                    ]
+                )
             J_groups.append(J)
         if len(groups) > 1:
             # a block differentiated with respect to an unknown it does not depend on
@@ -3232,6 +3251,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 # NOTE: maybe we need to make sure there are no functionspace clashes?
 
                 export.D = D
+                export.coordinate_system = self.mesh.coordinate_system
 
                 if self.drift_terms and isinstance(export, exports.SurfaceFlux):
                     export.drift_velocity = self.drift_velocity_in(
@@ -3239,6 +3259,34 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                         volume=volume,
                         temperature=temperature,
                         mesh=mesh,
+                    )
+
+            # the extrema exports read the solution on the submesh of the volume
+            # subdomain their location belongs to, so give them that volume and the
+            # meshtags of the parent mesh, then check the species is defined there
+            is_extremum = isinstance(
+                export,
+                exports.MaximumVolume
+                | exports.MinimumVolume
+                | exports.MaximumSurface
+                | exports.MinimumSurface,
+            )
+            if is_extremum:
+                if isinstance(export, exports.SurfaceQuantity):
+                    export.facet_meshtags = self.facet_meshtags
+                    export.volume = self.surface_to_volume[export.surface]
+                    location = f"surface {export.surface.id}"
+                else:
+                    export.volume_meshtags = self.volume_meshtags
+                    location = f"volume {export.volume.id}"
+
+                # a field that is not a Species (a bare name) is skipped: it fails
+                # earlier, for unrelated reasons
+                if isinstance(export.field, _species.Species) and not export.is_submesh:
+                    raise ValueError(
+                        f"Cannot compute {export.title}: species "
+                        f"{export.field.name} is not defined in the volume subdomain "
+                        f"{export.volume.id} that {location} belongs to"
                     )
 
             # reset the data and time for SurfaceQuantity and VolumeQuantity

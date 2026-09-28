@@ -1,9 +1,12 @@
+import math
+
 import ufl
 from dolfinx import fem
 from scifem import assemble_scalar
 
 from festim.exports.surface_quantity import SurfaceQuantity
 from festim.helpers import restrict
+from festim.mesh import CoordinateSystem
 from festim.species import Species
 from festim.subdomain.surface_subdomain import SurfaceSubdomain
 from festim.subdomain.volume_subdomain import VolumeSubdomain
@@ -31,6 +34,7 @@ class SurfaceFlux(SurfaceQuantity):
     field: Species
     surface: SurfaceSubdomain | VolumeSubdomain
     filename: str
+    coordinate_system: CoordinateSystem
 
     title: str
     value: float
@@ -76,12 +80,36 @@ class SurfaceFlux(SurfaceQuantity):
         mesh = ds.ufl_domain()
         n = ufl.FacetNormal(mesh)
 
+        match self.coordinate_system:
+            case CoordinateSystem.CARTESIAN:
+                weight = 1
+            case CoordinateSystem.CYLINDRICAL:
+                r = ufl.SpatialCoordinate(mesh)[0]
+                # TODO: full coverage assumed; expose as a constructor parameter
+                # (e.g. azimuth_range) to support partial coverage
+                coverage = 2 * math.pi  # radians
+                weight = coverage * r
+            case CoordinateSystem.SPHERICAL:
+                r = ufl.SpatialCoordinate(mesh)[0]
+                # TODO: full coverage assumed; expose as constructor parameters
+                # (e.g. azimuth_range, polar_range) to support partial coverage
+                coverage = 4 * math.pi  # steradians
+                weight = coverage * r**2
+            case _:
+                raise NotImplementedError(
+                    f"Unknown coordinate system {self.coordinate_system!s}"
+                )
+
         integrand = -self.D * ufl.dot(ufl.grad(u), n)
         if subdomain_id is None:
             subdomain_id = self.surface.id
 
         if self.drift_velocity is not None:
             integrand += u * ufl.dot(self.drift_velocity, n)
+
+        # the weight carries the metric of the coordinate system, so it multiplies the
+        # whole flux density, drift included
+        integrand *= weight
 
         self.value = assemble_scalar(
             fem.form(
