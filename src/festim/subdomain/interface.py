@@ -1,6 +1,8 @@
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from mpi4py import MPI
+
 import dolfinx
 import numpy as np
 import ufl
@@ -15,12 +17,29 @@ if TYPE_CHECKING:
 from abc import ABC, abstractmethod
 
 
+def cell_tag_lookup(cell_tags: "dolfinx.mesh.MeshTags") -> np.ndarray:
+    """A dense ``cell -> tag`` table over the local (owned and ghost) cells, ``-1``
+    where a cell carries no tag.
+
+    MeshTags are sparse and need not cover every cell, so their values cannot be
+    indexed by cell. Building the table is a pass over every local cell: build it
+    once and pass it as ``lookup`` to the functions below, rather than letting each
+    call build its own.
+    """
+    topology = cell_tags.topology
+    cell_map = topology.index_map(topology.dim)
+    lookup = np.full(cell_map.size_local + cell_map.num_ghosts, -1, dtype=np.int32)
+    lookup[cell_tags.indices] = cell_tags.values
+    return lookup
+
+
 def compute_ordered_interior_facet_data(
     cell_tags: "dolfinx.mesh.MeshTags",
     facet_tags: "dolfinx.mesh.MeshTags",
     tag: int,
     subdomain_plus: VolumeSubdomain,
     subdomain_minus: VolumeSubdomain,
+    lookup: np.ndarray | None = None,
 ):
     """Integration data for an interior-facet (``dS``) integral, with the restrictions
     ordered so that ``"+"`` is always ``subdomain_plus``.
@@ -37,6 +56,8 @@ def compute_ordered_interior_facet_data(
         tag: the value identifying the facets to integrate over
         subdomain_plus: the volume subdomain to place on the ``"+"`` restriction
         subdomain_minus: the volume subdomain to place on the ``"-"`` restriction
+        lookup: the table of :func:`cell_tag_lookup` for ``cell_tags``, built here if
+            not given
 
     Returns:
         ``(tag, integration_data)``, the pair accepted by ``ufl.Measure("dS",
@@ -44,7 +65,8 @@ def compute_ordered_interior_facet_data(
         ``(cell_plus, local_facet_plus, cell_minus, local_facet_minus)`` quadruples.
 
     Raises:
-        ValueError: if a tagged facet does not separate the two subdomains
+        ValueError: on every rank, if a tagged facet anywhere does not separate the
+            two subdomains
     """
     topology = cell_tags.topology
     topology.create_connectivity(topology.dim - 1, topology.dim)
@@ -52,17 +74,19 @@ def compute_ordered_interior_facet_data(
     integration_data = compute_integration_domains(
         dolfinx.fem.IntegralType.interior_facet, topology, facet_tags.find(tag)
     ).reshape(-1, 4)
-    cell_map = topology.index_map(topology.dim)
-    lookup = np.full(cell_map.size_local + cell_map.num_ghosts, -1, dtype=np.int32)
-    lookup[cell_tags.indices] = cell_tags.values
+    if lookup is None:
+        lookup = cell_tag_lookup(cell_tags)
     swap = lookup[integration_data[:, 2]] == subdomain_plus.id
     integration_data[swap] = integration_data[swap][:, [2, 3, 0, 1]]
 
     # A wrong ordering is silent, so rather than trust the tags, check that the two
     # cells of every facet really do lie one in each subdomain. A bare assert would
-    # vanish under ``python -O``.
+    # vanish under ``python -O``. The verdict is reduced over all ranks: raising only
+    # where the faulty facets are would leave the other ranks waiting in the next
+    # collective call.
     sides = lookup[integration_data[:, [0, 2]]]
-    if not (sides == [subdomain_plus.id, subdomain_minus.id]).all():
+    wrong = not (sides == [subdomain_plus.id, subdomain_minus.id]).all()
+    if topology.index_map(topology.dim).comm.allreduce(wrong, op=MPI.LOR):
         raise ValueError(
             f"facets tagged {tag} do not all separate volume subdomain "
             f"{subdomain_plus.id} from volume subdomain {subdomain_minus.id}; the "
@@ -76,6 +100,7 @@ def compute_one_sided_interior_facet_data(
     cell_tags: "dolfinx.mesh.MeshTags",
     facets,
     subdomain: VolumeSubdomain,
+    lookup: np.ndarray | None = None,
 ):
     """Integration data for the facets of a manifold that touch ``subdomain``, ordered
     so that ``"+"`` is always ``subdomain``.
@@ -96,10 +121,46 @@ def compute_one_sided_interior_facet_data(
         cell_tags: the cell meshtags of the parent mesh
         facets: the facets of the manifold, as returned by ``MeshTags.find``
         subdomain: the volume subdomain to place on the ``"+"`` restriction
+        lookup: the table of :func:`cell_tag_lookup` for ``cell_tags``, built here if
+            not given
 
     Returns:
         a flat array of ``(cell_plus, local_facet_plus, cell_minus, local_facet_minus)``
         quadruples, the form accepted by ``ufl.Measure("dS", subdomain_data=...)``
+
+    For several subdomains of the same manifold use
+    :func:`compute_sided_interior_facet_data`, which does the work once for all of
+    them.
+    """
+    return compute_sided_interior_facet_data(
+        cell_tags, facets, [subdomain], lookup=lookup
+    )[0]
+
+
+def compute_sided_interior_facet_data(
+    cell_tags: "dolfinx.mesh.MeshTags",
+    facets,
+    subdomains: list[VolumeSubdomain],
+    lookup: np.ndarray | None = None,
+) -> list[np.ndarray]:
+    """:func:`compute_one_sided_interior_facet_data` for several subdomains at once.
+
+    The integration entities of ``facets``, and the subdomain on either side of each,
+    are computed a single time and then split between ``subdomains``. Calling the
+    one-sided function per subdomain repeats both for every grain of a polycrystal,
+    so that the setup grows as the number of grains times the size of the mesh.
+
+    Args:
+        cell_tags: the cell meshtags of the parent mesh
+        facets: the facets of the manifold, as returned by ``MeshTags.find``
+        subdomains: the volume subdomains to place on the ``"+"`` restriction, one
+            integral each
+        lookup: the table of :func:`cell_tag_lookup` for ``cell_tags``, built here if
+            not given
+
+    Returns:
+        one flat array of ``(cell_plus, local_facet_plus, cell_minus,
+        local_facet_minus)`` quadruples per subdomain, in the order of ``subdomains``
     """
     topology = cell_tags.topology
     topology.create_connectivity(topology.dim - 1, topology.dim)
@@ -108,21 +169,25 @@ def compute_one_sided_interior_facet_data(
     data = compute_integration_domains(
         dolfinx.fem.IntegralType.interior_facet, topology, facets
     ).reshape(-1, 4)
-
-    # cell index -> volume subdomain id. MeshTags are not necessarily ordered by cell,
-    # nor do they necessarily cover every cell, so indexing values directly would be
-    # wrong for a mesh whose cells are not all tagged in order
-    cell_map = topology.index_map(topology.dim)
-    lookup = np.full(cell_map.size_local + cell_map.num_ghosts, -1, dtype=np.int32)
-    lookup[cell_tags.indices] = cell_tags.values
-
+    if lookup is None:
+        lookup = cell_tag_lookup(cell_tags)
     sides = lookup[data[:, [0, 2]]]
-    on_plus, on_minus = sides[:, 0] == subdomain.id, sides[:, 1] == subdomain.id
-    data = data[on_plus | on_minus]
-    # only the facets that have subdomain on "-" alone need their sides swapped
-    swap = on_minus[on_plus | on_minus] & ~on_plus[on_plus | on_minus]
-    data[swap] = data[swap][:, [2, 3, 0, 1]]
-    return data.reshape(-1)
+
+    # Each facet is listed for the subdomain on its "+" side, and once more, swapped,
+    # for the subdomain on its "-" side when that is a different one. A facet with the
+    # same subdomain on both sides is listed once, unswapped.
+    rows = np.arange(len(data))
+    two_sided = sides[:, 0] != sides[:, 1]
+    owner = np.concatenate([sides[:, 0], sides[two_sided, 1]])
+    row = np.concatenate([rows, rows[two_sided]])
+    entries = np.concatenate([data, data[two_sided][:, [2, 3, 0, 1]]])
+    # grouped by subdomain, keeping the order of the facets within each group
+    order = np.lexsort((row, owner))
+    owner, entries = owner[order], entries[order]
+    ids = np.array([subdomain.id for subdomain in subdomains], dtype=owner.dtype)
+    start = np.searchsorted(owner, ids, side="left")
+    stop = np.searchsorted(owner, ids, side="right")
+    return [entries[a:b].reshape(-1) for a, b in zip(start, stop, strict=True)]
 
 
 class InterfaceMethod(Enum):
@@ -181,7 +246,7 @@ class InterfaceBase(ABC):
         self.id = id
         self.subdomains = tuple(subdomains)
 
-    def compute_mapped_interior_facet_data(self, cell_tags):
+    def compute_mapped_interior_facet_data(self, cell_tags, lookup=None):
         """Compute integration data for interface integrals.
 
         This method computes the mapping between physical facets on the interface
@@ -190,13 +255,20 @@ class InterfaceBase(ABC):
 
         Args:
             cell_tags: The cell meshtags of the parent mesh.
+            lookup: optional table of :func:`cell_tag_lookup` for ``cell_tags``,
+                shared with the other interior-facet integrals of the problem.
 
         Returns:
             tuple: A tuple of (interface_id, flattened_integration_data) where
                 integration_data contains the mapped cell and facet indices.
         """
         return compute_ordered_interior_facet_data(
-            cell_tags, self.mt, self.id, self.subdomains[0], self.subdomains[1]
+            cell_tags,
+            self.mt,
+            self.id,
+            self.subdomains[0],
+            self.subdomains[1],
+            lookup=lookup,
         )
 
     def us(self, species: "Species"):

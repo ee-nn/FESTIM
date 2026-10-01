@@ -20,18 +20,18 @@ def meshtags_with_ghosts(mesh, tags):
     read from a distributed mesh file; ghost-only markings are not input tags.
     """
     index_map = mesh.topology.index_map(tags.dim)
-    values = dolfinx.la.vector(index_map, dtype=tags.values.dtype)
-    present = dolfinx.la.vector(index_map, dtype=np.int32)
-    values.array[:] = 0
-    present.array[:] = 0
+    # one (value, present) block per entity, so that a single scatter carries both;
+    # presence cannot be folded into the value, since zero is a valid tag
+    buffer = dolfinx.la.vector(index_map, 2, dtype=tags.values.dtype)
+    buffer.array[:] = 0
+    data = buffer.array.reshape(-1, 2)
     owned = tags.indices < index_map.size_local
     indices = tags.indices[owned]
-    values.array[indices] = tags.values[owned]
-    present.array[indices] = 1
-    values.scatter_forward()
-    present.scatter_forward()
-    indices = np.flatnonzero(present.array).astype(np.int32)
-    result = dolfinx.mesh.meshtags(mesh, tags.dim, indices, values.array[indices])
+    data[indices, 0] = tags.values[owned]
+    data[indices, 1] = 1
+    buffer.scatter_forward()
+    indices = np.flatnonzero(data[:, 1]).astype(np.int32)
+    result = dolfinx.mesh.meshtags(mesh, tags.dim, indices, data[indices, 0])
     result.name = tags.name
     return result
 

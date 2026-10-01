@@ -126,6 +126,18 @@ class CustomQuantity(DerivedQuantity):
     def title(self):
         return self._title
 
+    @property
+    def ufl_expr(self):
+        return self._ufl_expr
+
+    @ufl_expr.setter
+    def ufl_expr(self, value):
+        self._ufl_expr = value
+        # a new integrand invalidates the form compiled from the previous one
+        self._form = None
+        self._form_measure = None
+        self._form_key = None
+
     def compute(
         self,
         measure: ufl.Measure,
@@ -134,6 +146,11 @@ class CustomQuantity(DerivedQuantity):
         restriction=None,
     ):
         """Computes the value of the custom quantity and appends it to the data list.
+
+        The form is compiled on the first call and reused for as long as the
+        integrand, the measure, the tag and the restriction stay the same: compiling
+        it involves UFL processing and a JIT cache lookup that, in parallel, rank 0
+        does before the others, which costs far more than assembling a scalar.
 
         Args:
             measure: volume or surface measure of the model
@@ -145,8 +162,16 @@ class CustomQuantity(DerivedQuantity):
             raise ValueError("The UFL expression has not been evaluated yet.")
 
         tag = self.subdomain.id if subdomain_id is None else subdomain_id
-        form = fem.form(
-            restrict(self.ufl_expr, restriction) * measure(tag), entity_maps=entity_maps
-        )
-        self.value = assemble_scalar(form)
+        if (
+            self._form is None
+            or measure is not self._form_measure
+            or (tag, restriction) != self._form_key
+        ):
+            self._form = fem.form(
+                restrict(self.ufl_expr, restriction) * measure(tag),
+                entity_maps=entity_maps,
+            )
+            self._form_measure = measure
+            self._form_key = (tag, restriction)
+        self.value = assemble_scalar(self._form)
         self.data.append(self.value)

@@ -35,6 +35,10 @@ class ProblemBase:
     show_progress_bar: bool
     progress_bar: tqdm.auto.tqdm | None
     timesteps: list[float]
+    # whether define_meshtags_and_measures must copy the owners' tags onto ghost
+    # entities: only problems building submeshes or interior-facet orderings read
+    # the tags of ghosts, so the others are spared the communication
+    _needs_ghost_tags: bool = False
 
     def __init__(
         self,
@@ -170,8 +174,10 @@ class ProblemBase:
             )
 
         # Imported and user-provided tags may cover owned entities only. Submesh
-        # extraction and interior-facet integration also need the ghost tags.
-        if self.manifold_subdomains:
+        # extraction and interior-facet integration also need the ghost tags. That
+        # holds for every discontinuous problem, with or without a manifold: an
+        # Interface orders its facets from the tags of the ghost cells next to them.
+        if self._needs_ghost_tags or self.manifold_subdomains:
             self.facet_meshtags = meshtags_with_ghosts(
                 self.mesh.mesh, self.facet_meshtags
             )

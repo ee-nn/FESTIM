@@ -1299,6 +1299,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
 class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
     interfaces: list[_subdomain.Interface]
     surface_to_volume: dict
+    # submeshes and interior-facet orderings read the tags of ghost entities, which
+    # tags read from a file lack (see ProblemBase.define_meshtags_and_measures)
+    _needs_ghost_tags = True
     # None unless the user sets the deprecated problem-level attribute; only then
     # does initialise() push it onto the interfaces (see method_interface)
     _method_interface: _subdomain.interface.InterfaceMethod | None = None
@@ -1367,6 +1370,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         self.subdomain_to_species = {}  # maps subdomain to species defined in it
         self.subdomain_to_V_CG1 = {}
         self._total_volume = None
+        # owned exterior facets of the parent mesh, see _exterior_facet_marker
+        self._exterior_facet_mask = None
 
     @property
     def enclosures(self) -> list[_Enclosure]:
@@ -1468,6 +1473,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         )
         self.interior_facet_measure = None
         self._manifold_is_interior = {}
+        self._exterior_facet_mask = None
         self._manifold_export_measures = {}
         self._manifold_side_ids = {}
         self.manifold_to_volumes = _subdomain.map_manifold_to_volume_subdomains(
@@ -1935,24 +1941,32 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             # Ghost facets can have incomplete adjacency. Count each facet once,
             # on its owner, and distinguish physical boundaries from partition cuts.
             facets = facets[facets < mesh.topology.index_map(tdim - 1).size_local]
-            exterior = dolfinx.mesh.exterior_facet_indices(mesh.topology)
             # vectorised: the number of cells a facet connects to is the width of
             # its slice in the adjacency list, and there can be tens of thousands
             # of facets in a manifold
             offsets = facet_to_cell.offsets
             n_cells = offsets[facets + 1] - offsets[facets]
-            missing = (n_cells != 2) & ~np.isin(facets, exterior)
-            if mesh.comm.allreduce(bool(np.any(missing)), op=MPI.LOR):
+            # a facet with one cell is either on the boundary of the mesh or a
+            # partition cut whose second cell was not ghosted
+            missing = (n_cells != 2) & ~self._exterior_facet_marker()[facets]
+            # one reduction for all three counts rather than one each: this runs for
+            # every manifold, and every collective is a synchronisation point
+            counts = np.array(
+                [
+                    np.count_nonzero(missing),
+                    len(facets),
+                    np.count_nonzero(n_cells == 2),
+                ],
+                dtype=np.int64,
+            )
+            mesh.comm.Allreduce(MPI.IN_PLACE, counts, op=MPI.SUM)
+            n_missing, total, interior = (int(count) for count in counts)
+            if n_missing:
                 raise ValueError(
                     f"Internal manifold {manifold.id} needs both adjacent cells on "
                     "the rank owning each facet. Create or read the mesh with "
                     "GhostMode.shared_facet ghosting."
                 )
-            n_interior = int(np.count_nonzero(n_cells == 2))
-
-            comm = mesh.comm
-            total = comm.allreduce(len(facets), op=MPI.SUM)
-            interior = comm.allreduce(n_interior, op=MPI.SUM)
             if 0 < interior < total:
                 raise ValueError(
                     f"codim-1 volume subdomain {manifold.id} has {interior} interior "
@@ -1962,6 +1976,21 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 )
             self._manifold_is_interior[manifold] = interior > 0
         return self._manifold_is_interior[manifold]
+
+    def _exterior_facet_marker(self) -> npt.NDArray[np.bool_]:
+        """Mask over the local facets of the parent mesh, true on its owned exterior
+        facets.
+
+        ``dolfinx.mesh.exterior_facet_indices`` is collective and visits every facet
+        of the mesh, so it is computed once here rather than once per manifold.
+        """
+        if self._exterior_facet_mask is None:
+            topology = self.mesh.mesh.topology
+            facet_map = topology.index_map(topology.dim - 1)
+            mask = np.zeros(facet_map.size_local + facet_map.num_ghosts, dtype=bool)
+            mask[dolfinx.mesh.exterior_facet_indices(topology)] = True
+            self._exterior_facet_mask = mask
+        return self._exterior_facet_mask
 
     def facet_measure(self, manifold: _subdomain.VolumeSubdomain):
         """The parent-mesh measure the facets of ``manifold`` are integrated in: the
@@ -1999,14 +2028,19 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         is handed to all of them, each indexing it by its own id.
         """
         self._allocate_manifold_side_ids()
+        # one dense cell -> subdomain table shared by every integral below, rather
+        # than one built per manifold, per side of a manifold and per interface
+        lookup = _subdomain.cell_tag_lookup(self.volume_meshtags)
         integral_data = [
             entry
             for manifold in self.manifold_subdomains
             if self.manifold_is_interior(manifold)
-            for entry in self._manifold_integration_data(manifold)
+            for entry in self._manifold_integration_data(manifold, lookup=lookup)
         ]
         integral_data += [
-            interface.compute_mapped_interior_facet_data(self.volume_meshtags)
+            interface.compute_mapped_interior_facet_data(
+                self.volume_meshtags, lookup=lookup
+            )
             for interface in self.interfaces
         ]
         self.interior_facet_measure = ufl.Measure(
@@ -2045,7 +2079,9 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 self._manifold_side_ids[manifold][volume] = next_id
                 next_id += 1
 
-    def _manifold_integration_data(self, manifold: _subdomain.VolumeSubdomain):
+    def _manifold_integration_data(
+        self, manifold: _subdomain.VolumeSubdomain, lookup=None
+    ):
         """The ``(id, entities)`` pairs putting the coupling terms of an interior
         ``manifold`` on the facets it occupies.
 
@@ -2057,18 +2093,21 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
         Beyond two adjacent subdomains there is one pair *per side*, tagged with the ids
         allocated by :meth:`_allocate_manifold_side_ids`.
+
+        ``lookup`` is the table of :func:`festim.subdomain.cell_tag_lookup` for the
+        volume meshtags, built here if not given.
         """
         volumes = self.manifold_to_volumes[manifold]
         if len(volumes) > 2:
             facets = self.facet_meshtags.find(manifold.id)
+            # the integration entities and their sides are computed once for all the
+            # adjacent volumes, then split between them
+            sides = _subdomain.compute_sided_interior_facet_data(
+                self.volume_meshtags, facets, volumes, lookup=lookup
+            )
             return [
-                (
-                    self._manifold_side_ids[manifold][volume],
-                    _subdomain.compute_one_sided_interior_facet_data(
-                        self.volume_meshtags, facets, volume
-                    ),
-                )
-                for volume in volumes
+                (self._manifold_side_ids[manifold][volume], data)
+                for volume, data in zip(volumes, sides, strict=True)
             ]
         if len(volumes) == 2:
             return [
@@ -2078,6 +2117,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     manifold.id,
                     volumes[0],
                     volumes[1],
+                    lookup=lookup,
                 )
             ]
         # one subdomain on both sides: either restriction reads the same value, so the
@@ -3405,7 +3445,10 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 export.data = []
 
             if isinstance(export, exports.CustomQuantity):
-                volume, mesh, *_ = self.custom_quantity_context(export)
+                # resolved once and reused by post_processing, so that the measure,
+                # and with it the form CustomQuantity.compute compiles, stays the same
+                export._integration_context = self.custom_quantity_context(export)
+                volume, mesh, *_ = export._integration_context
                 local_species = [sp for sp in self.species if volume in sp.subdomains]
                 temperature = (
                     self.subdomain_temperature(volume)
@@ -3497,8 +3540,10 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                     export.compute()
 
             elif isinstance(export, exports.CustomQuantity):
+                # resolved once in initialise_exports, so that compute is handed the
+                # same measure every step and can reuse the form it compiled
                 _, _, measure, tag, restriction, entity_maps = (
-                    self.custom_quantity_context(export)
+                    export._integration_context
                 )
                 export.compute(
                     measure,

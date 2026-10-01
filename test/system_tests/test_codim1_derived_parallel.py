@@ -64,10 +64,14 @@ def test_derived_csv_written_once_on_model_communicator(tmp_path, self_comm):
     comm = MPI.COMM_SELF if self_comm else MPI.COMM_WORLD
     mesh = dolfinx.mesh.create_unit_square(comm, 4, 4)
     model, (_, _, gamma), (_, _, cg) = build(mesh=mesh)
+    # Under mpirun every rank runs its own pytest session, each with its own
+    # tmp_path; the ranks reading the file rank zero wrote have to look in rank
+    # zero's directory.
+    directory = comm.bcast(tmp_path, root=0)
     # Every world rank is rank zero of its COMM_SELF simulation and must write.
     suffix = str(MPI.COMM_WORLD.rank) if self_comm else "shared"
     quantity = F.TotalVolume(
-        field=cg, volume=gamma, filename=str(tmp_path / f"q_{suffix}.csv")
+        field=cg, volume=gamma, filename=str(directory / f"q_{suffix}.csv")
     )
     custom = F.CustomQuantity(expr=lambda **kw: kw["H_g"] + kw["t"], subdomain=gamma)
     model.exports = [quantity, custom]
@@ -202,3 +206,22 @@ def test_partition_point_is_not_a_manifold_dirichlet_boundary():
     )
     with pytest.raises(ValueError, match="matched no boundary entity"):
         model.initialise()
+
+
+def test_custom_quantity_form_is_compiled_once():
+    """Compiling a form is far costlier than assembling a scalar, and in parallel it
+    synchronises the ranks, so a custom quantity must not recompile every step."""
+    model, (_, _, gamma), _ = build(n=4)
+    custom = F.CustomQuantity(expr=lambda **kw: kw["H_g"] + kw["t"], subdomain=gamma)
+    model.exports = [custom]
+    model.settings.transient = True
+    model.settings.final_time = 0.06
+    model.settings.stepsize = F.Stepsize(initial_value=0.02)
+    model.show_progress_bar = False
+    model.initialise()
+    model.iterate()
+    form = custom._form
+    for _ in range(2):
+        model.iterate()
+    assert custom._form is form
+    assert len(custom.data) == 3
