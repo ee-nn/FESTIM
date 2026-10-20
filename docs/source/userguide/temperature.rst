@@ -158,9 +158,9 @@ Both problems must be transient and have the same ``final_time``; the coupled pr
 
 The two problems can be defined on different meshes, in which case the temperature is interpolated onto the mesh of the hydrogen transport problem at each time step.
 
-.. note::
-
-    Coupled problems are not yet supported with :class:`festim.HydrogenTransportProblemDiscontinuous`.
+The hydrogen solver transfers the temperature to each transport submesh before
+updating temperature-dependent inputs. This also applies when the temperature is
+provided as a FEniCS function that is updated by another solver.
 
 ----------------------
 From a checkpoint file

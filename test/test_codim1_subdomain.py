@@ -100,7 +100,7 @@ def test_codim1_subdomain_id_clashing_with_a_surface_raises():
     clashing = F.SurfaceSubdomain(id=2, locator=lambda x: np.isclose(x[0], 1.0))
 
     species = F.Species("H", subdomains=[omega])
-    problem = F.HydrogenTransportProblemDiscontinuous(
+    problem = F.HydrogenTransportProblem(
         mesh=F.Mesh(unit_square()),
         species=[species],
         subdomains=[omega, gamma, clashing],
@@ -235,7 +235,7 @@ def build_manifold_model(surfaces, species_on=None):
     bottom = F.SurfaceSubdomain(id=9, locator=lambda x: np.isclose(x[1], 0.0))
     H_om = F.Species("H_om", subdomains=[omega])
     H_gam = F.Species("H_gam", subdomains=species_on or [gamma])
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma, bottom, *surfaces],
@@ -276,7 +276,7 @@ def test_manifold_boundary_without_a_manifold_raises():
         material=F.Material(D_0=1, E_D=0),
         locator=lambda x: np.full_like(x[0], True, dtype=bool),
     )
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=mesh,
         species=[F.Species("H", subdomains=[omega])],
         subdomains=[omega, end],
@@ -327,7 +327,7 @@ def test_manifold_boundary_with_ambiguous_species_raises():
     # lives on *both* manifolds, so the surface cannot be resolved
     H_gam = F.Species("H_gam", subdomains=[gamma_top, gamma_left])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma_top, gamma_left, bottom, end],
@@ -366,7 +366,7 @@ def test_manifold_time_constants_live_on_the_submesh_and_track():
     H_om = F.Species("H_om", subdomains=[omega])
     H_gam = F.Species("H_gam", subdomains=[gamma])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma, right],
@@ -387,8 +387,9 @@ def test_manifold_time_constants_live_on_the_submesh_and_track():
 
     for mirror in (gamma.sub_t, gamma.sub_dt, gamma.sub_T):
         assert mirror.ufl_domain() is gamma.submesh.ufl_domain()
-    # a codim-0 subdomain has no mirror to keep: it uses the parent-mesh constants
-    assert omega.sub_t is None and omega.sub_dt is None
+    # Ordinary submeshes also mirror time for custom-field expressions.
+    assert omega.sub_t.ufl_domain() is omega.submesh.ufl_domain()
+    assert omega.sub_dt.ufl_domain() is omega.submesh.ufl_domain()
 
     model.iterate()
 

@@ -210,7 +210,7 @@ def test_writing_and_reading_of_species_function_using_checkpoints_discontinuous
     tmpdir,
 ):
     """Tests that a model can write a checkpoint file and another model can read it."""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 10, 10)
     my_model.mesh = F.Mesh(mesh)
@@ -258,7 +258,7 @@ def test_writing_and_reading_of_species_function_using_checkpoints_discontinuous
     my_model.initialise()
     my_model.run()
 
-    my_model2 = F.HydrogenTransportProblemDiscontinuous()
+    my_model2 = F.HydrogenTransportProblem()
     my_model2.mesh = F.Mesh(mesh)
     my_model2.subdomains = [vol1, vol2, surf1]
 
@@ -378,7 +378,7 @@ def _bcast_from_root(value):
 
 def _discontinuous_model(final_time=2.0):
     """A two-subdomain model with one species, used by the format tests below."""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
     my_model.mesh = F.Mesh(mesh)
 

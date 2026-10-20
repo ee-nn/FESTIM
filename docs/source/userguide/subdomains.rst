@@ -324,7 +324,7 @@ Coordinate systems
 ------------------
 
 Codimensional coupling supports the same coordinate systems as
-:class:`festim.HydrogenTransportProblemDiscontinuous`:
+:class:`festim.HydrogenTransportProblem`:
 
 * Cartesian: points in 1D, lines in 2D, and surfaces in 3D.
 * Cylindrical: points in a 1D radial mesh or lines in a 2D axisymmetric
@@ -353,7 +353,7 @@ Exchange laws remain flux densities: use the same equal-and-opposite
 value by an area. The radial metric cancels against the rescaled test function in
 these terms, just as it does in the storage and local source terms.
 
-Integral exports in the discontinuous problem include the physical measure:
+Integral exports include the physical measure:
 :math:`2\pi r` in cylindrical coordinates and :math:`4\pi r^2` in spherical
 coordinates. These factors apply to both totals and the numerator and denominator
 of averages, on bulk subdomains, manifolds and their boundaries. Cylindrical 1D
@@ -380,8 +380,8 @@ Limitations
   (:class:`festim.SurfaceFlux`, :class:`festim.TotalSurface`,
   :class:`festim.AverageSurface`, :class:`festim.TotalVolume`,
   :class:`festim.AverageVolume`) and :class:`festim.VTXSpeciesExport`. The minimum and
-  maximum quantities and :class:`festim.CustomQuantity` are not available in
-  :class:`festim.HydrogenTransportProblemDiscontinuous` at all, manifold or not.
+  maximum quantities and :class:`festim.CustomQuantity` are supported on ordinary
+  volumes and their surfaces, but are not available on manifolds.
 
 ----------
 Materials

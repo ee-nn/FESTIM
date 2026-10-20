@@ -19,7 +19,6 @@ from packaging.version import Version
 from festim import (
     boundary_conditions,
     exports,
-    k_B,
     problem,
 )
 from festim import (
@@ -63,7 +62,7 @@ from .mesh import CoordinateSystem, Mesh
 
 __all__ = [
     "HydrogenTransportProblem",
-    "HydrogenTransportProblemDiscontinuous",
+    "HydrogenTransportProblemDiscontinuous",  # noqa: F822 - resolved by __getattr__
 ]
 
 
@@ -78,95 +77,44 @@ def _warn_advection_terms_deprecated():
 
 
 class HydrogenTransportProblem(problem.ProblemBase):
-    """Hydrogen Transport Problem.
+    """Hydrogen transport on one or more volume subdomains.
+
+    Each subdomain carries a mixed function of its species; interfaces couple those
+    functions, and optional gas enclosures add pressure unknowns to the blocked solve.
+    Manifold volume subdomains carry their own lower-dimensional transport equation.
 
     Args:
-        mesh: The mesh
-        subdomains: list containing the subdomains
-        species: list containing the species
-        reactions: list containing the reactions
-        temperature: The temperature or a function describing the temperature as
-            a model of either space or space and time. Unit (K)
-        sources: The hydrogen sources
-        initial_conditions: The initial conditions
-        boundary_conditions: The boundary conditions
-        exports (list of festim.Export): the exports of the model
-        traps (list of F.Trap): the traps of the model
-        advection_terms: deprecated, use ``drift_terms``. Appended to it
-        drift_terms: the drift terms of the model -- advection, Soret, electromigration
+        mesh: The parent mesh.
+        subdomains: Volume and surface subdomains of the model.
+        species: Explicit species, with their volume subdomains.
+        reactions: Volumetric reactions.
+        temperature: Temperature in Kelvin, as a number, a FEniCS object, or a callable
+            accepting ``x`` and/or ``t``.
+        sources: Particle sources.
+        initial_conditions: Initial concentrations for transient simulations.
+        boundary_conditions: Concentration, flux, surface-reaction and outflow BCs.
+        settings: Solver and time-stepping settings.
+        exports: Field exports and derived quantities.
+        traps: Convenience trap definitions.
+        advection_terms: Deprecated; use ``drift_terms``.
+        drift_terms: Advection, Soret and electromigration terms.
+        petsc_options: Overrides for the default PETSc options.
+        element_immobile: ``"CG"`` (also ``"P"``) or ``"DG"`` for immobile species.
+        interfaces: Explicit interfaces coupling ordinary volume subdomains.
+        enclosures: Gas enclosures; requires DOLFINx >= 0.11.
 
-    Attributes:
-        mesh : The mesh
-        subdomains: The subdomains
-        species: The species
-        reactions: the reaction
-        temperature: The temperature in unit `K`
-        sources: The hydrogen sources
-        initial_conditions: The initial conditions
-        boundary_conditions: list of Dirichlet boundary conditions
-        exports (list of festim.Export): the export
-        traps (list of F.Trap): the traps of the model
-        advection_terms: deprecated, use ``drift_terms``. Appended to it
-        drift_terms: the drift terms of the model -- advection, Soret, electromigration
-        dx (dolfinx.fem.dx): the volume measure of the model
-        ds (dolfinx.fem.ds): the surface measure of the model
-        function_space (dolfinx.fem.FunctionSpaceBase): the function space of the
-            model
-        facet_meshtags (dolfinx.mesh.MeshTags): the facet meshtags of the model
-        volume_meshtags (dolfinx.mesh.MeshTags): the volume meshtags of the
-            model
-        formulation (ufl.form.Form): the formulation of the model
-        solver (dolfinx.nls.newton.NewtonSolver): the solver of the model
-        temperature_fenics (fem.Constant or fem.Function): the
-            temperature of the model as a fenics object (fem.Constant or
-            fem.Function).
-        temperature_expr (fem.Expression): the expression of the temperature
-            that is used to update the temperature_fenics
-        temperature_time_dependent (bool): True if the temperature is time
-            dependent
-        V_DG_0 (dolfinx.fem.FunctionSpaceBase): A DG function space of degree 0
-            over domain
-        V_DG_1 (dolfinx.fem.FunctionSpaceBase): A DG function space of degree 1
-            over domain
-        volume_subdomains (list of festim.VolumeSubdomain): the volume subdomains
-            of the model
-        surface_subdomains (list of festim.SurfaceSubdomain): the surface subdomains
-            of the model
-
-
-    Examples:
-        Can be used as either
-
-        .. highlight:: python
-        .. code-block:: python
-
-            import festim as F
-            my_model = F.HydrogenTransportProblem()
-            my_model.mesh = F.Mesh(...)
-            my_model.subdomains = [F.Subdomain(...)]
-            my_model.species = [F.Species(name="H"), F.Species(name="Trap")]
-            my_model.temperature = 500
-            my_model.sources = [F.ParticleSource(...)]
-            my_model.boundary_conditions = [F.BoundaryCondition(...)]
-            my_model.initialise()
-
-        or
-
-        .. highlight:: python
-        .. code-block:: python
-
-            my_model = F.HydrogenTransportProblem(
-                mesh=F.Mesh(...),
-                subdomains=[F.Subdomain(...)],
-                species=[F.Species(name="H"), F.Species(name="Trap")],
-            )
-            my_model.initialise()
+    Species with omitted subdomains temporarily default to all ordinary volumes, with
+    a deprecation warning. Multi-material models must declare interfaces explicitly.
+    Access solutions through ``volume.u``, ``volume.u_n`` and the species'
+    ``subdomain_to_*`` mappings. Deprecated single-domain aliases remain available
+    where there is exactly one possible target.
     """
 
     drift_terms: list[_drift.DriftTermBase]
-    _temperature_as_function: fem.Function
-    _species_to_D_global: dict[_species.Species, fem.Function]
-    _species_to_D_global_expr: dict[_species.Species, fem.Expression]
+    interfaces: list[_subdomain.Interface]
+    surface_to_volume: dict
+    subdomain_to_species: dict
+    _method_interface: _subdomain.interface.InterfaceMethod | None = None
 
     def __init__(
         self,
@@ -201,6 +149,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
         drift_terms=None,
         petsc_options=None,
         element_immobile: str = "CG",
+        *,
+        interfaces: list[_subdomain.Interface] | None = None,
+        enclosures: list[_Enclosure] | None = None,
     ):
         super().__init__(
             mesh=mesh,
@@ -227,12 +178,17 @@ class HydrogenTransportProblem(problem.ProblemBase):
 
         self._unpacked_sources = []
 
-        self._element_immobile = element_immobile
+        self.element_immobile = element_immobile
 
         self._temperature_as_function = None
-        self._species_to_D_global = None
-        self._species_to_D_global_expr = None
-        self._surface_to_volume = None
+
+        self.interfaces = interfaces or []
+        self.enclosures = enclosures or []
+        self.surface_to_volume = {}
+        self.subdomain_to_species = {}
+        self.subdomain_to_V_CG1 = {}
+        self._total_volume = None
+        self._spaces_defined = False
 
     @property
     def advection_terms(self):
@@ -366,285 +322,22 @@ class HydrogenTransportProblem(problem.ProblemBase):
             value = "CG"
         self._element_immobile = value
 
-    def initialise(self):
-        if getattr(self, "enclosures", None):
-            raise NotImplementedError(
-                f"Gas enclosures are not supported by {self.__class__.__name__}. Use "
-                "festim.HydrogenTransportProblemDiscontinuous instead, which solves a "
-                "blocked system the enclosure pressures can be added to."
-            )
-        self.create_species_from_traps()
-        self.define_function_spaces(element_degree=self.settings.element_degree)
-        self.define_meshtags_and_measures()
-        self.assign_functions_to_species()
-
-        self.t = fem.Constant(self.mesh.mesh, 0.0)
-        if self.settings.transient:
-            # TODO should raise error if no stepsize is provided
-            # TODO Should this be an attribute of festim.Stepsize?
-            self._dt = as_fenics_constant(
-                self.settings.stepsize.initial_value, self.mesh.mesh
-            )
-
-        self.create_implicit_species_value_fenics()
-
-        self.define_temperature()
-        self.define_boundary_conditions()
-        self.convert_reaction_rates_to_fenics_objects()
-        self.create_sources_from_reactions()
-        self.convert_source_input_values_to_fenics_objects()
-        self.convert_drift_terms_to_fenics_objects()
-        self.create_flux_values_fenics()
-        self.create_initial_conditions()
-        self.create_formulation()
-        self.create_solver()
-        self.initialise_exports()
-
-    def create_implicit_species_value_fenics(self):
-        """For each implicit species, create the value_fenics."""
-        for reaction in self.reactions:
-            for spe in reaction.species:
-                if isinstance(spe, _species.ImplicitSpecies):
-                    spe.create_value_fenics(
-                        mesh=self.mesh.mesh,
-                        t=self.t,
-                    )
-
     def create_species_from_traps(self):
-        """Generate a species and reaction per trap defined in self.traps."""
-
+        """Generate one immobile species and reaction per convenience trap."""
         for trap in self.traps:
-            trap.create_species_and_reaction()
-            self.species.append(trap.trapped_concentration)
-            self.reactions.append(trap.reaction)
-
-    def define_temperature(self):
-        """Sets the value of temperature_fenics_value.
-
-        The type depends on self.temperature. If self.temperature is a function on t
-        only, create a fem.Constant. Else, create an dolfinx.fem.Expression (stored in
-        self.temperature_expr) to be updated, a dolfinx.fem.Function object is created
-        from the Expression (stored in self.temperature_fenics_value). Raise a
-        ValueError if temperature is None.
-        """
-        # check if temperature is None
-        if self.temperature is None:
-            raise ValueError("the temperature attribute needs to be defined")
-
-        # if temperature is a float or int, create a fem.Constant
-        elif isinstance(self.temperature, float | int):
-            self.temperature_fenics = as_fenics_constant(
-                self.temperature, self.mesh.mesh
-            )
-        # if temperature is a fem.Constant or function, pass it to temperature_fenics
-        elif isinstance(self.temperature, fem.Constant | fem.Function):
-            self.temperature_fenics = self.temperature
-
-        # if temperature is callable, process accordingly
-        elif callable(self.temperature):
-            arguments = self.temperature.__code__.co_varnames
-            if "t" in arguments and "x" not in arguments:
-                if not isinstance(self.temperature(t=float(self.t)), float | int):
-                    raise ValueError(
-                        f"self.temperature should return a float or an int, not "
-                        f"{type(self.temperature(t=float(self.t)))} "
-                    )
-                # only t is an argument
-                self.temperature_fenics = as_fenics_constant(
-                    mesh=self.mesh.mesh, value=self.temperature(t=float(self.t))
+            if trap.volume not in self.volume_subdomains:
+                raise ValueError(f"Trap {trap.name} has a volume outside this problem")
+            if trap.mobile_species not in self.species or trap.volume not in (
+                trap.mobile_species.subdomains or []
+            ):
+                raise ValueError(
+                    f"Mobile species of trap {trap.name} must be defined in volume "
+                    f"subdomain {trap.volume.id}"
                 )
-            else:
-                x = ufl.SpatialCoordinate(self.mesh.mesh)
-                degree = 1
-                element_temperature = basix.ufl.element(
-                    basix.ElementFamily.P,
-                    self.mesh.mesh.basix_cell(),
-                    degree,
-                    basix.LagrangeVariant.equispaced,
-                )
-                function_space_temperature = fem.functionspace(
-                    self.mesh.mesh, element_temperature
-                )
-                self.temperature_fenics = fem.Function(function_space_temperature)
-                self.temperature_fenics.name = "temperature"
-                kwargs = {}
-                if "t" in arguments:
-                    kwargs["t"] = self.t
-                if "x" in arguments:
-                    kwargs["x"] = x
-
-                # store the expression of the temperature
-                # to update the temperature_fenics later
-                self.temperature_expr = fem.Expression(
-                    self.temperature(**kwargs),
-                    function_space_temperature.element.interpolation_points,
-                )
-                self.temperature_fenics.interpolate(self.temperature_expr)
-
-    def _export_context(
-        self, export
-    ) -> tuple[list[fem.Function], list[str], dolfinx.mesh.Mesh]:
-        """Resolve what a field export should write.
-
-        Args:
-            export: the export to resolve
-
-        Returns:
-            the functions to write, the name to store each one under, and the mesh
-            they live on
-        """
-        if isinstance(export, exports.TemperatureExport):
-            self._temperature_as_function = self._get_temperature_field_as_function()
-            return (
-                [self._temperature_as_function],
-                [self._temperature_as_function.name],
-                self._temperature_as_function.function_space.mesh,
-            )
-        elif isinstance(export, exports.SpeciesExport):
-            functions = export.get_functions()
-            names = [species.name for species in export.field]
-            return functions, names, self.mesh.mesh
-        elif isinstance(export, exports.CustomFieldExport):
-            export.function = fem.Function(self.V_CG_1)
-            export.set_dolfinx_expression(
-                temperature=self.temperature_fenics,
-                time=self.t,
-            )
-            return (
-                [export.function],
-                [export.filename.stem],
-                export.function.function_space.mesh,
-            )
-        raise NotImplementedError(f"Export type {type(export)} not implemented")
-
-    def initialise_exports(self):
-        """Defines the export writers of the model, if field is given as a string, find
-        species object in self.species."""
-
-        # formats that hold several meshes in one file (vtkhdf) let exports share a
-        # filename: the first one to claim it truncates, the rest append as new blocks
-        initialised_files = set()
-        for export in self.exports:
-            # if name of species is given then replace with species object. Done first
-            # so that the writers below get real Species to work from.
-            if hasattr(export, "field"):
-                if isinstance(export.field, list):
-                    for idx, field in enumerate(export.field):
-                        if isinstance(field, str):
-                            export.field[idx] = _species.find_species_from_name(
-                                field, self.species
-                            )
-                elif isinstance(export.field, str):
-                    export.field = _species.find_species_from_name(
-                        export.field, self.species
-                    )
-
-            if isinstance(export, exports.FieldExportBase):
-                self._register_export_milestones(export)
-                functions, names, mesh = self._export_context(export)
-                # everything lives on the parent mesh here, so a single block per file
-                export.define_writer(
-                    functions,
-                    names,
-                    mesh,
-                    overwrite=export.filename not in initialised_files,
-                )
-                initialised_files.add(export.filename)
-
-            elif isinstance(export, exports.DerivedQuantity):
-                # raise not implemented error if the derived quantity don't match the
-                # type of mesh eg. TotalVolume is not implemented for cylindrical
-                # or spherical meshes. SurfaceFlux supports all coordinate systems.
-                if (
-                    self.mesh.coordinate_system != CoordinateSystem.CARTESIAN
-                    and not isinstance(export, exports.SurfaceFlux)
-                ):
-                    raise NotImplementedError(
-                        f"Derived quantity exports are not implemented for "
-                        f"{self.mesh.coordinate_system!s} meshes"
-                    )
-
-                # a volume subdomain is accepted as a surface only to let a codim-1
-                # one (a manifold) through, and manifolds exist only in
-                # HydrogenTransportProblemDiscontinuous. Here the id would be looked
-                # up in the facet tags, silently reporting some other surface's value
-                if isinstance(export, exports.SurfaceQuantity) and isinstance(
-                    export.surface, _subdomain.VolumeSubdomain
-                ):
-                    raise TypeError(
-                        f"volume subdomain {export.surface.id} was given as the "
-                        f"surface of a {type(export).__name__}. Co-dim volume "
-                        "subdomains are only supported by "
-                        "HydrogenTransportProblemDiscontinuous"
-                    )
-
-            # clean data for profile1D export
-            if isinstance(export, exports.Profile1DExport):
-                export.data = []
-                export.t = []
-        # compute diffusivity function for surface fluxes
-
-        # TODO: probably a better way to handle things would be to follow what's done in
-        # https://jsdokken.com/dolfinx-tutorial/chapter3/subdomains.html
-        spe_to_D_global_func_expr = {
-            spe: self.define_D_global(spe) for spe in self.species if spe.mobile
-        }
-        self._species_to_D_global_expr = {
-            k: v[1] for k, v in spe_to_D_global_func_expr.items()
-        }  # links species to D expression
-        self._species_to_D_global = {
-            k: v[0] for k, v in spe_to_D_global_func_expr.items()
-        }  # links species to global D function
-
-        for export in self.exports:
-            if isinstance(export, exports.SurfaceQuantity):
-                # add the global D to the export
-                export.D = self._species_to_D_global.get(export.field)
-                export.D_expr = self._species_to_D_global_expr.get(export.field)
-                export.coordinate_system = self.mesh.coordinate_system
-            # a model without drift terms must not pay for the surface-to-volume
-            # lookup, which needs meshtags this one does not otherwise require
-            if self.drift_terms and isinstance(export, exports.SurfaceFlux):
-                export.drift_velocity = self.drift_velocity_in(
-                    field=export.field,
-                    volume=self.volume_subdomain_of_surface(export.surface),
-                )
-            if isinstance(export, exports.MaximumVolume | exports.MinimumVolume):
-                export.volume_meshtags = self.volume_meshtags
-            if isinstance(export, exports.MaximumSurface | exports.MinimumSurface):
-                export.facet_meshtags = self.facet_meshtags
-
-            # reset the data and time for SurfaceQuantity and VolumeQuantity
-            if isinstance(export, exports.DerivedQuantity):
-                export.t = []
-                export.data = []
-
-            if isinstance(export, exports.CustomQuantity):
-                kwargs = {
-                    species.name: species.post_processing_solution
-                    for species in self.species
-                }
-                kwargs["n"] = ufl.FacetNormal(self.mesh.mesh)
-                kwargs["t"] = self.t
-                kwargs["T"] = self.temperature_fenics
-
-                # NOTE we need to change our D_global approach
-                D_kwargs = {
-                    f"D_{sp.name}": self._species_to_D_global[sp]
-                    for sp in self.species
-                    if sp.mobile  # immobile species don't have a D_global
-                }
-                kwargs.update(D_kwargs)
-                kwargs["D"] = {
-                    sp.name: D_kwargs[f"D_{sp.name}"]
-                    for sp in self.species
-                    if sp.mobile
-                }
-                if len(self.species) == 1:
-                    if self.species[0].mobile:
-                        kwargs["D"] = kwargs[f"D_{self.species[0].name}"]
-                kwargs["x"] = ufl.SpatialCoordinate(self.mesh.mesh)
-                export.ufl_expr = export.expr(**kwargs)
+            if trap.trapped_concentration not in self.species:
+                trap.create_species_and_reaction()
+                self.species.append(trap.trapped_concentration)
+                self.reactions.append(trap.reaction)
 
     def _get_temperature_field_as_function(self) -> dolfinx.fem.Function:
         """Based on the type of the temperature_fenics attribute, converts it as a
@@ -656,12 +349,11 @@ class HydrogenTransportProblem(problem.ProblemBase):
         if isinstance(self.temperature_fenics, fem.Function):
             return self.temperature_fenics
         elif isinstance(self.temperature_fenics, fem.Constant):
-            # use existing function space if function already exists
             if self._temperature_as_function is None:
                 V = dolfinx.fem.functionspace(self.mesh.mesh, ("P", 1))
-            else:
-                V = self._temperature_as_function.function_space
-            temperature_field = dolfinx.fem.Function(V)
+                self._temperature_as_function = fem.Function(V)
+            temperature_field = self._temperature_as_function
+            V = temperature_field.function_space
             temperature_expr = fem.Expression(
                 self.temperature_fenics,
                 V.element.interpolation_points,
@@ -711,655 +403,12 @@ class HydrogenTransportProblem(problem.ProblemBase):
             return None
         return sum(velocities[1:], velocities[0])
 
-    def volume_subdomain_of_surface(
-        self, surface: _subdomain.SurfaceSubdomain
-    ) -> _subdomain.VolumeSubdomain:
-        """Returns the volume subdomain a surface subdomain belongs to.
-
-        The mapping is deduced from the mesh connectivity and the meshtags, and is
-        computed once then cached.
-
-        Args:
-            surface: the surface subdomain
-
-        Returns:
-            the volume subdomain the surface belongs to
-
-        Raises:
-            ValueError: if the surface cannot be mapped to a volume subdomain
-        """
-        if self._surface_to_volume is None:
-            mesh = self.mesh.mesh
-            tdim = mesh.topology.dim
-            mesh.topology.create_connectivity(tdim - 1, tdim)
-            self._surface_to_volume = _subdomain.map_surface_to_volume_subdomains(
-                ft=self.facet_meshtags,
-                ct=self.volume_meshtags,
-                facet_to_cell=mesh.topology.connectivity(tdim - 1, tdim),
-                volume_subdomains=self.volume_subdomains,
-                surface_subdomains=self.facet_surface_subdomains,
-                comm=mesh.comm,
-            )
-
-        if surface not in self._surface_to_volume:
-            raise ValueError(
-                f"Surface subdomain {surface.id} could not be mapped to a volume "
-                "subdomain. Check that its id matches a tagged facet of the mesh."
-            )
-        return self._surface_to_volume[surface]
-
-    def define_D_global(self, species):
-        """Defines the global diffusion coefficient for a given species.
-
-        Args:
-            species (F.Species): the species
-
-        Returns:
-            dolfinx.fem.Function, dolfinx.fem.Expression: the global diffusion
-                coefficient and the expression of the global diffusion coefficient
-                for a given species
-        """
-        assert isinstance(species, _species.Species)
-        # create global D function
-        D = fem.Function(self.V_DG_1)
-
-        # if diffusion coeffient has been given as a function, use that
-        if self.volume_subdomains[0].material.D:
-            if len(self.volume_subdomains) > 1:
-                raise NotImplementedError(
-                    "Giving the diffusion coefficient as a function is currently "
-                    "only supported for a single volume subdomain case"
-                )
-            return self.volume_subdomains[0].material.D, None
-
-        D_0 = fem.Function(self.V_DG_0)
-        E_D = fem.Function(self.V_DG_0)
-        for vol in self.volume_subdomains:
-            cell_indices = self.volume_meshtags.find(vol.id)
-
-            # replace values of D_0 and E_D by values from the material
-            D_0.x.array[cell_indices] = vol.material.get_D_0(species=species)
-            E_D.x.array[cell_indices] = vol.material.get_E_D(species=species)
-
-        expr = D_0 * ufl.exp(
-            -E_D / as_fenics_constant(k_B, self.mesh.mesh) / self.temperature_fenics
-        )
-        D_expr = fem.Expression(expr, self.V_DG_1.element.interpolation_points)
-        D.interpolate(D_expr)
-        return D, D_expr
-
-    def define_function_spaces(self, element_degree: int = 1):
-        """Creates the function space of the modelw with a mixed element. Creates the
-        main solution and previous solution function u and u_n. Create global DG
-        function spaces of degree 0 and 1 for the global diffusion coefficient.
-
-        Args:
-            element_degree: Degree order for finite element. Defaults to 1.
-        """
-
-        element_CG = basix.ufl.element(
-            basix.ElementFamily.P,
-            self.mesh.mesh.basix_cell(),
-            element_degree,
-            basix.LagrangeVariant.equispaced,
-        )
-        element_DG = basix.ufl.element(
-            "DG",
-            self.mesh.mesh.basix_cell(),
-            element_degree,
-            basix.LagrangeVariant.equispaced,
-        )
-
-        elements = []
-        for spe in self.species:
-            if isinstance(spe, _species.Species):
-                if spe.mobile:
-                    elements.append(element_CG)
-                else:
-                    match self._element_immobile:
-                        case "DG":
-                            elements.append(element_DG)
-                        case "CG":
-                            elements.append(element_CG)
-
-        element = basix.ufl.mixed_element(elements)
-
-        self.function_space = fem.functionspace(self.mesh.mesh, element)
-
-        # create global DG function spaces of degree 0 and 1
-        element_DG0 = basix.ufl.element(
-            "DG",
-            self.mesh.mesh.basix_cell(),
-            0,
-            basix.LagrangeVariant.equispaced,
-        )
-        element_DG1 = basix.ufl.element(
-            "DG",
-            self.mesh.mesh.basix_cell(),
-            1,
-            basix.LagrangeVariant.equispaced,
-        )
-        self.V_DG_0 = fem.functionspace(self.mesh.mesh, element_DG0)
-        self.V_DG_1 = fem.functionspace(self.mesh.mesh, element_DG1)
-        self.V_CG_1 = fem.functionspace(self.mesh.mesh, ("CG", 1))
-
-        self.u = fem.Function(self.function_space)
-        self.u_n = fem.Function(self.function_space)
-
-    def assign_functions_to_species(self):
-        """Creates the solution, prev solution, test function and post-processing
-        solution for each species, as well as a collapsed function space for each
-        species."""
-
-        sub_solutions = list(ufl.split(self.u))
-        sub_prev_solution = list(ufl.split(self.u_n))
-        sub_test_functions = list(ufl.TestFunctions(self.function_space))
-
-        for idx, spe in enumerate(self.species):
-            spe.sub_function_space = self.function_space.sub(idx)
-            spe.sub_function = self.u.sub(idx)  # TODO add this to discontinuous class
-            spe.post_processing_solution = self.u.sub(idx).collapse()
-            spe.post_processing_solution.name = spe.name
-            spe.collapsed_function_space, spe.map_sub_to_main_solution = (
-                self.function_space.sub(idx).collapse()
-            )
-
-        for idx, spe in enumerate(self.species):
-            spe.solution = sub_solutions[idx]
-            spe.prev_solution = sub_prev_solution[idx]
-            spe.test_function = sub_test_functions[idx]
-
-    def define_boundary_conditions(self):
-        """Defines the boundary conditions of the model."""
-
-        for bc in self._unpacked_bcs:
-            if isinstance(bc.species, str):
-                # if name of species is given then replace with species object
-                bc.species = _species.find_species_from_name(bc.species, self.species)
-            if isinstance(bc, boundary_conditions.ParticleFluxBC):
-                bc.create_value_fenics(
-                    mesh=self.mesh.mesh,
-                    temperature=self.temperature_fenics,
-                    t=self.t,
-                )
-
-        super().define_boundary_conditions()
-
-    def create_dirichletbc_form(self, bc):
-        """Creates a dirichlet boundary condition form.
-
-        Args:
-            bc (festim.DirichletBC): the boundary condition
-
-        Returns:
-            dolfinx.fem.bcs.DirichletBC: A representation of
-                the boundary condition for modifying linear systems.
-        """
-        # create value_fenics
-        bc.create_value(
-            temperature=self.temperature_fenics,
-            function_space=bc.species.collapsed_function_space,
-            t=self.t,
-        )
-
-        # get dofs
-        if isinstance(bc.value_fenics, (fem.Function)):
-            function_space_dofs = (
-                bc.species.sub_function_space,
-                bc.species.collapsed_function_space,
-            )
-        else:
-            function_space_dofs = bc.species.sub_function_space
-
-        bc_dofs = bc.define_surface_subdomain_dofs(
-            facet_meshtags=self.facet_meshtags,
-            function_space=function_space_dofs,
-        )
-
-        # create form
-        form = fem.dirichletbc(
-            value=bc.value_fenics,
-            dofs=bc_dofs,
-            V=bc.species.sub_function_space,
-        )
-
-        return form
-
-    def convert_source_input_values_to_fenics_objects(self):
-        """For each source create the value_fenics."""
-        for source in self._unpacked_sources:
-            # create value_fenics for all F.ParticleSource objects
-            if isinstance(source, _source.ParticleSource):
-                source.value.convert_input_value(
-                    function_space=self.function_space,
-                    t=self.t,
-                    temperature=self.temperature_fenics,
-                    up_to_ufl_expr=True,
-                )
-
-    def convert_reaction_rates_to_fenics_objects(self):
-        """For each reaction convert its rate coefficients to fenics objects."""
-        for reaction in self.reactions:
-            for rate in reaction.rate_coefficients:
-                if rate.input_value is not None:
-                    rate.convert_input_value(
-                        function_space=getattr(self, "function_space", None),
-                        t=self.t,
-                        temperature=self.temperature_fenics,
-                        subdomain=reaction.volume,
-                        up_to_ufl_expr=True,
-                    )
-
     def create_sources_from_reactions(self):
         """Populate _unpacked_sources with the user-provided sources plus one
         volumetric particle source per species participating in each reaction."""
         self._unpacked_sources = list(self.sources)
         for reaction in self.reactions:
             self._unpacked_sources += reaction.create_sources()
-
-    def convert_drift_terms_to_fenics_objects(self):
-        """For each drift term convert its user-given coefficients.
-
-        Runs after ``define_temperature`` so that a coefficient given as a function of
-        ``T``, or a drift velocity built from the temperature gradient, has one to read.
-        """
-
-        for drift_term in self.drift_terms:
-            drift_term.convert_inputs(
-                function_space=self.function_space,
-                t=self.t,
-                temperature=self.temperature_fenics,
-            )
-
-    def create_flux_values_fenics(self):
-        """For each particle flux create the value_fenics."""
-        for bc in self.boundary_conditions:
-            # create value_fenics for all F.ParticleFluxBC objects
-            if isinstance(bc, boundary_conditions.ParticleFluxBC):
-                bc.create_value_fenics(
-                    mesh=self.mesh.mesh,
-                    temperature=self.temperature_fenics,
-                    t=self.t,
-                )
-
-    def create_initial_conditions(self):
-        """For each initial condition, create the value_fenics and assign it to the
-        previous solution of the condition's species."""
-
-        if len(self.initial_conditions) > 0 and not self.settings.transient:
-            raise ValueError(
-                "Initial conditions can only be defined for transient simulations"
-            )
-
-        for condition in self.initial_conditions:
-            function_space_value = None
-            if callable(condition.value):
-                # if bc.value is a callable then need to provide a functionspace
-                function_space_value = condition.species.collapsed_function_space
-
-            condition.create_expr_fenics(
-                mesh=self.mesh.mesh,
-                temperature=self.temperature_fenics,
-                function_space=function_space_value,
-            )
-
-            # assign to previous solution of species
-            entities = self.volume_meshtags.find(condition.volume.id)
-            idx = self.species.index(condition.species)
-            function_to_interpolate_on = self.u_n.sub(idx)
-
-            function_to_interpolate_on.interpolate(
-                condition.expr_fenics, cells0=entities
-            )
-
-    def create_formulation(self):
-        """Creates the formulation of the model."""
-
-        self.formulation = 0
-
-        # add diffusion and time derivative for each species
-        for spe in self.species:
-            u = spe.solution
-            u_n = spe.prev_solution
-            v = spe.test_function
-
-            for vol in self.volume_subdomains:
-                if spe.mobile:
-                    D = vol.material.get_diffusion_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, spe
-                    )
-                    match self.mesh.coordinate_system:
-                        case CoordinateSystem.CARTESIAN:
-                            self.formulation += ufl.dot(
-                                D * ufl.grad(u), ufl.grad(v)
-                            ) * self.dx(vol.id)
-                        case CoordinateSystem.CYLINDRICAL:
-                            r = ufl.SpatialCoordinate(self.mesh.mesh)[0]
-                            self.formulation += (
-                                r
-                                * ufl.dot(D * ufl.grad(u), ufl.grad(v / r))
-                                * self.dx(vol.id)
-                            )
-                        case CoordinateSystem.SPHERICAL:
-                            r = ufl.SpatialCoordinate(self.mesh.mesh)[0]
-                            self.formulation += (
-                                r**2
-                                * ufl.dot(D * ufl.grad(u), ufl.grad(v / r**2))
-                                * self.dx(vol.id)
-                            )
-                        case _:
-                            raise NotImplementedError(
-                                f"Unknown coordinate system {self.mesh.coordinate_system!s}"  # noqa: E501
-                            )
-
-                if self.settings.transient:
-                    self.formulation += ((u - u_n) / self.dt) * v * self.dx(vol.id)
-
-        for source in self._unpacked_sources:
-            self.formulation -= (
-                source.value.fenics_object
-                * source.species.test_function
-                * self.dx(source.volume.id)
-            )
-
-        # add boundary conditions (fluxes and weak dirichlet)
-        for bc in self.boundary_conditions:
-            if isinstance(bc, boundary_conditions.ParticleFluxBC):
-                self.formulation -= (
-                    bc.value_fenics
-                    * bc.species.test_function
-                    * self.ds(bc.subdomain.id)
-                )
-            if isinstance(bc, boundary_conditions.SurfaceReactionBC):
-                for flux_bc in bc.flux_bcs:
-                    self.formulation -= (
-                        flux_bc.value_fenics
-                        * flux_bc.species.test_function
-                        * self.ds(flux_bc.subdomain.id)
-                    )
-
-            if isinstance(bc, boundary_conditions.FixedConcentrationBC):
-                if bc.enforce_weakly:
-                    u = bc.species.solution
-                    v = bc.species.test_function
-                    # D is set by the material of the volume the surface belongs to
-                    vol = self.volume_subdomain_of_surface(bc.subdomain)
-                    D = vol.material.get_diffusion_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, bc.species
-                    )
-                    self.formulation += bc.weak_formulation(u, v, self.ds, D)
-
-        for drift_term in self.drift_terms:
-            vol = drift_term.subdomain
-            for species in drift_term.species:
-                D = vol.material.get_diffusion_coefficient(
-                    self.mesh.mesh, self.temperature_fenics, species
-                )
-                velocity = drift_term.drift_velocity(
-                    D=D, temperature=self.temperature_fenics
-                )
-                # a term whose velocity is identically zero is still assembled: it costs
-                # nothing (UFL folds the zero into the integrand it shares a measure
-                # with) and dropping it would change the user's model behind their back
-                _drift.warn_if_no_effect(drift_term, species, velocity)
-                self.formulation += _drift.drift_form(
-                    concentration=species.solution,
-                    test_function=species.test_function,
-                    velocity=velocity,
-                    dx=self.dx(vol.id),
-                    coordinate_system=self.mesh.coordinate_system,
-                    mesh=self.mesh.mesh,
-                )
-
-        for bc in self.boundary_conditions:
-            if isinstance(bc, boundary_conditions.OutflowBC):
-                velocity = self.drift_velocity_in(
-                    field=bc.species,
-                    volume=self.volume_subdomain_of_surface(bc.subdomain),
-                )
-                if velocity is not None:
-                    self.formulation += (
-                        bc.species.solution
-                        * ufl.dot(velocity, ufl.FacetNormal(self.mesh.mesh))
-                        * bc.species.test_function
-                        * self.ds(bc.subdomain.id)
-                    )
-
-        # check if each species is defined in all volumes
-        if not self.settings.transient:
-            for spe in self.species:
-                # if species mobile, already defined in diffusion term
-                if not spe.mobile:
-                    not_defined_in_volume = self.volume_subdomains.copy()
-                    for vol in self.volume_subdomains:
-                        # check reactions
-                        for reaction in self.reactions:
-                            if vol == reaction.volume:
-                                if vol in not_defined_in_volume:
-                                    not_defined_in_volume.remove(vol)
-
-                    # add c = 0 to formulation where needed
-                    for vol in not_defined_in_volume:
-                        self.formulation += (
-                            spe.solution * spe.test_function * self.dx(vol.id)
-                        )
-
-    def update_time_dependent_values(self):
-        super().update_time_dependent_values()
-
-        t = float(self.t)
-
-        for reaction in self.reactions:
-            for spe in reaction.species:
-                if isinstance(spe, _species.ImplicitSpecies):
-                    spe.update_density(t=t)
-            # the sources built from a reaction only wrap a ufl expression
-            # referencing these rate Values, so the rates must be updated here
-            # directly. Temperature-dependent rates are ufl expressions
-            # referencing temperature_fenics (updated in place below), so only
-            # explicitly time-dependent rates need a value update.
-            for rate in reaction.rate_coefficients:
-                if rate.explicit_time_dependent:
-                    rate.update(t=t)
-
-        if (
-            isinstance(self.temperature, fem.Function)
-            or self.temperature_time_dependent
-        ):
-            for bc in self.boundary_conditions:
-                if isinstance(
-                    bc,
-                    boundary_conditions.FixedConcentrationBC
-                    | boundary_conditions.ParticleFluxBC,
-                ):
-                    if bc.temperature_dependent:
-                        bc.update(t=t)
-
-            for source in self.sources:
-                if source.value.temperature_dependent:
-                    source.value.update(t=t)
-
-        if self.temperature_time_dependent:
-            if isinstance(self.temperature_fenics, fem.Constant):
-                self.temperature_fenics.value = self.temperature(t=t)
-            elif isinstance(self.temperature_fenics, fem.Function):
-                self.temperature_fenics.interpolate(self.temperature_expr)
-
-        for drift_term in self.drift_terms:
-            drift_term.update_time_dependent_inputs(t=t)
-
-    def update_post_processing_solutions(self):
-        """Updates the post-processing solutions of each species."""
-
-        for spe in self.species:
-            spe.post_processing_solution.x.array[:] = self.u.x.array[
-                spe.map_sub_to_main_solution
-            ]
-
-    def post_processing(self):
-        """Post processes the model."""
-
-        self.update_post_processing_solutions()
-
-        if self.temperature_time_dependent:
-            # update global D if temperature time dependent or internal
-            # variables time dependent
-            # TODO: honestly, we probably don't need to do this at all
-            # SurfaceFlux quantities should use ufl.Expr for D instead of a fem.Function
-
-            for spe, D_global in self._species_to_D_global.items():
-                D_global.interpolate(self._species_to_D_global_expr[spe])
-
-        for export in self.exports:
-            # skip if it isn't time to export
-            if hasattr(export, "times"):
-                if not is_it_time_to_export(
-                    current_time=float(self.t), times=export.times
-                ):
-                    continue
-
-            # handle field exports
-            if isinstance(export, exports.FieldExportBase):
-                if isinstance(export, exports.TemperatureExport):
-                    if not self.temperature_time_dependent:
-                        # nothing changed since the last write
-                        continue
-                    self._temperature_as_function.interpolate(
-                        self._get_temperature_field_as_function()
-                    )
-                export.update()
-                export.write(float(self.t))
-
-            # TODO if export type derived quantity
-            if isinstance(export, exports.SurfaceQuantity):
-                if isinstance(
-                    export,
-                    exports.SurfaceFlux | exports.TotalSurface | exports.AverageSurface,
-                ):
-                    export.compute(export.field.solution, self.ds)
-                else:
-                    export.compute()
-                # update export data
-                export.t.append(float(self.t))
-
-                # if filename given write export data to file
-                if export.filename is not None:
-                    export.write(t=float(self.t))
-            elif isinstance(export, exports.VolumeQuantity):
-                if isinstance(export, exports.TotalVolume | exports.AverageVolume):
-                    export.compute(u=export.field.solution, dx=self.dx)
-                else:
-                    export.compute()
-                # update export data
-                export.t.append(float(self.t))
-
-                # if filename given write export data to file
-                if export.filename is not None:
-                    export.write(t=float(self.t))
-            elif isinstance(export, exports.CustomQuantity):
-                is_surface = isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                measure = self.ds if is_surface else self.dx
-                export.compute(measure)
-
-                # update export data
-                export.t.append(float(self.t))
-
-                # if filename given write export data to file
-                if export.filename is not None:
-                    export.write(t=float(self.t))
-
-            if isinstance(export, exports.Profile1DExport):
-                # computing dofs at each time step is costly so storing it in the export
-                if export._dofs is None:
-                    index = self.species.index(export.field)
-                    V0, export._dofs = self.u.function_space.sub(index).collapse()
-                    # dolfinx >=0.11 returns the collapse dof map as a list of
-                    # arrays; flatten it back to a 1D index array
-                    if Version(dolfinx.__version__) >= Version("0.11"):
-                        export._dofs = np.concatenate(export._dofs)
-                    coords = V0.tabulate_dof_coordinates()[:, 0]
-                    export._sort_coords = np.argsort(coords)
-                    x = coords[export._sort_coords]
-
-                    export.x = x
-
-                c = self.u.x.array[export._dofs][export._sort_coords]
-
-                export.data.append(c)
-                export.t.append(float(self.t))
-
-
-class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
-    interfaces: list[_subdomain.Interface]
-    surface_to_volume: dict
-    # None unless the user sets the deprecated problem-level attribute; only then
-    # does initialise() push it onto the interfaces (see method_interface)
-    _method_interface: _subdomain.interface.InterfaceMethod | None = None
-    subdomain_to_species: dict
-
-    def __init__(
-        self,
-        mesh=None,
-        subdomains=None,
-        species=None,
-        reactions=None,
-        temperature=None,
-        sources=None,
-        initial_conditions=None,
-        boundary_conditions=None,
-        settings=None,
-        exports=None,
-        traps=None,
-        advection_terms=None,
-        drift_terms=None,
-        interfaces: list[_subdomain.Interface] | None = None,
-        enclosures: list[_Enclosure] | None = None,
-        petsc_options: dict | None = None,
-    ):
-        """Class for a multi-material hydrogen transport problem For other arguments see
-        ``festim.HydrogenTransportProblem``.
-
-        Args:
-            interfaces (list, optional): list of interfaces (``festim.Interface``
-                objects). Defaults to None.
-            enclosures (list, optional): list of gas enclosures (``festim.Enclosure``
-                objects). Requires dolfinx >= 0.11. Defaults to None.
-            surface_to_volume (dict, optional): correspondance dictionary linking
-                each ``festim.SurfaceSubdomain`` objects to a ``festim.VolumeSubdomain``
-                object). Defaults to None.
-            petsc_options (dict, optional): petsc options to be passed to the
-                ``festim.NewtonSolver`` object. If None, the default options are:
-                ```
-                default_petsc_options = {
-                    "ksp_type": "preonly",
-                    "pc_type": "lu",
-                    "pc_factor_mat_solver_type": "mumps",
-                }
-                ```
-                Defaults to None.
-        """
-        super().__init__(
-            mesh,
-            subdomains,
-            species,
-            reactions,
-            temperature,
-            sources,
-            initial_conditions,
-            boundary_conditions,
-            settings,
-            exports,
-            traps,
-            advection_terms,
-            drift_terms=drift_terms,
-            petsc_options=petsc_options,
-        )
-        self.interfaces = interfaces or []
-        self.enclosures = enclosures or []
-        self.surface_to_volume = {}
-        self.subdomain_to_species = {}  # maps subdomain to species defined in it
-        self.subdomain_to_V_CG1 = {}
-        self._total_volume = None
 
     @property
     def enclosures(self) -> list[_Enclosure]:
@@ -1403,6 +452,82 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         else:
             raise TypeError("method_interface must be of type str or InterfaceMethod")
 
+    def _normalise_species_subdomains(self):
+        ordinary = [v for v in self.volume_subdomains if v.codim(self.mesh.vdim) == 0]
+        for spe in self.species:
+            if spe.subdomains is None:
+                if len(ordinary) > 1 and not self.interfaces:
+                    raise ValueError(
+                        f"Species {spe.name} has omitted subdomains in a "
+                        "multi-material "
+                        "problem. Declare species subdomains and explicit interfaces; "
+                        "concentration continuity is no longer implicit."
+                    )
+                warnings.warn(
+                    f"Inferring subdomains for species {spe.name} is deprecated; "
+                    "set Species.subdomains explicitly.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+                spe.subdomains = list(ordinary)
+            if not isinstance(spe.subdomains, list):
+                raise TypeError("subdomains attribute in Species should be list")
+            if not spe.subdomains:
+                raise ValueError(
+                    f"Species {spe.name} must have a non-empty list of subdomains"
+                )
+            if any(v not in self.volume_subdomains for v in spe.subdomains):
+                raise ValueError(
+                    f"Species {spe.name} has a subdomain outside this problem"
+                )
+            if len({id(v) for v in spe.subdomains}) != len(spe.subdomains):
+                raise ValueError(f"Species {spe.name} has duplicate subdomains")
+
+    def _single_domain_alias(self, name):
+        if not self._spaces_defined:
+            return self.__dict__.get("_legacy_" + name)
+        if len(self.volume_subdomains) != 1:
+            raise ValueError(
+                f"HydrogenTransportProblem.{name} is ambiguous; use the per-subdomain "
+                f"API (volume.{name} or volume.u.function_space)."
+            )
+        warnings.warn(
+            f"HydrogenTransportProblem.{name} is deprecated; "
+            "use the per-subdomain API.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        volume = self.volume_subdomains[0]
+        return (
+            volume.u.function_space
+            if name == "function_space"
+            else getattr(volume, name)
+        )
+
+    @property
+    def u(self):
+        return self._single_domain_alias("u")
+
+    @u.setter
+    def u(self, value):
+        self._legacy_u = value
+
+    @property
+    def u_n(self):
+        return self._single_domain_alias("u_n")
+
+    @u_n.setter
+    def u_n(self, value):
+        self._legacy_u_n = value
+
+    @property
+    def function_space(self):
+        return self._single_domain_alias("function_space")
+
+    @function_space.setter
+    def function_space(self, value):
+        self._legacy_function_space = value
+
     def initialise(self):
         # if method_interface is given as an attribute of Problem class, then pass it to
         # each interface and raise a deprecation warning. ``hasattr`` cannot be used to
@@ -1416,16 +541,10 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             for interface in self.interfaces:
                 interface.method = self._method_interface
 
-        # check that all species have a list of F.VolumeSubdomain as this is
-        # different from F.HydrogenTransportProblem
-        for spe in self.species:
-            if not spe.subdomains:
-                raise ValueError(
-                    f"Species {spe.name} must have a list of subdomains defined "
-                    "in 'subdomains' attribute for discontinuous problem"
-                )
-            if not isinstance(spe.subdomains, list):
-                raise TypeError("subdomains attribute in Species should be list")
+        self._normalise_species_subdomains()
+        self.create_species_from_traps()
+        self.bc_forms = []
+        self._timesteps = []
 
         self.define_meshtags_and_measures()
         if self.surface_to_volume:
@@ -1495,7 +614,6 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         # all have to share one measure (see :meth:`build_interior_facet_measure`)
         self.build_interior_facet_measure()
 
-        self.create_species_from_traps()
         self.link_enclosures()
 
         self.t = fem.Constant(self.mesh.mesh, 0.0)
@@ -1511,25 +629,13 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         self.create_implicit_species_value_fenics()
 
         for subdomain in self.volume_subdomains:
-            self.define_function_spaces(subdomain)
+            self.define_function_spaces(
+                subdomain, element_degree=self.settings.element_degree
+            )
 
         self.define_enclosure_function_spaces()
 
-        # create global DG function spaces of degree 0 and 1
-        element_DG0 = basix.ufl.element(
-            "DG",
-            self.mesh.mesh.basix_cell(),
-            0,
-            basix.LagrangeVariant.equispaced,
-        )
-        element_DG1 = basix.ufl.element(
-            "DG",
-            self.mesh.mesh.basix_cell(),
-            1,
-            basix.LagrangeVariant.equispaced,
-        )
-        self.V_DG_0 = fem.functionspace(self.mesh.mesh, element_DG0)
-        self.V_DG_1 = fem.functionspace(self.mesh.mesh, element_DG1)
+        self._spaces_defined = True
 
         self.define_temperature()
         self.convert_enclosure_input_values_to_fenics_objects()
@@ -1553,38 +659,87 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         self.initialise_exports()
 
     def define_temperature(self):
-        super().define_temperature()
+        # check if temperature is None
+        if self.temperature is None:
+            raise ValueError("the temperature attribute needs to be defined")
 
-        # NOTE this won't be needed anymore when https://github.com/FEniCS/dolfinx/pull/4140
-        # is released
+        # if temperature is a float or int, create a fem.Constant
+        elif isinstance(self.temperature, float | int):
+            self.temperature_fenics = as_fenics_constant(
+                self.temperature, self.mesh.mesh
+            )
+        # if temperature is a fem.Constant or function, pass it to temperature_fenics
+        elif isinstance(self.temperature, fem.Constant | fem.Function):
+            self.temperature_fenics = self.temperature
 
-        # because dolfinx.fem.Expressions cannot work with submeshes
-        # (ie. mixing parent and submesh),
-        # we need to create "sub" temperature functions for each subdomain
-        # pass temperature function to each subdomain
-        if isinstance(self.temperature_fenics, fem.Function):
-            for subdomain in self.volume_subdomains:
-                element_CG = basix.ufl.element(
+        # if temperature is callable, process accordingly
+        elif callable(self.temperature):
+            arguments = self.temperature.__code__.co_varnames
+            if "t" in arguments and "x" not in arguments:
+                if not isinstance(self.temperature(t=float(self.t)), float | int):
+                    raise ValueError(
+                        f"self.temperature should return a float or an int, not "
+                        f"{type(self.temperature(t=float(self.t)))} "
+                    )
+                # only t is an argument
+                self.temperature_fenics = as_fenics_constant(
+                    mesh=self.mesh.mesh, value=self.temperature(t=float(self.t))
+                )
+            else:
+                x = ufl.SpatialCoordinate(self.mesh.mesh)
+                degree = 1
+                element_temperature = basix.ufl.element(
                     basix.ElementFamily.P,
-                    subdomain.submesh.basix_cell(),
-                    0 if subdomain.submesh.topology.dim == 0 else 1,
+                    self.mesh.mesh.basix_cell(),
+                    degree,
                     basix.LagrangeVariant.equispaced,
                 )
-                V = dolfinx.fem.functionspace(subdomain.submesh, element_CG)
-                sub_T = dolfinx.fem.Function(V)
-                sub_T.name = "temperature"
-                from festim.helpers import nmm_interpolate
+                function_space_temperature = fem.functionspace(
+                    self.mesh.mesh, element_temperature
+                )
+                self.temperature_fenics = fem.Function(function_space_temperature)
+                self.temperature_fenics.name = "temperature"
+                kwargs = {}
+                if "t" in arguments:
+                    kwargs["t"] = self.t
+                if "x" in arguments:
+                    kwargs["x"] = x
 
-                nmm_interpolate(f_out=sub_T, f_in=self.temperature_fenics)
+                # store the expression of the temperature
+                # to update the temperature_fenics later
+                self.temperature_expr = fem.Expression(
+                    self.temperature(**kwargs),
+                    function_space_temperature.element.interpolation_points,
+                )
+                self.temperature_fenics.interpolate(self.temperature_expr)
 
-                subdomain.sub_T = sub_T
-        else:
-            # a manifold subdomain integrates its gradient terms on its own submesh,
-            # and a fem.Constant bound to the parent mesh cannot appear there
-            for subdomain in self.manifold_subdomains:
+        self._define_submesh_temperatures()
+
+    def _define_submesh_temperatures(self):
+        for subdomain in self.volume_subdomains:
+            if not hasattr(subdomain, "submesh"):
+                continue
+            if isinstance(self.temperature_fenics, fem.Function):
+                element = self.temperature_fenics.function_space.element.basix_element
+                degree = 0 if subdomain.submesh.topology.dim == 0 else element.degree
+                family = "DG" if element.discontinuous else "P"
+                V = fem.functionspace(subdomain.submesh, (family, degree))
+                subdomain.sub_T = fem.Function(V)
+                subdomain.sub_T.name = "temperature"
+                nmm_interpolate(subdomain.sub_T, self.temperature_fenics)
+            else:
                 subdomain.sub_T = as_fenics_constant(
                     float(self.temperature_fenics), subdomain.submesh
                 )
+
+    def _update_submesh_temperatures(self):
+        for subdomain in self.volume_subdomains:
+            if not hasattr(subdomain, "sub_T"):
+                continue
+            if isinstance(self.temperature_fenics, fem.Function):
+                nmm_interpolate(subdomain.sub_T, self.temperature_fenics)
+            else:
+                subdomain.sub_T.value = float(self.temperature_fenics)
 
     def create_dirichletbc_form(self, bc: boundary_conditions.FixedConcentrationBC):
         """Creates the ``value_fenics`` attribute for a given
@@ -1704,6 +859,10 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         """For each intial condition, create the value_fenics and assign it to the
         previous solution of the condition's species."""
 
+        if self.initial_conditions and not self.settings.transient:
+            raise ValueError(
+                "Initial conditions can only be defined for transient simulations"
+            )
         for condition in self.initial_conditions:
             # the index within the subdomain's mixed element, which is not the index of
             # the species in the global list unless every species lives on every
@@ -1768,7 +927,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         for species in self.subdomain_to_species[subdomain]:
             if species not in unique_species:
                 unique_species.append(species)
-        nb_species = len(unique_species)
+        if not unique_species:
+            raise ValueError(f"Volume subdomain {subdomain.id} has no species defined")
 
         # A radial surface is a point in a 1D mesh. Basix only supports P0 there.
         if subdomain.submesh.topology.dim == 0:
@@ -1779,7 +939,24 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             element_degree,
             basix.LagrangeVariant.equispaced,
         )
-        element = basix.ufl.mixed_element([element_CG] * nb_species)
+        element_DG = (
+            basix.ufl.element(
+                "DG",
+                subdomain.submesh.basix_cell(),
+                element_degree,
+                basix.LagrangeVariant.equispaced,
+            )
+            if subdomain.submesh.topology.dim > 0
+            else element_CG
+        )
+        element = basix.ufl.mixed_element(
+            [
+                element_CG
+                if spe.mobile or self.element_immobile == "CG"
+                else element_DG
+                for spe in unique_species
+            ]
+        )
         V = dolfinx.fem.functionspace(subdomain.submesh, element)
         u = dolfinx.fem.Function(V)
         u_n = dolfinx.fem.Function(V)
@@ -1803,6 +980,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             species.subdomain_to_test_function[subdomain] = vs[i]
             species.subdomain_to_function_space[subdomain] = V.sub(i)
             species.subdomain_to_index[subdomain] = i
+            species.subdomain_to_sub_function[subdomain] = u.sub(i)
             species.subdomain_to_post_processing_solution[subdomain] = u.sub(
                 i
             ).collapse()
@@ -1870,6 +1048,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
 
     def define_boundary_conditions(self):
         for bc in self._unpacked_bcs:
+            if isinstance(bc.species, str):
+                bc.species = _species.find_species_from_name(bc.species, self.species)
             if isinstance(bc, boundary_conditions.ParticleFluxBC):
                 bc._volume_subdomain = self.flux_bc_target(bc)[0]
 
@@ -2245,7 +1425,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         ``UnboundLocalError``. The mirrors are kept in sync by
         :meth:`update_submesh_time_constants`.
         """
-        for subdomain in self.manifold_subdomains:
+        for subdomain in self.volume_subdomains:
             subdomain.sub_t = as_fenics_constant(float(self.t), subdomain.submesh)
             if self.settings.transient:
                 subdomain.sub_dt = as_fenics_constant(float(self.dt), subdomain.submesh)
@@ -2255,7 +1435,9 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
         :meth:`create_submesh_time_constants`, so that an adaptive stepsize and
         explicitly time-dependent values on a manifold see the same values as the
         rest of the problem."""
-        for subdomain in self.manifold_subdomains:
+        for subdomain in self.volume_subdomains:
+            if not hasattr(subdomain, "sub_t") or subdomain.sub_t is None:
+                continue
             subdomain.sub_t.value = float(self.t)
             if self.settings.transient:
                 subdomain.sub_dt.value = float(self.dt)
@@ -2290,11 +1472,8 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             for rate in reaction.rate_coefficients:
                 if rate.input_value is not None:
                     rate.convert_input_value(
-                        function_space=(
-                            reaction.volume.u.function_space
-                            if manifold
-                            else getattr(self, "function_space", None)
-                        ),
+                        function_space=reaction.volume.u.function_space,
+                        mesh=reaction.volume.submesh if manifold else self.mesh.mesh,
                         t=self.subdomain_time(reaction.volume),
                         temperature=self.subdomain_temperature(reaction.volume),
                         subdomain=reaction.volume,
@@ -2685,14 +1864,14 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
     def convert_enclosure_input_values_to_fenics_objects(self):
         """Converts the user input values of the enclosures and their openings to fenics
         objects."""
+        if not self.enclosures:
+            return
+        V = fem.functionspace(self.mesh.mesh, ("DG", 0))
         for enclosure in self.enclosures:
             # opening parameters are scalars, so any function space on the parent mesh
             # will do here
-            enclosure.convert_input_values_to_fenics_objects(
-                function_space=self.V_DG_0, t=self.t
-            )
+            enclosure.convert_input_values_to_fenics_objects(function_space=V, t=self.t)
 
-    # NOTE: what are the alternative naming for "production rate"?
     def gas_production_rates(self, surface, gas_species: _GasSpecies):
         """The rates at which particles of a gas species are produced at a surface, in
         particles/s/m2, positive when entering the gas.
@@ -3189,55 +2368,86 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             entity_maps,
         )
 
-    def _export_context(
-        self, export
-    ) -> tuple[list[fem.Function], list[str], dolfinx.mesh.Mesh]:
-        """Resolve what a field export should write.
-
-        Species and custom fields live on submeshes here, so each export writes on the
-        mesh of its own subdomain rather than on the parent mesh.
-
-        Args:
-            export: the export to resolve
-
-        Returns:
-            the functions to write, the name to store each one under, and the mesh
-            they live on
-        """
+    def _export_context(self, export):
+        """Resolve the functions, stable field names and mesh for a field export."""
         if isinstance(export, exports.SpeciesExport):
             functions = export.get_functions()
-            # NOTE: names are deliberately un-suffixed (`H`, not `H_1`) even though the
-            # collapsed functions are named per subdomain: checkpoints written before
-            # this refactor used the bare species name and are read back by name.
-            names = [species.name for species in export.field]
-            return functions, names, functions[0].function_space.mesh
-        elif isinstance(export, exports.TemperatureExport):
-            assert isinstance(self.temperature_fenics, fem.Function), (
-                "Temperature must be space-dependent to be exported as "
-                "TemperatureExport"
-            )
             return (
-                [self.temperature_fenics],
-                [self.temperature_fenics.name],
-                self.temperature_fenics.function_space.mesh,
+                functions,
+                [spe.name for spe in export.field],
+                functions[0].function_space.mesh,
             )
-        elif isinstance(export, exports.CustomFieldExport):
-            # need to find an appropriate function space on the right submesh
-            V = self.subdomain_to_V_CG1[export.subdomain]
-            export.function = fem.Function(V)
-            export.set_dolfinx_expression(
-                # need to pass the right temperature
-                temperature=self.temperature_fenics,
-                time=self.t,
-            )
+        if isinstance(export, exports.TemperatureExport):
+            self._temperature_as_function = self._get_temperature_field_as_function()
             return (
-                [export.function],
-                [export.filename.stem],
-                export.function.function_space.mesh,
+                [self._temperature_as_function],
+                [self._temperature_as_function.name],
+                self._temperature_as_function.function_space.mesh,
             )
+        if isinstance(export, exports.CustomFieldExport):
+            volume = export.subdomain
+            export.function = fem.Function(self.subdomain_to_V_CG1[volume])
+            export.set_dolfinx_expression(temperature=volume.sub_T, time=volume.sub_t)
+            return [export.function], [export.filename.stem], volume.submesh
         raise NotImplementedError(f"Export type {type(export)} not implemented")
 
+    def _resolve_export_subdomain(self, export):
+        """Select the unique valid volume for an export, or require a selection."""
+        if isinstance(export, exports.SpeciesExport):
+            fields = export.field
+        elif isinstance(export, exports.CustomFieldExport):
+            fields = []
+            for spe in export.species_dependent_value.values():
+                fields.extend(
+                    spe.others if isinstance(spe, _species.ImplicitSpecies) else [spe]
+                )
+        else:
+            fields = [export.field]
+        candidates = [
+            v
+            for v in self.volume_subdomains
+            if all(v in spe.subdomain_to_solution for spe in fields)
+        ]
+        if export.subdomain is None:
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"{type(export).__name__} requires an explicit subdomain; "
+                    f"there are {len(candidates)} valid volume subdomains."
+                )
+            export.subdomain = candidates[0]
+        elif export.subdomain not in candidates:
+            raise ValueError(
+                f"{type(export).__name__} has fields not defined on its "
+                "selected subdomain"
+            )
+
     def initialise_exports(self):
+        for export in self.exports:
+            if hasattr(export, "field"):
+                if isinstance(export.field, list):
+                    export.field = [
+                        _species.find_species_from_name(field, self.species)
+                        if isinstance(field, str)
+                        else field
+                        for field in export.field
+                    ]
+                elif isinstance(export.field, str):
+                    export.field = _species.find_species_from_name(
+                        export.field, self.species
+                    )
+            if isinstance(
+                export,
+                exports.SpeciesExport
+                | exports.CustomFieldExport
+                | exports.Profile1DExport,
+            ):
+                self._resolve_export_subdomain(export)
+            if isinstance(export, exports.Profile1DExport):
+                self._register_export_milestones(export)
+                export.data = []
+                export.t = []
+                export._dofs = None
+
         # formats that hold several meshes in one file (vtkhdf) let exports share a
         # filename: the first one to claim it truncates, the rest append as new blocks
         initialised_files = set()
@@ -3260,9 +2470,7 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 )
                 initialised_files.add(export.filename)
 
-        # compute diffusivity function for surface fluxes
-        # for the discontinuous case, we don't use D_global as in
-        # HydrogenTransportProblem
+        # Resolve diffusivity on the integration mesh of each surface export.
         for export in self.exports:
             if isinstance(export, exports.SurfaceQuantity):
                 volume, mesh, *_ = self.export_surface_context(export)
@@ -3324,42 +2532,33 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 export.data = []
 
             if isinstance(export, exports.CustomQuantity):
-                volume = (
-                    export.subdomain
-                    if not isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                    else self.surface_to_volume[
-                        export.subdomain
-                        if isinstance(export.subdomain, _subdomain.SurfaceSubdomain)
-                        else next(
-                            s
-                            for s in self.surface_subdomains
-                            if s.id == export.subdomain
-                        )
-                    ]
-                )
-
+                if isinstance(export.subdomain, _subdomain.SurfaceSubdomain):
+                    volume = self.surface_to_volume[export.subdomain]
+                else:
+                    volume = export.subdomain
+                species_here = self.subdomain_to_species[volume]
                 kwargs = {
-                    species.name: species.subdomain_to_post_processing_solution[volume]
-                    for species in self.species
+                    spe.name: spe.subdomain_to_post_processing_solution[volume]
+                    for spe in species_here
                 }
                 kwargs["n"] = ufl.FacetNormal(self.mesh.mesh)
                 kwargs["t"] = self.t
                 kwargs["T"] = self.temperature_fenics
-
-                D_kwargs = {
-                    f"D_{sp.name}": volume.material.get_diffusion_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, sp
+                diffusivities = {
+                    spe.name: volume.material.get_diffusion_coefficient(
+                        self.mesh.mesh, self.temperature_fenics, spe
                     )
-                    for sp in self.species
+                    for spe in species_here
+                    if spe.mobile
                 }
-                kwargs.update(D_kwargs)
-                kwargs["D"] = {sp.name: D_kwargs[f"D_{sp.name}"] for sp in self.species}
-                if len(self.species) == 1:
-                    kwargs["D"] = kwargs[f"D_{self.species[0].name}"]
+                kwargs.update({f"D_{name}": D for name, D in diffusivities.items()})
+                kwargs["D"] = diffusivities
+                if len(species_here) == 1 and species_here[0].mobile:
+                    kwargs["D"] = diffusivities[species_here[0].name]
                 kwargs["x"] = ufl.SpatialCoordinate(self.mesh.mesh)
                 export.ufl_expr = export.expr(**kwargs)
 
-    def post_processing(self):
+    def update_post_processing_solutions(self):
         # update post-processing solutions (for each species in each subdomain)
         # with new solution
         for subdomain in self.volume_subdomains:
@@ -3372,6 +2571,20 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 u = subdomain.u
                 v0_to_V = species.subdomain_to_collapsed_function_space[subdomain][1]
                 collapsed_function.x.array[:] = u.x.array[v0_to_V]
+                collapsed_function.x.scatter_forward()
+
+    def post_processing(self):
+        self.update_post_processing_solutions()
+        if (
+            isinstance(self.temperature_fenics, fem.Constant)
+            and self._temperature_as_function is not None
+        ):
+            self._temperature_as_function.interpolate(
+                fem.Expression(
+                    self.temperature_fenics,
+                    self._temperature_as_function.function_space.element.interpolation_points,
+                )
+            )
 
         for export in self.exports:
             # skip if it isn't time to export
@@ -3465,30 +2678,60 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
                 export.t.append(float(self.t))
 
     def update_time_dependent_values(self):
+        """Refresh temperature and mesh-local coefficients before their consumers."""
+        t = float(self.t)
+        if self.temperature_time_dependent:
+            if isinstance(self.temperature_fenics, fem.Constant):
+                self.temperature_fenics.value = self.temperature(t=t)
+            else:
+                self.temperature_fenics.interpolate(self.temperature_expr)
+                self.temperature_fenics.x.scatter_forward()
+        if self.temperature_fenics is not None:
+            # A ready-made Function (e.g. supplied by the heat solver) can change
+            # externally even though temperature_time_dependent is False.
+            self._update_submesh_temperatures()
+        self.update_submesh_time_constants()
         super().update_time_dependent_values()
 
-        self.update_submesh_time_constants()
+        for reaction in self.reactions:
+            for spe in reaction.species:
+                if isinstance(spe, _species.ImplicitSpecies):
+                    spe.update_density(t=t)
+            for rate in reaction.rate_coefficients:
+                if rate.explicit_time_dependent:
+                    rate.update(t=t)
 
+        for bc in self._unpacked_bcs:
+            if isinstance(
+                bc,
+                boundary_conditions.FixedConcentrationBC
+                | boundary_conditions.ParticleFluxBC,
+            ):
+                if bc.temperature_dependent:
+                    bc.update(t=t)
+        for source in self.sources:
+            if source.value.temperature_dependent:
+                source.value.update(t=t)
+        for drift_term in self.drift_terms:
+            drift_term.update_time_dependent_inputs(t=t)
         for enclosure in self.enclosures:
-            enclosure.update_time_dependent_values(t=float(self.t))
-
-        # update sub_T if temperature is given as a function
-        if self.temperature_time_dependent:
-            if isinstance(self.temperature_fenics, fem.Function):
-                for subdomain in self.volume_subdomains:
-                    temp = self.temperature_fenics
-                    sub_T = subdomain.sub_T
-                    from festim.helpers import nmm_interpolate
-
-                    nmm_interpolate(f_out=sub_T, f_in=temp)
-            else:
-                # a manifold mirrors a constant temperature onto its own submesh, and
-                # that mirror has to follow the parent constant
-                for subdomain in self.manifold_subdomains:
-                    subdomain.sub_T.value = float(self.temperature_fenics)
+            enclosure.update_time_dependent_values(t=t)
 
     def iterate(self):
         """Iterates the model for a given time step."""
+        self._timesteps.append(float(self.t))
+        if callable(self.settings.rtol) or callable(self.settings.atol):
+            rtol = (
+                self.settings.rtol(float(self.t))
+                if callable(self.settings.rtol)
+                else self.settings.rtol
+            )
+            atol = (
+                self.settings.atol(float(self.t))
+                if callable(self.settings.atol)
+                else self.settings.atol
+            )
+            self.solver.solver.setTolerances(rtol=rtol, atol=atol)
         if self.show_progress_bar:
             self.progress_bar.update(
                 min(self.dt.value, abs(self.settings.final_time - self.t.value))
@@ -3541,316 +2784,18 @@ class HydrogenTransportProblemDiscontinuous(HydrogenTransportProblem):
             self.post_processing()
 
     def __del__(self):
-        for export in self.exports:
+        for export in getattr(self, "exports", []):
             if isinstance(export, exports.FieldExportBase):
                 export.close()
 
 
-class HydrogenTransportProblemDiscontinuousChangeVar(HydrogenTransportProblem):
-    species: list[_species.Species]
-
-    def initialise(self):
-        # check if a SurfaceReactionBC is given
-        for bc in self.boundary_conditions:
-            if isinstance(bc, (boundary_conditions.SurfaceReactionBC)):
-                raise ValueError(
-                    f"{type(bc)} not implemented for "
-                    f"HydrogenTransportProblemDiscontinuousChangeVar"
-                )
-            # with the change of variable, the solution of a mobile species is the
-            # chemical potential and not the concentration, so a species-dependent
-            # value would silently be given the wrong quantity
-            if isinstance(bc, boundary_conditions.ParticleFluxBC):
-                if bc.species_dependent_value:
-                    raise ValueError(
-                        f"{type(bc)} concentration-dependent not implemented for "
-                        f"HydrogenTransportProblemDiscontinuousChangeVar"
-                    )
-
-        for source in self.sources:
-            if isinstance(source, _source.ParticleSource):
-                if source.value.species_dependent:
-                    raise ValueError(
-                        f"{type(source)} concentration-dependent not implemented for "
-                        f"HydrogenTransportProblemDiscontinuousChangeVar"
-                    )
-
-        super().initialise()
-
-    def create_sources_from_reactions(self):
-        # this problem uses a change of variable (u * K_S) for mobile species, so
-        # reactions cannot be expressed as plain particle sources and are instead
-        # handled directly in add_reaction_term. _unpacked_sources therefore holds
-        # only the user sources. This override will be removed when this deprecated
-        # problem class is dropped.
-        self._unpacked_sources = list(self.sources)
-
-    def create_formulation(self):
-        """Creates the formulation of the model."""
-
-        self.formulation = 0
-
-        # add diffusion and time derivative for each species
-        for spe in self.species:
-            u = spe.solution
-            u_n = spe.prev_solution
-            v = spe.test_function
-
-            for vol in self.volume_subdomains:
-                D = vol.material.get_diffusion_coefficient(
-                    self.mesh.mesh, self.temperature_fenics, spe
-                )
-                if spe.mobile:
-                    K_S = vol.material.get_solubility_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, spe
-                    )
-                    c = u * K_S
-                    c_n = u_n * K_S
-                else:
-                    c = u
-                    c_n = u_n
-                if spe.mobile:
-                    self.formulation += ufl.dot(D * ufl.grad(c), ufl.grad(v)) * self.dx(
-                        vol.id
-                    )
-
-                if self.settings.transient:
-                    self.formulation += ((c - c_n) / self.dt) * v * self.dx(vol.id)
-
-        # add drift (advection, Soret, electromigration). The solved variable of a
-        # mobile species is the chemical potential here, so the drift term is written
-        # in terms of the concentration u * K_S, as the diffusion term above is
-        for drift_term in self.drift_terms:
-            vol = drift_term.subdomain
-            for spe in drift_term.species:
-                D = vol.material.get_diffusion_coefficient(
-                    self.mesh.mesh, self.temperature_fenics, spe
-                )
-                conc = spe.solution
-                if spe.mobile:
-                    conc = conc * vol.material.get_solubility_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, spe
-                    )
-                velocity = drift_term.drift_velocity(
-                    D=D, temperature=self.temperature_fenics
-                )
-                # assembled even when identically zero, as in the base class
-                _drift.warn_if_no_effect(drift_term, spe, velocity)
-                self.formulation += _drift.drift_form(
-                    concentration=conc,
-                    test_function=spe.test_function,
-                    velocity=velocity,
-                    dx=self.dx(vol.id),
-                    coordinate_system=self.mesh.coordinate_system,
-                    mesh=self.mesh.mesh,
-                )
-
-        for bc in self.boundary_conditions:
-            if isinstance(bc, boundary_conditions.OutflowBC):
-                volume = self.volume_subdomain_of_surface(bc.subdomain)
-                velocity = self.drift_velocity_in(field=bc.species, volume=volume)
-                if velocity is None:
-                    continue
-                conc = bc.species.solution
-                if bc.species.mobile:
-                    conc = conc * volume.material.get_solubility_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, bc.species
-                    )
-                self.formulation += (
-                    conc
-                    * ufl.dot(velocity, ufl.FacetNormal(self.mesh.mesh))
-                    * bc.species.test_function
-                    * self.ds(bc.subdomain.id)
-                )
-
-        for reaction in self.reactions:
-            self.add_reaction_term(reaction)
-
-        # add sources (reactions are handled inline above, not expanded into
-        # sources, so _unpacked_sources is just the user sources here)
-        for source in self._unpacked_sources:
-            self.formulation -= (
-                source.value.fenics_object
-                * source.species.test_function
-                * self.dx(source.volume.id)
-            )
-
-        # add fluxes
-        for bc in self._unpacked_bcs:
-            if isinstance(bc, boundary_conditions.ParticleFluxBC):
-                self.formulation -= (
-                    bc.value_fenics
-                    * bc.species.test_function
-                    * self.ds(bc.subdomain.id)
-                )
-
-        # check if each species is defined in all volumes
-        if not self.settings.transient:
-            for spe in self.species:
-                # if species mobile, already defined in diffusion term
-                if not spe.mobile:
-                    not_defined_in_volume = self.volume_subdomains.copy()
-                    for vol in self.volume_subdomains:
-                        # check reactions
-                        for reaction in self.reactions:
-                            if (
-                                spe in reaction.product
-                            ):  # TODO we probably need this in HydrogenTransportProblem
-                                # too no?
-                                if vol == reaction.volume:
-                                    if vol in not_defined_in_volume:
-                                        not_defined_in_volume.remove(vol)
-
-                    # add c = 0 to formulation where needed
-                    for vol in not_defined_in_volume:
-                        self.formulation += (
-                            spe.solution * spe.test_function * self.dx(vol.id)
-                        )
-
-    def add_reaction_term(self, reaction: _reaction.GenericReaction):
-        """Adds the reaction term to the formulation."""
-
-        products = (
-            reaction.product
-            if isinstance(reaction.product, list)
-            else [reaction.product]
+def __getattr__(name):
+    if name == "HydrogenTransportProblemDiscontinuous":
+        warnings.warn(
+            "HydrogenTransportProblemDiscontinuous is deprecated; use "
+            "HydrogenTransportProblem instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-
-        # we cannot use the `concentration` attribute of the mobile species and need to
-        # use u * K_S instead
-
-        def get_concentrations(species_list) -> list:
-            concentrations = []
-            for spe in species_list:
-                if isinstance(spe, _species.ImplicitSpecies):
-                    concentrations.append(None)
-                elif spe.mobile:
-                    K_S = reaction.volume.material.get_solubility_coefficient(
-                        self.mesh.mesh, self.temperature_fenics, spe
-                    )
-                    concentrations.append(spe.solution * K_S)
-                else:
-                    concentrations.append(None)
-            return concentrations
-
-        reactant_concentrations = get_concentrations(reaction.reactant)
-        product_concentrations = get_concentrations(products)
-
-        # get the reaction term from the reaction
-        reaction_term = reaction.reaction_term(
-            reactant_concentrations=reactant_concentrations,
-            product_concentrations=product_concentrations,
-        )
-
-        # add reaction term to formulation
-        # reactant
-        for reactant in reaction.reactant:
-            if isinstance(reactant, _species.Species):
-                self.formulation += (
-                    reaction_term * reactant.test_function * self.dx(reaction.volume.id)
-                )
-
-        # product
-        for product in products:
-            self.formulation += (
-                -reaction_term * product.test_function * self.dx(reaction.volume.id)
-            )
-
-    def initialise_exports(self):
-        self.override_post_processing_solution()
-        super().initialise_exports()
-
-    def override_post_processing_solution(self):
-        # override the post-processing solution c = theta * K_S
-        Q0 = fem.functionspace(self.mesh.mesh, ("DG", 0))
-        Q1 = fem.functionspace(self.mesh.mesh, ("DG", 1))
-
-        for spe in self.species:
-            if not spe.mobile:
-                continue
-            K_S0 = fem.Function(Q0)
-            E_KS = fem.Function(Q0)
-            for subdomain in self.volume_subdomains:
-                entities = self.volume_meshtags.find(subdomain.id)
-                K_S0.x.array[entities] = subdomain.material.get_K_S_0(spe)
-                E_KS.x.array[entities] = subdomain.material.get_E_K_S(spe)
-
-            K_S = K_S0 * ufl.exp(-E_KS / (k_B * self.temperature_fenics))
-
-            theta = spe.solution
-
-            spe.dg_expr = fem.Expression(theta * K_S, Q1.element.interpolation_points)
-            spe.post_processing_solution = fem.Function(Q1)
-            spe.post_processing_solution.interpolate(
-                spe.dg_expr
-            )  # NOTE: do we need this line since it's in initialise?
-
-    def update_post_processing_solutions(self):
-        """Updates the post-processing solutions after each time step."""
-        # need to compute c = theta * K_S
-        # this expression is stored in species.dg_expr
-
-        for spe in self.species:
-            if not spe.mobile:
-                continue
-            spe.post_processing_solution.interpolate(spe.dg_expr)
-
-    def create_dirichletbc_form(self, bc: boundary_conditions.FixedConcentrationBC):
-        """Creates a dirichlet boundary condition form.
-
-        Args:
-            bc (festim.DirichletBC): the boundary condition
-
-        Returns:
-            dolfinx.fem.bcs.DirichletBC: A representation of
-                the boundary condition for modifying linear systems.
-        """
-        # create K_S function
-        Q0 = fem.functionspace(self.mesh.mesh, ("DG", 0))
-        K_S0 = fem.Function(Q0)
-        E_KS = fem.Function(Q0)
-        for subdomain in self.volume_subdomains:
-            entities = self.volume_meshtags.find(subdomain.id)
-            K_S0.x.array[entities] = subdomain.material.get_K_S_0(bc.species)
-            E_KS.x.array[entities] = subdomain.material.get_E_K_S(bc.species)
-
-        K_S = K_S0 * ufl.exp(-E_KS / (k_B * self.temperature_fenics))
-
-        # create value_fenics
-        bc.create_value(
-            temperature=self.temperature_fenics,
-            function_space=bc.species.collapsed_function_space,
-            t=self.t,
-            K_S=K_S,
-        )
-
-        # get dofs
-        if isinstance(bc.value_fenics, fem.Function):
-            function_space_dofs = (
-                bc.species.sub_function_space,
-                bc.species.collapsed_function_space,
-            )
-        else:
-            function_space_dofs = bc.species.sub_function_space
-
-        bc_dofs = bc.define_surface_subdomain_dofs(
-            facet_meshtags=self.facet_meshtags,
-            function_space=function_space_dofs,
-        )
-
-        # create form
-        form = fem.dirichletbc(
-            value=bc.value_fenics,
-            dofs=bc_dofs,
-            V=bc.species.sub_function_space,
-        )
-
-        return form
-
-    def update_time_dependent_values(self):
-        super().update_time_dependent_values()
-
-        if self.temperature_time_dependent:
-            for bc in self.boundary_conditions:
-                if isinstance(bc, boundary_conditions.FixedConcentrationBC):
-                    bc.update(self.t)
+        return HydrogenTransportProblem
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

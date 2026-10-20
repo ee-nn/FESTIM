@@ -40,24 +40,25 @@ def _get_solution(field: Species, subdomain=None) -> fem.Function:
     Raises:
         ValueError: if no subdomain is given and the species has no
             post_processing_solution.
-        ValueError: if a subdomain is given but the species has a
-            post_processing_solution (ie. the problem is not a mixed-domain one).
+        ValueError: if several subdomain solutions exist and none is selected.
         ValueError: if the species has no post-processing solution on any subdomain.
         ValueError: if the species has no post-processing solution on the given
             subdomain.
     """
+    solutions = field.subdomain_to_post_processing_solution
+    if subdomain is None and solutions:
+        if len(solutions) != 1:
+            raise ValueError(
+                f"Species {field.name} has several subdomain solutions; "
+                "specify subdomain."
+            )
+        return next(iter(solutions.values()))
     if subdomain is None:
         if field.post_processing_solution is None:
             raise ValueError(
                 f"Species {field.name} has no post_processing_solution to plot."
             )
         return field.post_processing_solution
-    else:
-        if field.post_processing_solution is not None:
-            raise ValueError(
-                "Problem seems to be HydrogenTransportProblem but a subdomain"
-                " was provided."
-            )
     if not field.subdomain_to_post_processing_solution:
         raise ValueError(
             f"Species {field.name} has no subdomain post-processing solutions."

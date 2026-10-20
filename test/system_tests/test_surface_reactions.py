@@ -1,24 +1,18 @@
-import dolfinx.fem as fem
 import numpy as np
 import ufl
 
 import festim as F
 
 
-# TODO add this to the festim package
-class FluxFromSurfaceReaction(F.SurfaceFlux):
-    def __init__(self, reaction: F.SurfaceReactionBC):
-        super().__init__(
-            F.Species(mobile=False),  # just a dummy species here
-            reaction.subdomain,
-        )
-        self.reaction = reaction.flux_bcs[0]
+class FluxFromSurfaceReaction(F.CustomQuantity):
+    """Integrate a reaction's flux directly, without a dummy concentration field."""
 
-    def compute(self, u, ds, entity_maps=None):
-        self.value = fem.assemble_scalar(
-            fem.form(self.reaction.value_fenics * ds(self.surface.id))
+    def __init__(self, reaction: F.SurfaceReactionBC):
+        self.reaction = reaction.flux_bcs[0]
+        super().__init__(
+            expr=lambda **kwargs: self.reaction.value_fenics,
+            subdomain=reaction.subdomain,
         )
-        self.data.append(self.value)
 
 
 def test_2_isotopes_no_pressure():

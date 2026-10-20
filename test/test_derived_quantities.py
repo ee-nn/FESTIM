@@ -412,7 +412,7 @@ class TestDerivedQuantityFilename:
 
 class TestCustomQuantityWithDiscontinuousProblem:
     """
-    Integration tests for CustomQuantity with HydrogenTransportProblemDiscontinuous
+    Integration tests for CustomQuantity with HydrogenTransportProblem
     """
 
     def test_custom_quantity_discontinuous_volume(self):
@@ -427,7 +427,7 @@ class TestCustomQuantityWithDiscontinuousProblem:
 
         mesh = create_unit_square(MPI.COMM_WORLD, 5, 5)
 
-        my_model = F.HydrogenTransportProblemDiscontinuous()
+        my_model = F.HydrogenTransportProblem()
         my_model.mesh = F.Mesh(mesh)
         my_model.subdomains = [vol, top, bottom]
         my_model.temperature = 300
@@ -474,7 +474,7 @@ class TestCustomQuantityWithDiscontinuousProblem:
 
         mesh = create_unit_square(MPI.COMM_WORLD, 5, 5)
 
-        my_model = F.HydrogenTransportProblemDiscontinuous()
+        my_model = F.HydrogenTransportProblem()
         my_model.mesh = F.Mesh(mesh)
         my_model.subdomains = [vol, top, bottom]
         my_model.temperature = 300

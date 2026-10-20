@@ -149,7 +149,7 @@ def build(penalty, fed="bottom", swap_interface_order=False, laws=None, n=8):
     c_bot_wall, c_top_wall = (K_BOT, 0.0) if fed == "bottom" else (0.0, K_TOP)
 
     pair = (top, bottom) if swap_interface_order else (bottom, top)
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, n, n)),
         species=[H],
         subdomains=[bottom, top, bottom_surf, top_surf],

@@ -115,7 +115,7 @@ def build(method, penalty, case, n=40):
     vertices = np.unique(
         np.concatenate([np.linspace(0, L, n + 1), np.linspace(L, 2 * L, n + 1)])
     )
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh1D(vertices),
         species=[H],
         subdomains=[upstream, downstream, left, right],

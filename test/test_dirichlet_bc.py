@@ -9,7 +9,7 @@ from ufl.conditional import Conditional
 
 import festim as F
 
-from .utils import evaluate_at_point
+from .utils import evaluate_at_point, prepare_subdomains
 
 dummy_mat = F.Material(D_0=1, E_D=1, name="dummy_mat")
 
@@ -72,9 +72,7 @@ def test_callable_for_value():
         species=[species],
     )
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
 
     T = fem.Constant(my_model.mesh.mesh, 550.0)
     t = fem.Constant(my_model.mesh.mesh, 0.0)
@@ -116,9 +114,7 @@ def test_value_callable_x_t_T():
         species=[species],
     )
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
 
     T = fem.Constant(my_model.mesh.mesh, 550.0)
     t = fem.Constant(my_model.mesh.mesh, 0.0)
@@ -160,8 +156,7 @@ def test_callable_t_only(value):
         species=[species],
     )
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
+    prepare_subdomains(my_model)
 
     T = fem.Constant(my_model.mesh.mesh, 550.0)
     t = fem.Constant(my_model.mesh.mesh, 0.0)
@@ -206,9 +201,7 @@ def test_callable_x_only():
         species=[species],
     )
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
 
     T = fem.Constant(my_model.mesh.mesh, 550.0)
     t = fem.Constant(my_model.mesh.mesh, 0.0)

@@ -5,8 +5,6 @@ from festim.heat_transfer_problem import HeatTransferProblem
 from festim.helpers import nmm_interpolate
 from festim.hydrogen_transport_problem import (
     HydrogenTransportProblem,
-    HydrogenTransportProblemDiscontinuous,
-    HydrogenTransportProblemDiscontinuousChangeVar,
 )
 
 
@@ -76,18 +74,7 @@ class CoupledTransientHeatTransferHydrogenTransport:
 
     @hydrogen_problem.setter
     def hydrogen_problem(self, value):
-        if isinstance(
-            value,
-            HydrogenTransportProblemDiscontinuous
-            | HydrogenTransportProblemDiscontinuousChangeVar,
-        ):
-            raise NotImplementedError(
-                "Coupled heat transfer - hydrogen transport simulations with "
-                "HydrogenTransportProblemDiscontinuousChangeVar or"
-                "HydrogenTransportProblemDiscontinuous"
-                "not currently supported"
-            )
-        elif not isinstance(value, HydrogenTransportProblem):
+        if not isinstance(value, HydrogenTransportProblem):
             raise TypeError(
                 "hydrogen_problem must be a festim.HydrogenTransportProblem object"
             )

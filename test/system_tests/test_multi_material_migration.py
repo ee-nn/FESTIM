@@ -4,7 +4,6 @@ import dolfinx
 import dolfinx.fem.petsc
 import numpy as np
 import ufl
-from dolfinx import fem
 
 import festim as F
 
@@ -61,7 +60,7 @@ def generate_mesh(n=20):
 
 
 def test_run(tmpdir):
-    my_model = F.HydrogenTransportProblemDiscontinuousChangeVar()
+    my_model = F.HydrogenTransportProblem()
 
     interface_1 = 0.2
     interface_2 = 0.8
@@ -123,14 +122,14 @@ def test_run(tmpdir):
         for domain in [left_domain, middle_domain, right_domain]
     ]
 
-    K_left = material_left.K_S_0
-    K_right = material_right.K_S_0
-    assert material_left.E_K_S == 0, "Only constant solubility is supported"
-    assert material_right.E_K_S == 0, "Only constant solubility is supported"
+    my_model.interfaces = [
+        F.Interface(10, [left_domain, middle_domain], method="nitsche"),
+        F.Interface(11, [middle_domain, right_domain], method="nitsche"),
+    ]
 
     my_model.boundary_conditions = [
-        F.FixedConcentrationBC(left_surface, value=0.05 / K_left, species=H),
-        F.FixedConcentrationBC(right_surface, value=0.2 / K_right, species=H),
+        F.FixedConcentrationBC(left_surface, value=0.05, species=H),
+        F.FixedConcentrationBC(right_surface, value=0.2, species=H),
     ]
 
     my_model.temperature = lambda x: 300 + 100 * x[0]
@@ -139,8 +138,11 @@ def test_run(tmpdir):
     my_model.settings.stepsize = F.Stepsize(1)
 
     my_model.exports = [
-        F.VTXSpeciesExport(tmpdir + f"/u_{field}_var_change.bp", field=field)
+        F.SpeciesExport(
+            tmpdir + f"/u_{field}_{volume.id}.bp", field=field, subdomain=volume
+        )
         for field in [H, trapped_H]
+        for volume in [left_domain, middle_domain, right_domain]
     ]
     my_model.initialise()
     my_model.run()
@@ -170,7 +172,7 @@ def test_2_materials_2d_mms(tmpdir):
 
     mesh, mt, ct = generate_mesh(100)
 
-    my_model = F.HydrogenTransportProblemDiscontinuousChangeVar()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh)
     my_model.volume_meshtags = ct
     my_model.facet_meshtags = mt
@@ -193,6 +195,10 @@ def test_2_materials_2d_mms(tmpdir):
     H = F.Species("H", mobile=True)
 
     my_model.species = [H]
+    H.subdomains = [bottom_domain, top_domain]
+    my_model.interfaces = [
+        F.Interface(5, [bottom_domain, top_domain], method="nitsche")
+    ]
 
     my_model.boundary_conditions = [
         F.FixedConcentrationBC(top_surface, value=c_exact_top_ufl, species=H),
@@ -215,45 +221,18 @@ def test_2_materials_2d_mms(tmpdir):
     my_model.temperature = 500.0  # lambda x: 300 + 10 * x[1] + 100 * x[0]
 
     my_model.settings = F.Settings(atol=1e-10, rtol=1e-10, transient=False)
-    my_model.exports = [F.VTXSpeciesExport(tmpdir + "/u.bp", field=H)]
+    my_model.exports = [
+        F.SpeciesExport(tmpdir + "/u.bp", field=H, subdomain=top_domain)
+    ]
 
     my_model.initialise()
     my_model.run()
 
-    c_computed = H.post_processing_solution
+    from .tools import error_L2
 
-    top_cells = dolfinx.mesh.locate_entities(
-        mesh, mesh.topology.dim, lambda x: x[1] > 0.5 - 1e-14
-    )
-    bot_cells = dolfinx.mesh.locate_entities(
-        mesh, mesh.topology.dim, lambda x: x[1] <= 0.5 + 1e-14
-    )
-
-    # Create higher order function space
-    degree = c_computed.function_space.ufl_element().degree
-    family = "DG"
-    mesh = c_computed.function_space.mesh
-    W = fem.functionspace(mesh, (family, degree + 3))
-    # Interpolate approximate solution
-    u_W = fem.Function(W)
-    u_W.interpolate(c_computed, cells0=top_cells)
-    u_W.interpolate(c_computed, cells0=bot_cells)
-
-    # Interpolate exact solution, special handling if exact solution
-    # is a ufl expression or a python lambda function
-
-    u_ex_W = fem.Function(W)
-    u_ex_W.interpolate(c_exact_top_np, cells0=top_cells)
-    u_ex_W.interpolate(c_exact_bot_np, cells0=bot_cells)
-
-    # Compute the error in the higher order function space
-    e_W = fem.Function(W)
-    e_W.x.array[:] = u_W.x.array - u_ex_W.x.array
-
-    # Integrate the error
-    error = fem.form(ufl.inner(e_W, e_W) * ufl.dx)
-    error_local = fem.assemble_scalar(error)
-    error_global = mesh.comm.allreduce(error_local, op=MPI.SUM)
-    L2_error_mobile = np.sqrt(error_global)
-
-    assert L2_error_mobile < 1e-3
+    for volume, exact in [
+        (top_domain, c_exact_top_np),
+        (bottom_domain, c_exact_bot_np),
+    ]:
+        computed = H.subdomain_to_post_processing_solution[volume]
+        assert error_L2(computed, exact) < 1e-3

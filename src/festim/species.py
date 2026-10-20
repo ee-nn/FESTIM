@@ -1,3 +1,4 @@
+import warnings
 from typing import Union
 
 import ufl
@@ -7,6 +8,36 @@ from festim.helpers import as_fenics_constant, spatial_coordinate
 from festim.subdomain.volume_subdomain import (
     VolumeSubdomain as _VolumeSubdomain,
 )
+
+
+def _single_domain_attribute(name, mapping, component=None):
+    """A deprecated view of a species' unique subdomain field.
+
+    The backing value supports standalone species used to construct UFL expressions
+    before a transport problem has allocated per-subdomain functions.
+    """
+
+    def get(self):
+        values = getattr(self, mapping, {})
+        if not values:
+            return getattr(self, "_legacy_" + name, None)
+        if len(values) != 1:
+            raise ValueError(
+                f"Species {self.name}.{name} is ambiguous; use the per-subdomain "
+                f"API ({mapping}[volume])."
+            )
+        warnings.warn(
+            f"Species.{name} is deprecated; use {mapping}[volume] instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        value = next(iter(values.values()))
+        return value if component is None else value[component]
+
+    def set_(self, value):
+        setattr(self, "_legacy_" + name, value)
+
+    return property(get, set_)
 
 
 class Species:
@@ -73,6 +104,28 @@ class Species:
     subdomain_to_collapsed_function_space: dict
     subdomain_to_function_space: dict
     subdomain_to_index: dict
+    subdomain_to_sub_function: dict
+
+    solution = _single_domain_attribute("solution", "subdomain_to_solution")
+    prev_solution = _single_domain_attribute(
+        "prev_solution", "subdomain_to_prev_solution"
+    )
+    test_function = _single_domain_attribute(
+        "test_function", "subdomain_to_test_function"
+    )
+    sub_function = _single_domain_attribute("sub_function", "subdomain_to_sub_function")
+    sub_function_space = _single_domain_attribute(
+        "sub_function_space", "subdomain_to_function_space"
+    )
+    collapsed_function_space = _single_domain_attribute(
+        "collapsed_function_space", "subdomain_to_collapsed_function_space", 0
+    )
+    map_sub_to_main_solution = _single_domain_attribute(
+        "map_sub_to_main_solution", "subdomain_to_collapsed_function_space", 1
+    )
+    post_processing_solution = _single_domain_attribute(
+        "post_processing_solution", "subdomain_to_post_processing_solution"
+    )
 
     def __init__(
         self,
@@ -100,6 +153,7 @@ class Species:
         self.subdomain_to_function_space = {}
         # index of this species within the subdomain's mixed element
         self.subdomain_to_index = {}
+        self.subdomain_to_sub_function = {}
 
     def __repr__(self) -> str:
         return f"Species({self.name})"
@@ -119,7 +173,7 @@ class Species:
 
     @property
     def legacy(self) -> bool:
-        """Check if we are using FESTIM 1.0 implementation or FESTIM 2.0."""
+        """Whether the species is a standalone field without subdomain functions."""
         if not self.subdomain_to_solution:
             return True
         else:

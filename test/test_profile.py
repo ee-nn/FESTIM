@@ -112,7 +112,7 @@ def test_profile_single_species():
 
 
 def test_profile_discontinuous():
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     protium = F.Species("H")
     deuterium = F.Species("D")
@@ -180,7 +180,7 @@ def test_profile_discontinuous():
 
 
 def test_profile_discontinuous_single_species():
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     protium = F.Species("H")
     my_model.species = [protium]

@@ -124,7 +124,7 @@ def test_permeation_problem_multi_volume(tmp_path):
     my_model = F.HydrogenTransportProblem()
     my_model.mesh = my_mesh
 
-    my_mat = F.Material(D_0=1.9e-7, E_D=0.2, name="my_mat")
+    my_mat = F.Material(D_0=1.9e-7, E_D=0.2, name="my_mat", K_S_0=1.0, E_K_S=0.0)
     my_subdomain_1 = F.VolumeSubdomain1D(id=1, borders=[0, L / 4], material=my_mat)
     my_subdomain_2 = F.VolumeSubdomain1D(id=2, borders=[L / 4, L / 2], material=my_mat)
     my_subdomain_3 = F.VolumeSubdomain1D(
@@ -144,6 +144,13 @@ def test_permeation_problem_multi_volume(tmp_path):
 
     mobile_H = F.Species("H")
     my_model.species = [mobile_H]
+    mobile_H.subdomains = my_model.volume_subdomains
+    my_model.interfaces = [
+        F.Interface(10 + i, [left, right], method="nitsche")
+        for i, (left, right) in enumerate(
+            zip(mobile_H.subdomains[:-1], mobile_H.subdomains[1:])
+        )
+    ]
 
     temperature = Constant(my_mesh.mesh, 500.0)
     my_model.temperature = temperature
@@ -165,7 +172,9 @@ def test_permeation_problem_multi_volume(tmp_path):
     )
     my_model.exports = [
         F.VTXSpeciesExport(
-            os.path.join(tmp_path, "mobile_concentration_h.bp"), field=mobile_H
+            os.path.join(tmp_path, "mobile_concentration_h.bp"),
+            field=mobile_H,
+            subdomain=my_subdomain_1,
         ),
         outgassing_flux,
     ]

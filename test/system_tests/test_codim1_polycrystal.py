@@ -89,7 +89,7 @@ def strips(n=24, k=(2.0, 5.0, 3.0)):
         F.FixedConcentrationBC(subdomain=right, value=0.0, species=species[2]),
     ]
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[*species, c_gb],
         subdomains=[*grains, network, left, right],
@@ -238,7 +238,7 @@ def t_junction(n=24, rates=(1.0, 1.0, 1.0)):
 
     species = [F.Species(f"c_{g.id}", subdomains=[g]) for g in grains]
     c_gb = F.Species("c_gb", subdomains=[network])
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[*species, c_gb],
         subdomains=[*grains, network, charged],

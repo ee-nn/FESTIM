@@ -30,31 +30,6 @@ def test_error_raised_when_wrong_hydrogen_problem_given(object):
 
 @pytest.mark.parametrize(
     "object",
-    [
-        F.HydrogenTransportProblemDiscontinuous(),
-        F.HydrogenTransportProblemDiscontinuousChangeVar(),
-    ],
-)
-def test_error_raised_when_wrong_type_hydrogen_problem_given(object):
-    """Test TypeError is raised when an object that isnt a
-    festim.HydrogenTransportProblem object is given to hydrogen_problem."""
-
-    test_heat_problem = F.HeatTransferProblem()
-
-    with pytest.raises(
-        NotImplementedError,
-        match="Coupled heat transfer - hydrogen transport simulations with "
-        "HydrogenTransportProblemDiscontinuousChangeVar or"
-        "HydrogenTransportProblemDiscontinuous"
-        "not currently supported",
-    ):
-        F.CoupledTransientHeatTransferHydrogenTransport(
-            heat_problem=test_heat_problem, hydrogen_problem=object
-        )
-
-
-@pytest.mark.parametrize(
-    "object",
     ["coucou", 1, 1.0],
 )
 def test_error_raised_when_wrong_heat_problem_given(object):

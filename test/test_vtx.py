@@ -56,7 +56,7 @@ def test_vtx_suffix_converter(tmpdir):
 
 def test_vtx_DG(tmpdir):
     """Test VTX export setup for DG formulation."""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(vertices=np.array([0.0, 1.0, 2.0, 3.0, 4.0]))
     my_mat = F.Material(D_0=3, E_D=2, K_S_0=1, E_K_S=0, name="mat")
 
@@ -91,7 +91,7 @@ def test_vtx_DG(tmpdir):
 
 def test_vtx_mixed_domain_temperature(tmpdir):
     """Test VTXTemperatureExport setup for mixed formulation."""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(vertices=np.array([0.0, 1.0, 2.0, 3.0, 4.0]))
     my_mat = F.Material(D_0=3, E_D=2, K_S_0=1, E_K_S=0, name="mat")
 
@@ -311,7 +311,7 @@ def test_custom_field_discontinuous(tmp_path, expression):
     expressions.
     """
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     mat = F.Material(D_0=1, E_D=0, K_S_0=1, E_K_S=0)
 
@@ -375,8 +375,8 @@ def test_custom_field_discontinuous(tmp_path, expression):
     "expression",
     [lambda c_A, t: c_A * t, lambda t: t],
 )
-def test_custom_field_not_implemented_error(expression):
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+def test_custom_field_time_dependent(tmp_path, expression):
+    my_model = F.HydrogenTransportProblem()
 
     mat = F.Material(D_0=1, E_D=0, K_S_0=1, E_K_S=0)
 
@@ -421,7 +421,7 @@ def test_custom_field_not_implemented_error(expression):
     my_model.settings = F.Settings(transient=False, atol=1e-9, rtol=1e-9)
 
     custom_field = F.CustomFieldExport(
-        filename="custom_field.bp",
+        filename=tmp_path / "custom_field.bp",
         expression=expression,
         species_dependent_value={"c_A": A, "c_B": B},
         subdomain=vol,
@@ -431,8 +431,9 @@ def test_custom_field_not_implemented_error(expression):
         custom_field,
     ]
 
-    with pytest.raises(NotImplementedError):
-        my_model.initialise()
+    my_model.initialise()
+    my_model.run()
+    assert custom_field.function is not None
 
 
 @pytest.mark.parametrize("direction", ["both", "forward", "backward"])

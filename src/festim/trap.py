@@ -107,7 +107,9 @@ class Trap(_Species):
 
     def create_species_and_reaction(self):
         """Create the immobile trapped species object and the reaction for trapping."""
-        self.trapped_concentration = _Species(name=self.name, mobile=False)
+        self.trapped_concentration = _Species(
+            name=self.name, mobile=False, subdomains=[self.volume]
+        )
         self.empty_trap_sites = _ImplicitSpecies(
             n=self.n, others=[self.trapped_concentration]
         )

@@ -86,7 +86,7 @@ def build(n=20, mesh=None, plane=0.5, swap_declaration_order=False):
     ]
 
     subdomains = [right, left] if swap_declaration_order else [left, right]
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_l, H_r, H_g],
         subdomains=[*subdomains, gamma, outer_l, outer_r],
@@ -219,7 +219,7 @@ def test_interior_manifold_inside_a_single_subdomain():
     H_b = F.Species("H_b", subdomains=[bulk])
     H_g = F.Species("H_g", subdomains=[gamma])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_b, H_g],
         subdomains=[bulk, gamma, outer],
@@ -276,7 +276,7 @@ def test_manifold_mixing_interior_and_exterior_facets_raises():
         dim=1,
         locator=lambda x: np.isclose(x[0], 0.5) | np.isclose(x[0], 0.0),
     )
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[
             F.Species("H_b", subdomains=[bulk]),
@@ -475,7 +475,7 @@ def test_interior_manifold_3d_tilted_mms():
             ),
         ]
 
-        model = F.HydrogenTransportProblemDiscontinuous(
+        model = F.HydrogenTransportProblem(
             mesh=F.Mesh(mesh),
             species=[H_l, H_r, H_g],
             subdomains=[left, right, gamma, outer_l, outer_r],
@@ -623,7 +623,7 @@ def build_two_junctions(n=12, second_junction="manifold"):
         F.FixedConcentrationBC(subdomain=outer_r, value=0.0, species=outflow_species),
     ]
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=species,
         subdomains=[left, middle, right, gamma_1, *extra, outer_l, outer_r],
@@ -758,7 +758,7 @@ def build_shared_bulk_species(n=12):
         F.FixedConcentrationBC(subdomain=outer_r, value=0.0, species=H_mr),
     ]
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_l, H_mr, H_g],
         subdomains=[left, middle, right, gamma, outer_l, outer_r],
@@ -847,7 +847,7 @@ def build_interface_and_manifold(n=12):
         F.FixedConcentrationBC(subdomain=outer_r, value=0.0, species=H_mr),
     ]
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_l, H_mr, H_g],
         subdomains=[left, middle, right, gamma, outer_l, outer_r],

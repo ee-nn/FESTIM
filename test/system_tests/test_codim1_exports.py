@@ -62,7 +62,7 @@ def exterior_model(n=32, exports=()):
     H_om = F.Species("H_om", subdomains=[omega])
     H_gam = F.Species("H_gam", subdomains=[gamma])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma, right],
@@ -331,7 +331,7 @@ def test_outlet_flux_of_a_manifold_carrying_advection():
     vel = dolfinx.fem.Function(dolfinx.fem.functionspace(mesh, ("Lagrange", 1, (2,))))
     vel.interpolate(lambda x: np.vstack([np.zeros_like(x[0]), np.full_like(x[0], v_y)]))
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=[omega, gamma, inlet, outlet, fixed],
@@ -392,13 +392,7 @@ def test_ordinary_volume_subdomain_as_a_surface_raises():
 
 @pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial only for now")
 def test_volume_as_a_surface_raises_in_a_problem_without_manifolds():
-    """Only HydrogenTransportProblemDiscontinuous supports manifolds.
-
-    The ``surface`` setter accepts a volume subdomain so a manifold can be passed
-    through, so every other problem class has to reject one at initialisation. It would
-    otherwise look the subdomain's id up in the *facet* tags and silently report some
-    other surface's value -- a plausible number for the wrong surface, not a zero.
-    """
+    """A full-dimensional volume cannot be used as an export surface."""
     mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 8, 8)
     vol = F.VolumeSubdomain(
         id=1,
@@ -419,5 +413,5 @@ def test_volume_as_a_surface_raises_in_a_problem_without_manifolds():
         temperature=500,
         settings=F.Settings(atol=1e-10, rtol=1e-10, transient=False),
     )
-    with pytest.raises(TypeError, match="only supported by .*Discontinuous"):
+    with pytest.raises(ValueError, match=r"codim-1|codimension|manifold"):
         model.initialise()

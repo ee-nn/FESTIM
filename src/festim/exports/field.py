@@ -230,7 +230,7 @@ class SpeciesExport(FieldExportBase):
 
     @property
     def _checkpoint(self) -> bool:
-        """Kept so the legacy problem classes keep working unchanged."""
+        """Compatibility view of the checkpoint format."""
         return self.format == "checkpoint"
 
     @property
@@ -374,9 +374,13 @@ class CustomFieldExport(FieldExportBase):
             for spe in self.species_dependent_value.values()
             if isinstance(spe, Species)
         ]
-        return any(
-            spe.subdomain_to_post_processing_solution for spe in all_explicit_species
-        ) or (self.subdomain.sub_T if self.subdomain else None)
+        return bool(
+            any(
+                spe.subdomain_to_post_processing_solution
+                for spe in all_explicit_species
+            )
+            or self.subdomain is not None
+        )
 
     def set_dolfinx_expression(
         self,
@@ -443,27 +447,15 @@ class CustomFieldExport(FieldExportBase):
                 return spe.post_processing_solution
 
     def check_valid_inputs(self, kwargs: dict):
-        """
-        Check if we are in the mixed domain/discontinuous case and if the user-provided
-        expression is valid in this case.
-        dolfinx.fem.Expression does not support co-dim 0 submeshes and time is defined
-        on the parent mesh, so we cannot have time-dependent custom fields in the mixed
-        domain/discontinuous case.
-
-        When https://github.com/FEniCS/dolfinx/issues/3207 is resolved we should be
-        able to support this
-        """
-
-        # check the domain of all kwargs and check that they are the same
-
-        if self.mixed_domain and "t" in kwargs:
-            raise NotImplementedError(
-                "Time-dependent custom fields are not implemented in the case of a "
-                "mixed domain/discontinuous case."
-                "dolfinx.fem.Expression does not support co-dim 0 submeshes and time is"
-                "defined on the parent mesh."
-                "See https://github.com/FEniCS/dolfinx/issues/3207 for more details."
-            )
+        """Expression coefficients must live on the mesh being exported."""
+        domain = self.function.function_space.mesh.ufl_domain()
+        for name, value in kwargs.items():
+            if isinstance(value, ufl.core.expr.Expr):
+                other = ufl.domain.extract_unique_domain(value)
+                if other is not None and other is not domain:
+                    raise ValueError(
+                        f"Custom field argument {name} is defined on another mesh"
+                    )
 
 
 class ReactionRateExport(CustomFieldExport):
@@ -537,7 +529,7 @@ class ReactionRateExport(CustomFieldExport):
                 spe.name: spe for spe in reaction.reactant + reaction_products
             },
             times=times,
-            subdomain=subdomain,
+            subdomain=subdomain if subdomain is not None else reaction.volume,
             format=format,
             backend=backend,
             checkpoint=checkpoint,

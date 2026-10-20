@@ -66,7 +66,7 @@ def advection_diffusion_along_gamma(n, length=1.0, height=1.0, D=1.0, v_x=1.0):
     c_wall = F.Species("c_wall", subdomains=[wall])
     c_gamma = F.Species("c_gamma", subdomains=[gamma])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[c_wall, c_gamma],
         subdomains=[wall, gamma, inlet, outlet, outer],
@@ -148,7 +148,7 @@ def test_pipe_inlet_concentration():
     c_wall = F.Species("c_wall", subdomains=[wall])
     c_inf = F.Species("c_inf", subdomains=[fluid])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[c_wall, c_inf],
         subdomains=[wall, fluid, inlet, outlet, outer],

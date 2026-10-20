@@ -16,7 +16,7 @@ def make_model(n=16, enclosures=None, final_time=20.0, dt=1.0):
     """A 1D slab with a single material and no boundary conditions, to which enclosures
     can be attached. The species field is decoupled unless a coupling BC is given."""
     mesh = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, n)
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
 
     material = F.Material(name="mat", D_0=1e-9, E_D=0.0)
@@ -204,7 +204,7 @@ def test_closed_enclosure_conserves_particles(length, area):
     dt, final_time = 5.0, 200.0
 
     mesh = dolfinx.mesh.create_interval(MPI.COMM_WORLD, 40, [0.0, length])
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
     material = F.Material(name="mat", D_0=1e-6, E_D=0.0)
     volume = F.VolumeSubdomain1D(id=1, borders=[0.0, length], material=material)
@@ -278,7 +278,7 @@ def test_cylindrical_1d_conserves_particles(contact):
     k_d0, k_r0 = 1e15, 1e-25
     dt, final_time = 5.0, 200.0
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(
         vertices=np.linspace(r_in, r_out, 41), coordinate_system="cylindrical"
     )
@@ -361,7 +361,7 @@ def test_spherical_1d_conserves_particles(contact):
     k_d0, k_r0 = 1e15, 1e-25
     dt, final_time = 5.0, 200.0
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(
         vertices=np.linspace(r_in, r_out, 41), coordinate_system="spherical"
     )
@@ -453,7 +453,7 @@ def test_enclosure_on_2d_mesh_conserves_particles():
         [24, 24],
         dolfinx.mesh.CellType.triangle,
     )
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
     material = F.Material(name="mat", D_0=1.0, E_D=0.0)
     volume = F.VolumeSubdomain(id=1, material=material)
@@ -537,7 +537,7 @@ def test_cylindrical_2d_conserves_particles():
         [12, 12],
         dolfinx.mesh.CellType.triangle,
     )
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh, coordinate_system="cylindrical")
     material = F.Material(name="mat", D_0=1.0, E_D=0.0)
     volume = F.VolumeSubdomain(id=1, material=material)
@@ -608,7 +608,7 @@ def test_steady_state_closed_enclosure_reaches_surface_equilibrium():
     k_d0, k_r0 = 1e15, 1e-25
 
     mesh = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, 20)
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
     material = F.Material(name="mat", D_0=1e-6, E_D=0.0)
     volume = F.VolumeSubdomain1D(id=1, borders=[0.0, 1.0], material=material)
@@ -662,7 +662,7 @@ def test_enclosure_in_contact_with_two_materials():
     dt, final_time = 5.0, 200.0
 
     vertices = np.concatenate((np.linspace(0, 0.5, 30), np.linspace(0.5, 1.0, 30)))
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(vertices)
     material_left = F.Material(D_0=1e-6, E_D=0.0, K_S_0=1, E_K_S=0)
     material_right = F.Material(D_0=2e-6, E_D=0.0, K_S_0=1, E_K_S=0)
@@ -754,7 +754,7 @@ def test_enclosure_couples_two_disconnected_meshes():
     k_d0, k_r0 = 1e17, 1e-21
     dt, final_time = 5.0, 200.0
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D([np.linspace(0, 0.5, 30), np.linspace(1.0, 1.5, 30)])
 
     material = F.Material(D_0=1e-6, E_D=0.0, K_S_0=1, E_K_S=0)

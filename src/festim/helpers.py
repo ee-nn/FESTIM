@@ -107,10 +107,10 @@ def as_mapped_function(
         # t/x/T, so a value may be given more species than it uses
         if name not in arguments:
             continue
-        if species.concentration is not None:
-            kwargs[name] = species.concentration
-        else:  # discontinuous case: the species has one solution per subdomain
+        if subdomain is not None:
             kwargs[name] = solution_on(species, subdomain, foreign_subdomain)
+        else:
+            kwargs[name] = species.concentration
 
     return value(**kwargs)
 
@@ -142,7 +142,13 @@ def solution_on(
         ValueError: if the species lives on several subdomains, none of which is
             ``subdomain`` or ``foreign_subdomain``, so the choice would be arbitrary
     """
+    if not hasattr(species, "subdomain_to_solution"):
+        # Implicit species compute their concentration from explicit species on
+        # the selected subdomain, rather than through deprecated global aliases.
+        return species.concentration_submesh(subdomain)
     solutions = species.subdomain_to_solution
+    if not solutions:
+        return species.concentration
     if subdomain in solutions:
         return solutions[subdomain]
     if foreign_subdomain in solutions:
@@ -385,9 +391,7 @@ class Value:
             self.fenics_interpolation_expression = self.input_value
 
         elif isinstance(self.input_value, float | int):
-            self.fenics_object = as_fenics_constant(
-                value=self.input_value, mesh=function_space.mesh
-            )
+            self.fenics_object = as_fenics_constant(value=self.input_value, mesh=mesh)
 
         elif callable(self.input_value):
             args = self.input_value.__code__.co_varnames

@@ -180,7 +180,7 @@ def test_reaction(k, p, c_A_0):
 
 def test_surface_reaction_in_discontinuous_case():
     """Test the SurfaceReactionBC in a discontinuous problem setup."""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     my_model.mesh = F.Mesh1D(vertices=np.linspace(0, 1, num=1000))
 

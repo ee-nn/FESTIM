@@ -4,6 +4,7 @@ from dolfinx import fem
 from festim import k_B
 from festim.boundary_conditions import ParticleFluxBC
 from festim.enclosure.gas_species import GasSpecies
+from festim.helpers import solution_on
 
 
 class SurfaceReactionBCpartial(ParticleFluxBC):
@@ -65,22 +66,16 @@ class SurfaceReactionBCpartial(ParticleFluxBC):
         else:
             gas_pressure = self.gas_pressure
 
-        # initialise with the concentration of the first reactant
-        if self.reactant[0].concentration:
-            product_of_reactants = self.reactant[0].concentration
-        else:  # probably used in HydrogenTransportProblemDiscontinuous
-            product_of_reactants = self.reactant[0].subdomain_to_solution[
-                self._volume_subdomain
-            ]
-
-        # then compute the product of the concentrations of the other reactants
-        for reactant in self.reactant[1:]:
-            if reactant.concentration:
-                product_of_reactants *= reactant.concentration
-            else:  # probably used in HydrogenTransportProblemDiscontinuous
-                product_of_reactants *= reactant.subdomain_to_solution[
-                    self._volume_subdomain
-                ]
+        volume = getattr(self, "_volume_subdomain", None)
+        concentrations = [
+            solution_on(reactant, volume)
+            if volume is not None
+            else reactant.concentration
+            for reactant in self.reactant
+        ]
+        product_of_reactants = concentrations[0]
+        for concentration in concentrations[1:]:
+            product_of_reactants *= concentration
 
         self.value_fenics = kd * gas_pressure - kr * product_of_reactants
 

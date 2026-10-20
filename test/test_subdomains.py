@@ -24,7 +24,6 @@ def test_different_surface_ids():
         volume_subdomain,
     ]
 
-    my_test_model.define_function_spaces()
     my_test_model.define_meshtags_and_measures()
 
     for surf_id in surface_subdomains_ids:
@@ -135,8 +134,6 @@ def test_ValueError_rasied_when_volume_ids_are_not_unique():
         vol_1,
         vol_2,
     ]
-
-    my_test_model.define_function_spaces()
 
     with pytest.raises(ValueError, match="Volume ids are not unique"):
         my_test_model.define_meshtags_and_measures()

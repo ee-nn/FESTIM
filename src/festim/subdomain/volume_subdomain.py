@@ -32,11 +32,8 @@ class VolumeSubdomain:
         u_n: the previous solution function of the subdomain
         material: the material assigned to the subdomain
         sub_T: the sub temperature field in the subdomain
-        sub_t: for a manifold (codim-1) subdomain, the current time as a constant living
-            on its submesh. ``None`` for a codim-0 subdomain, which uses the parent-mesh
-            constant
-        sub_dt: for a manifold (codim-1) subdomain, the timestep as a constant living on
-            its submesh. ``None`` for a codim-0 subdomain
+        sub_t: the current time as a constant on the submesh
+        sub_dt: the timestep as a constant on the submesh for transient problems
         dim: the topological dimension of the subdomain. Defaults to ``None``, meaning
             the dimension of the mesh. Set it to ``mesh_dim - 1`` to solve a transport
             equation on a manifold embedded in the mesh (a point in a 1D mesh, a line
@@ -125,8 +122,6 @@ class VolumeSubdomain:
         """
         Creates the following attributes: ``.parent_mesh``, ``.submesh``, ``.cell_map``,
         and ``.v_map``.
-
-        Only used in ``festim.HydrogenTransportProblemDiscontinuous``
 
         Args:
             mesh (dolfinx.mesh.Mesh): the parent mesh

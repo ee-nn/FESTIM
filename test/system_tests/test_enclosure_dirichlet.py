@@ -46,7 +46,7 @@ def build_slab_with_enclosure(
         the model, the solid species, the gas species, the volume and the enclosure
     """
     mesh = dolfinx.mesh.create_interval(MPI.COMM_WORLD, n, [0.0, length])
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
 
     material = F.Material(name="mat", D_0=D_0, E_D=0.0)
@@ -276,7 +276,7 @@ def test_time_dependent_temperature_leaves_coupled_bc_untouched():
     what this test exercises.
     """
     mesh = dolfinx.mesh.create_interval(MPI.COMM_WORLD, 20, [0.0, 1.0])
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
 
     material = F.Material(name="mat", D_0=1e-1, E_D=0.0)
@@ -358,7 +358,7 @@ def test_dirichlet_coupling_agrees_with_surface_reaction():
 
     # --- the same problem through a surface reaction
     mesh = dolfinx.mesh.create_interval(MPI.COMM_WORLD, n, [0.0, length])
-    model_r = F.HydrogenTransportProblemDiscontinuous()
+    model_r = F.HydrogenTransportProblem()
     model_r.mesh = F.Mesh(mesh=mesh)
     material = F.Material(name="mat", D_0=D_0, E_D=0.0)
     vol_r = F.VolumeSubdomain1D(id=1, borders=[0.0, length], material=material)

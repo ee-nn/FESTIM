@@ -86,7 +86,7 @@ def test_2_materials_2d_mms(tmpdir):
 
     mesh, mt, ct = generate_mesh(100)
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.method_interface = "nitsche"
     my_model.mesh = F.Mesh(mesh)
     my_model.volume_meshtags = ct
@@ -159,7 +159,7 @@ def test_2_materials_2d_mms(tmpdir):
 
 # TODO make this a MMS case
 def test_1_material_discontinuous_version(tmpdir):
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     N = 1500
     vertices = np.linspace(0, 1, num=N)
@@ -222,7 +222,7 @@ def test_1_material_discontinuous_version(tmpdir):
 
 
 def test_3_materials_transient(tmpdir):
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     interface_1 = 0.5
     interface_2 = 0.7
@@ -326,7 +326,7 @@ def test_3_materials_transient(tmpdir):
 def test_2_mats_particle_flux_bc(tmpdir):
     mesh, mt, ct = generate_mesh()
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.method_interface = "nitsche"
 
     my_model.mesh = F.Mesh(mesh)
@@ -390,7 +390,7 @@ def test_all_cells_are_not_tagged():
     that is too coarse to capture the geometry of the volume subdomains.
     """
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     mat = F.Material(D_0=1, E_D=0, K_S_0=1, E_K_S=0)
 
@@ -429,7 +429,7 @@ def test_all_cells_are_not_tagged():
 
 def test_extrema_exports_discontinuous(tmpdir):
     """MinimumVolume, MaximumVolume, MinimumSurface and MaximumSurface work with
-    HydrogenTransportProblemDiscontinuous.
+    HydrogenTransportProblem.
 
     The steady state concentration is piecewise linear in y. Continuity of the flux
     and of the chemical potential (c/K_S) at the interface give c = 3/8 on the bottom
@@ -438,7 +438,7 @@ def test_extrema_exports_discontinuous(tmpdir):
 
     fenics_mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 10, 10)
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(fenics_mesh)
 
     material_top = F.Material(name="Material_A", D_0=1, E_D=0, K_S_0=2, E_K_S=0)
@@ -520,7 +520,7 @@ def test_extrema_export_on_a_volume_without_the_species(make_export, location):
     species isn't defined is caught at initialise() rather than failing later in
     post_processing."""
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(np.linspace(0, 1, 11))
 
     mat = F.Material(D_0=1, E_D=0, K_S_0=1, E_K_S=0)
@@ -587,7 +587,7 @@ def test_jacobian_skips_blocks_of_absent_unknowns(monkeypatch):
     right_surface = F.SurfaceSubdomain1D(id=2, x=vertices[-1])
 
     H = F.Species("H", subdomains=[left, middle, right])
-    my_model = F.HydrogenTransportProblemDiscontinuous(
+    my_model = F.HydrogenTransportProblem(
         mesh=F.Mesh1D(vertices),
         subdomains=[left, middle, right, left_surface, right_surface],
         species=[H],

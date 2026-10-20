@@ -156,8 +156,7 @@ class ParticleFluxBC(FluxBCBase):
             callable value to festim.Species objects, allowing the flux to depend on the
             concentration of other species. Example: {"c1": species1} where "c1" is the
             argument name in the callable value and species1 is a festim.Species
-            object. Ignored if value is not callable. Defaults to an empty dict. Not
-            supported by festim.HydrogenTransportProblemDiscontinuousChangeVar.
+            object. Ignored if value is not callable. Defaults to an empty dict.
 
     Attributes:
         subdomain (festim.SurfaceSubdomain): the surface subdomain where the
@@ -243,10 +242,10 @@ class ParticleFluxBC(FluxBCBase):
                     kwargs["T"] = temperature
 
                 for name, species in self.species_dependent_value.items():
-                    if species.concentration is not None:
-                        kwargs[name] = species.concentration
-                    else:  # discontinuous case: one solution per subdomain
+                    if getattr(self, "_volume_subdomain", None) is not None:
                         kwargs[name] = solution_on(species, self._volume_subdomain)
+                    else:
+                        kwargs[name] = species.concentration
 
                 self.value_fenics = self.value(**kwargs)
 

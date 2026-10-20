@@ -91,19 +91,14 @@ def test_plot_raises_if_no_solution():
         F.plot(F.Species("H"))
 
 
-def test_plot_raises_if_subdomain_given_on_non_mixed_domain_problem():
+def test_plot_subdomain_selection_with_single_domain_alias():
     material = F.Material(D_0=1, E_D=0)
-    vol_1 = F.VolumeSubdomain(id=1, material=material)
-
-    species = F.Species("H")
-    species.post_processing_solution = create_mock_solution()
-
-    with pytest.raises(
-        ValueError,
-        match="Problem seems to be HydrogenTransportProblem but a subdomain "
-        "was provided",
-    ):
-        F.plot(species, subdomain=vol_1)
+    volume = F.VolumeSubdomain(id=1, material=material)
+    species = F.Species("H", subdomains=[volume])
+    solution = create_mock_solution()
+    species.subdomain_to_post_processing_solution = {volume: solution}
+    plotter = F.plot(species, subdomain=volume)
+    plotter.close()
 
 
 def test_plot_raises_if_no_subdomain_solutions():

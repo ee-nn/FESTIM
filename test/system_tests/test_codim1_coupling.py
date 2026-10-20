@@ -153,7 +153,7 @@ def run(n, dim=2, degree=1, velocity=None):
         subdomains.append(gamma_ends)
         bcs.append(F.OutflowBC(subdomain=gamma_ends, species=H_gam))
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam],
         subdomains=subdomains,
@@ -265,7 +265,7 @@ def test_coupling_source_internal_subdomain():
         F.FixedConcentrationBC(subdomain=outer_r, value=0.0, species=H_r),
     ]
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_l, H_r, H_g],
         subdomains=[left, right, gamma, outer_l, outer_r],
@@ -339,7 +339,7 @@ def uncoupled(stepsize, final_time, source_value, reactions=None, extra_species=
     H_om = F.Species("H_om", subdomains=[omega])
     H_gam = F.Species("H_gam", subdomains=[gamma])
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[H_om, H_gam, *extra_species],
         subdomains=[omega, gamma, right],

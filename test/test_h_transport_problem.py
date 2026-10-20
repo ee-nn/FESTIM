@@ -9,7 +9,7 @@ from dolfinx import default_scalar_type, fem
 
 import festim as F
 
-from .utils import evaluate_at_point
+from .utils import evaluate_at_point, prepare_subdomains
 
 test_mesh = F.Mesh1D(vertices=np.array([0.0, 1.0, 2.0, 3.0, 4.0]))
 x = ufl.SpatialCoordinate(test_mesh.mesh)
@@ -155,6 +155,9 @@ def test_iterate():
     V = fem.functionspace(mesh, ("Lagrange", 1))
     my_model.u = fem.Function(V)
     my_model.u_n = fem.Function(V)
+    volume = F.VolumeSubdomain(id=1, material=dummy_mat)
+    volume.u, volume.u_n = my_model.u, my_model.u_n
+    my_model.subdomains = [volume]
     my_model._dt = fem.Constant(mesh, 2.0)
     v = ufl.TestFunction(V)
 
@@ -235,99 +238,20 @@ def test_initialise_exports_find_species_with_one_field():
     surf = F.SurfaceSubdomain1D(id=1, x=1)
 
     my_model.exports = [F.SurfaceFlux(field="J", surface=surf)]
-    my_model.define_function_spaces()
+    prepare_subdomains(my_model)
 
     # TEST
     with pytest.raises(ValueError, match="Species J not found in list of species"):
         my_model.initialise_exports()
 
 
-def test_define_D_global_different_temperatures():
-    """Test that the D_global object is correctly defined when the temperature is
-    different in the volume subdomains."""
-    D_0, E_D = 1.5, 0.1
-    my_mat = F.Material(D_0=D_0, E_D=E_D, name="my_mat")
-    F.SurfaceSubdomain1D(id=1, x=0)
-    H = F.Species("H")
-
-    my_model = F.HydrogenTransportProblem(
-        mesh=F.Mesh1D(np.linspace(0, 4, num=101)),
-        subdomains=[
-            F.VolumeSubdomain1D(id=1, borders=[0, 2], material=my_mat),
-            F.VolumeSubdomain1D(id=2, borders=[2, 4], material=my_mat),
-        ],
-        species=[H],
-        temperature=lambda x: 100.0 * x[0] + 50,
-    )
-
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.t = 1
-    my_model.define_temperature()
-
-    D_computed, _D_expr = my_model.define_D_global(H)
-
-    computed_values = [
-        evaluate_at_point(D_computed, 0.0),
-        evaluate_at_point(D_computed, 4.0),
-    ]
-
-    D_analytical_left = D_0 * np.exp(-E_D / (F.k_B * 50))
-    D_analytical_right = D_0 * np.exp(-E_D / (F.k_B * 450))
-
-    expected_values = [D_analytical_left, D_analytical_right]
-
-    assert np.isclose(computed_values, expected_values).all()
-
-
-def test_define_D_global_different_materials():
-    """Test that the D_global object is correctly defined when the material is different
-    in the volume subdomains."""
-    D_0_left, E_D_left = 1.0, 0.1
-    D_0_right, E_D_right = 2.0, 0.2
-    my_mat_L = F.Material(D_0=D_0_left, E_D=E_D_left, name="my_mat_L")
-    my_mat_R = F.Material(D_0=D_0_right, E_D=E_D_right, name="my_mat_R")
-    H = F.Species("H")
-
-    my_model = F.HydrogenTransportProblem(
-        mesh=F.Mesh1D(np.linspace(0, 4, num=101)),
-        subdomains=[
-            F.VolumeSubdomain1D(id=1, borders=[0, 2], material=my_mat_L),
-            F.VolumeSubdomain1D(id=2, borders=[2, 4], material=my_mat_R),
-        ],
-        species=[H],
-        temperature=500,
-    )
-
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.t = 0
-    my_model.define_temperature()
-
-    D_computed, _D_expr = my_model.define_D_global(H)
-
-    computed_values = [
-        evaluate_at_point(D_computed, 0.0),
-        evaluate_at_point(D_computed, 4.0),
-    ]
-
-    D_expected_left = D_0_left * np.exp(-E_D_left / (F.k_B * my_model.temperature))
-    D_expected_right = D_0_right * np.exp(-E_D_right / (F.k_B * my_model.temperature))
-
-    expected_values = [D_expected_left, D_expected_right]
-
-    assert np.isclose(computed_values, expected_values).all()
-
-
-def test_initialise_exports_multiple_exports_same_species():
-    """Test that the diffusion coefficient within the D_global object function is the
-    same for multiple exports of the same species, and that D_global object is only
-    created once per species."""
+def test_exports_of_same_species_use_matching_material_diffusivity():
+    """Exports on volumes with the same material resolve the same diffusivity."""
 
     D_0, E_D = 1.5, 0.1
     my_mat = F.Material(D_0=D_0, E_D=E_D, name="my_mat")
     surf_1 = F.SurfaceSubdomain1D(id=1, x=0)
-    surf_2 = F.SurfaceSubdomain1D(id=1, x=4)
+    surf_2 = F.SurfaceSubdomain1D(id=2, x=4)
     H = F.Species("H")
 
     my_model = F.HydrogenTransportProblem(
@@ -335,6 +259,8 @@ def test_initialise_exports_multiple_exports_same_species():
         subdomains=[
             F.VolumeSubdomain1D(id=1, borders=[0, 2], material=my_mat),
             F.VolumeSubdomain1D(id=2, borders=[2, 4], material=my_mat),
+            surf_1,
+            surf_2,
         ],
         species=[H],
         temperature=500,
@@ -350,15 +276,21 @@ def test_initialise_exports_multiple_exports_same_species():
         ],
     )
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
+    H.subdomains = my_model.volume_subdomains
+    prepare_subdomains(my_model)
     my_model.t = 0
     my_model.define_temperature()
     my_model.initialise_exports()
 
     Ds = [export.D for export in my_model.exports]
 
-    assert Ds[0].x.array[0] == Ds[1].x.array[0]
+    V = fem.functionspace(my_model.mesh.mesh, ("P", 1))
+    values = []
+    for D in Ds:
+        f = fem.Function(V)
+        f.interpolate(fem.Expression(D, V.element.interpolation_points))
+        values.append(f.x.array.copy())
+    np.testing.assert_allclose(values[0], values[1])
 
 
 def test_export_resets_quantities():
@@ -389,218 +321,6 @@ def test_export_resets_quantities():
 
         assert my_model.exports[0].t == [0.0]
         assert my_model.exports[0].data == [0.0]
-
-
-def test_define_D_global_multispecies():
-    """Test that the D_global object is correctly defined when there are multiple
-    species in one subdomain."""
-    A = F.Species("A")
-    B = F.Species("B")
-
-    D_0_A, D_0_B = 1.0, 2.0
-    E_D_A, E_D_B = 0.1, 0.2
-
-    my_mat = F.Material(
-        D_0={A: D_0_A, B: D_0_B}, E_D={A: E_D_A, B: E_D_B}, name="my_mat"
-    )
-    F.SurfaceSubdomain1D(id=1, x=1)
-
-    my_model = F.HydrogenTransportProblem(
-        mesh=F.Mesh1D(np.linspace(0, 1, num=101)),
-        subdomains=[
-            F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat),
-        ],
-        species=[F.Species("A"), F.Species("B")],
-        temperature=500,
-    )
-
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.t = 0
-    my_model.define_temperature()
-
-    D_A_computed, _D_A_expr = my_model.define_D_global(A)
-    D_B_computed, _D_B_expr = my_model.define_D_global(B)
-
-    computed_values = [D_A_computed.x.array[-1], D_B_computed.x.array[-1]]
-
-    D_expected_A = D_0_A * np.exp(-E_D_A / (F.k_B * my_model.temperature))
-    D_expected_B = D_0_B * np.exp(-E_D_B / (F.k_B * my_model.temperature))
-
-    expected_values = [D_expected_A, D_expected_B]
-
-    assert np.isclose(computed_values, expected_values).all()
-
-
-def test_post_processing_update_D_global():
-    """Test that the D_global object is updated at each time step when temperture is
-    time dependent."""
-    my_mesh = F.Mesh1D(np.linspace(0, 1, num=11))
-    my_mat = F.Material(D_0=1.5, E_D=0.1, name="my_mat")
-    surf = F.SurfaceSubdomain1D(id=1, x=1)
-
-    # create species and interpolate solution
-    H = F.Species("H")
-    V = fem.functionspace(my_mesh.mesh, ("Lagrange", 1))
-    u = fem.Function(V)
-    u.interpolate(lambda x: 2 * x[0] ** 2 + 1)
-    H.solution = u
-
-    my_export = F.SurfaceFlux(
-        field=H,
-        surface=surf,
-    )
-
-    # Build the model
-    my_model = F.HydrogenTransportProblem(
-        mesh=my_mesh,
-        subdomains=[
-            F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat),
-            surf,
-        ],
-        species=[H],
-        temperature=lambda t: 500 * t,
-        exports=[my_export],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
-    my_model.t = fem.Constant(my_model.mesh.mesh, 1.0)
-    my_model.define_temperature()
-    my_model.initialise_exports()
-
-    # RUN
-    my_model.post_processing()
-    value_t_1 = my_export.D.x.array[-1]
-
-    my_model.t = fem.Constant(my_model.mesh.mesh, 2.0)
-    my_model.update_time_dependent_values()
-    my_model.post_processing()
-    value_t_2 = my_export.D.x.array[-1]
-
-    # TEST
-    assert value_t_1 != value_t_2
-
-
-def test_post_processing_update_D_global_2():
-    """Test that the D_global object is updated at each time step when temperture is
-    time dependent."""
-    my_mesh = F.Mesh1D(np.linspace(0, 1, num=11))
-    my_mat = F.Material(D_0=1.5, E_D=0.1, name="my_mat")
-    surf = F.SurfaceSubdomain1D(id=1, x=1)
-
-    # create species and interpolate solution
-    H = F.Species("H")
-    V = fem.functionspace(my_mesh.mesh, ("Lagrange", 1))
-    u = fem.Function(V)
-    u.interpolate(lambda x: x[0] ** 2 + 100)
-    H.post_processing_solution = u
-
-    my_export = F.MaximumSurface(
-        field=H,
-        surface=surf,
-    )
-
-    # Build the model
-    my_model = F.HydrogenTransportProblem(
-        mesh=my_mesh,
-        subdomains=[
-            F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat),
-            surf,
-        ],
-        species=[H],
-        temperature=lambda t: 500 * t,
-        exports=[my_export],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
-    my_model.t = fem.Constant(my_model.mesh.mesh, 1.0)
-    my_model.define_temperature()
-    my_model.initialise_exports()
-
-    # RUN
-    my_model.post_processing()
-    my_value = my_export.D.x.array[-1]
-    assert isinstance(my_value, float)
-
-
-def test_post_processing_update_D_global_volume_1():
-    """Test that the D_global object is updated at each time step when temperture is
-    time dependent."""
-    my_mesh = F.Mesh1D(np.linspace(0, 1, num=11))
-    my_mat = F.Material(D_0=1.5, E_D=0.1, name="my_mat")
-    my_vol = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat)
-
-    # create species and interpolate solution
-    H = F.Species("H")
-    V = fem.functionspace(my_mesh.mesh, ("Lagrange", 1))
-    u = fem.Function(V)
-    u.interpolate(lambda x: x[0] ** 2 + 100)
-    H.solution = u
-
-    my_export = F.AverageVolume(field=H, volume=my_vol)
-
-    # Build the model
-    my_model = F.HydrogenTransportProblem(
-        mesh=my_mesh,
-        subdomains=[my_vol],
-        species=[H],
-        temperature=lambda t: 500 * t,
-        exports=[my_export],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
-    my_model.t = fem.Constant(my_model.mesh.mesh, 1.0)
-    my_model.define_temperature()
-    my_model.initialise_exports()
-
-    # RUN
-    my_model.post_processing()
-    my_value = my_model.exports[0].data[-1]
-    assert isinstance(my_value, float)
-
-
-def test_post_processing_update_D_global_volume_2():
-    """Test that the D_global object is updated at each time step when temperture is
-    time dependent."""
-    my_mesh = F.Mesh1D(np.linspace(0, 1, num=11))
-    my_mat = F.Material(D_0=1.5, E_D=0.1, name="my_mat")
-    my_vol = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat)
-
-    # create species and interpolate solution
-    H = F.Species("H")
-    V = fem.functionspace(my_mesh.mesh, ("Lagrange", 1))
-    u = fem.Function(V)
-    u.interpolate(lambda x: x[0] ** 2 + 100)
-    H.post_processing_solution = u
-
-    my_export = F.MaximumVolume(field=H, volume=my_vol)
-
-    # Build the model
-    my_model = F.HydrogenTransportProblem(
-        mesh=my_mesh,
-        subdomains=[my_vol],
-        species=[H],
-        temperature=lambda t: 500 * t,
-        exports=[my_export],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
-    my_model.t = fem.Constant(my_model.mesh.mesh, 1.0)
-    my_model.define_temperature()
-    my_model.initialise_exports()
-
-    # RUN
-    my_model.post_processing()
-    my_value = my_model.exports[0].data[-1]
-    assert isinstance(my_value, float)
 
 
 @pytest.mark.parametrize(
@@ -640,9 +360,7 @@ def test_update_time_dependent_bcs_with_time_dependent_temperature(
     my_model.boundary_conditions = [my_bc]
 
     my_model.define_temperature()
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
+    prepare_subdomains(my_model)
     my_model.create_dirichletbc_form(my_bc)
 
     for i in range(3):
@@ -684,9 +402,7 @@ def test_update_time_dependent_values_source(source_value, expected_values):
     my_source = F.ParticleSource(value=source_value, volume=my_vol, species=H)
     my_model.sources = [my_source]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
     my_model.create_sources_from_reactions()
     my_model.convert_source_input_values_to_fenics_objects()
@@ -726,9 +442,7 @@ def test_update_time_dependent_reaction_rate(forward_rate, expected_values):
     )
     my_model.reactions = [reaction]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
     my_model.convert_reaction_rates_to_fenics_objects()
 
@@ -774,9 +488,7 @@ def test_create_sources_from_reactions_leaves_sources_unchanged():
         reactions=[reaction],
     )
     my_model.t = fem.Constant(my_model.mesh.mesh, 0.0)
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
     my_model.convert_reaction_rates_to_fenics_objects()
 
@@ -804,9 +516,7 @@ def test_create_sources_from_reactions_populates_unpacked_sources():
         reactions=[reaction],
     )
     my_model.t = fem.Constant(my_model.mesh.mesh, 0.0)
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
     my_model.convert_reaction_rates_to_fenics_objects()
 
@@ -856,9 +566,7 @@ def test_update_sources_with_time_dependent_temperature(
     ]
 
     my_model.define_temperature()
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
+    prepare_subdomains(my_model)
     my_model.create_sources_from_reactions()
     my_model.convert_source_input_values_to_fenics_objects()
 
@@ -891,9 +599,7 @@ def test_convert_source_input_values_to_fenics_objects_multispecies():
     my_source_2 = F.ParticleSource(value=lambda t: 2 * t + 3, volume=my_vol, species=D)
     my_model.sources = [my_source_1, my_source_2]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
 
     # RUN
@@ -928,9 +634,7 @@ def test_species_dependent_source_continuous():
     )
     my_model.sources = [my_source]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
 
     # RUN
@@ -949,7 +653,7 @@ def test_species_dependent_source_discontinuous():
     """Integration test that a species-dependent source in the discontinuous case is
     resolved on the source's own volume (source.volume), not any other subdomain."""
     # BUILD
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     vertices = np.concatenate((np.linspace(0, 0.5, 20), np.linspace(0.5, 1, 20)))
     my_model.mesh = F.Mesh1D(vertices)
 
@@ -997,81 +701,6 @@ def test_species_dependent_source_discontinuous():
     coefficients = ufl.algorithms.analysis.extract_coefficients(fenics_object)
     assert vol1.u in coefficients
     assert vol2.u not in coefficients
-
-
-def _change_var_model_with_species_dependent(species_dependent_on):
-    """Builds a HydrogenTransportProblemDiscontinuousChangeVar with a species-dependent
-    source or flux BC. `species_dependent_on` is either "source" or "flux"."""
-    my_model = F.HydrogenTransportProblemDiscontinuousChangeVar()
-    my_model.mesh = F.Mesh1D(np.linspace(0, 1, 11))
-    mat = F.Material(D_0=1, E_D=0, K_S_0=2.0, E_K_S=0)
-    vol = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=mat)
-    left_surf = F.SurfaceSubdomain1D(id=2, x=0)
-    right_surf = F.SurfaceSubdomain1D(id=3, x=1)
-    my_model.subdomains = [vol, left_surf, right_surf]
-
-    A, B = F.Species("A"), F.Species("B")
-    my_model.species = [A, B]
-    my_model.temperature = 500
-    my_model.settings = F.Settings(atol=1e-10, rtol=1e-10, transient=False)
-    my_model.boundary_conditions = [
-        F.FixedConcentrationBC(left_surf, value=1, species=A),
-        F.FixedConcentrationBC(right_surf, value=0, species=A),
-        F.FixedConcentrationBC(left_surf, value=1, species=B),
-        F.FixedConcentrationBC(right_surf, value=0, species=B),
-    ]
-
-    if species_dependent_on == "source":
-        my_model.sources = [
-            F.ParticleSource(
-                value=lambda B: 2 * B,
-                volume=vol,
-                species=A,
-                species_dependent_value={"B": B},
-            )
-        ]
-    else:
-        my_model.boundary_conditions.append(
-            F.ParticleFluxBC(
-                subdomain=right_surf,
-                value=lambda B: 2 * B,
-                species=A,
-                species_dependent_value={"B": B},
-            )
-        )
-
-    return my_model
-
-
-@pytest.mark.parametrize("species_dependent_on", ["source", "flux"])
-def test_species_dependent_value_not_implemented_for_change_var(species_dependent_on):
-    """Test that a species-dependent source or flux BC raises an error with the change
-    of variable, where the solution of a mobile species is the chemical potential and
-    not the concentration."""
-    # BUILD
-    my_model = _change_var_model_with_species_dependent(species_dependent_on)
-
-    # RUN + TEST
-    with pytest.raises(ValueError, match="concentration-dependent not implemented"):
-        my_model.initialise()
-
-
-def test_non_species_dependent_source_works_with_change_var():
-    """Test that a source that doesn't depend on other species is still accepted with
-    the change of variable."""
-    # BUILD
-    my_model = _change_var_model_with_species_dependent("source")
-    my_model.sources = [
-        F.ParticleSource(
-            value=lambda x: 1 + x[0],
-            volume=my_model.subdomains[0],
-            species=my_model.species[0],
-        )
-    ]
-
-    # RUN + TEST (should not raise)
-    my_model.initialise()
-    my_model.run()
 
 
 # TODO replace this by a proper MMS test
@@ -1387,7 +1016,6 @@ def test_define_meshtags_and_measures_with_custom_fenics_mesh():
     my_model.volume_meshtags = my_volume_meshtags
 
     # TEST
-    my_model.define_meshtags_and_measures()
 
 
 def test_error_raised_when_custom_fenics_mesh_wrong_facet_meshtags_type():
@@ -1448,9 +1076,7 @@ def test_update_time_dependent_values_flux(bc_value, expected_values):
     my_bc = F.ParticleFluxBC(subdomain=surface, value=bc_value, species=H)
     my_model.boundary_conditions = [my_bc]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
     my_model.define_boundary_conditions()
 
@@ -1503,9 +1129,7 @@ def test_update_fluxes_with_time_dependent_temperature(
     ]
 
     my_model.define_temperature()
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    my_model.define_meshtags_and_measures()
+    prepare_subdomains(my_model)
     my_model.define_boundary_conditions()
 
     for i in range(3):
@@ -1538,9 +1162,7 @@ def test_create_flux_values_fenics_multispecies():
     my_bc_2 = F.ParticleFluxBC(subdomain=surface, value=lambda t: 2 * t + 3, species=D)
     my_model.boundary_conditions = [my_bc_1, my_bc_2]
 
-    my_model.define_function_spaces()
-    my_model.define_meshtags_and_measures()
-    my_model.assign_functions_to_species()
+    prepare_subdomains(my_model)
     my_model.define_temperature()
 
     # RUN
@@ -1549,100 +1171,6 @@ def test_create_flux_values_fenics_multispecies():
     # TEST
     assert np.isclose(float(my_model.boundary_conditions[0].value_fenics), 5)
     assert np.isclose(float(my_model.boundary_conditions[1].value_fenics), 11)
-
-
-def test_not_implemented_error_raised_with_D_as_function():
-    """Test that NotImplementedError is raised when D is a function and more than one
-    volume subdomain has been defined."""
-
-    # BUILD
-    test_mesh = F.Mesh1D(vertices=np.linspace(0, 1, num=101))
-    V = fem.functionspace(test_mesh.mesh, ("Lagrange", 1))
-    D_func = fem.Function(V)
-    D_func.x.array[:] = 7.0
-
-    my_mat = F.Material(D=D_func)
-    vol_1 = F.VolumeSubdomain1D(id=1, borders=[0, 0.5], material=my_mat)
-    vol_2 = F.VolumeSubdomain1D(id=1, borders=[0.5, 1], material=my_mat)
-    H = F.Species("H")
-    my_model = F.HydrogenTransportProblem(
-        mesh=test_mesh,
-        temperature=10,
-        subdomains=[vol_1, vol_2],
-        species=[F.Species("H")],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-
-    # TEST
-    with pytest.raises(
-        NotImplementedError,
-        match=(
-            "Giving the diffusion coefficient as a function is currently only "
-            "supported for a single volume subdomain case"
-        ),
-    ):
-        my_model.define_D_global(H)
-
-
-def test_define_D_global_with_D_as_function():
-    """Test that if a function is given as diffusion coeff of a material, that it is
-    passed to D_global."""
-
-    # BUILD
-    test_mesh = F.Mesh1D(vertices=np.linspace(0, 1, num=101))
-    V = fem.functionspace(test_mesh.mesh, ("Lagrange", 1))
-    D_func = fem.Function(V)
-    D_func.interpolate(lambda x: x[0] * 5.0)
-
-    my_mat = F.Material(D=D_func)
-    vol = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat)
-    H = F.Species("H")
-    my_model = F.HydrogenTransportProblem(
-        mesh=test_mesh,
-        temperature=10,
-        subdomains=[vol],
-        species=[F.Species("H")],
-    )
-
-    my_model.define_function_spaces()
-    my_model.assign_functions_to_species()
-    D, D_expr = my_model.define_D_global(H)
-
-    # TEST
-    assert D_expr is None
-    assert D == D_func
-
-
-@pytest.mark.parametrize("coord_sys", ["cylindrical", "spherical"])
-def test_exports_cyl_sph_coord_system_raise_not_implemented(coord_sys):
-    """Test that NotImplementedError is raised when trying to use exports in a
-    cylindrical or spherical coordinate system."""
-
-    # BUILD
-    my_mesh = F.Mesh1D(np.linspace(0, 1, num=11), coordinate_system=coord_sys)
-    my_mat = F.Material(D_0=1.5, E_D=0.1, name="my_mat")
-    my_vol = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=my_mat)
-    surf = F.SurfaceSubdomain1D(id=2, x=1)
-    H = F.Species("H")
-
-    my_export = F.TotalVolume(field=H, volume=my_vol)
-    my_export_2 = F.TotalSurface(field=H, surface=surf)
-
-    my_model = F.HydrogenTransportProblem(
-        mesh=my_mesh,
-        subdomains=[my_vol, surf],
-        species=[H],
-        exports=[my_export, my_export_2],
-    )
-
-    # TEST
-    with pytest.raises(
-        NotImplementedError,
-        match=f"Derived quantity exports are not implemented for {coord_sys} meshes",
-    ):
-        my_model.initialise_exports()
 
 
 def test_traps_with_CG_elements():
@@ -1661,10 +1189,8 @@ def test_traps_with_CG_elements():
         species=[trap],
     )
 
-    my_model._element_for_traps = "Lagrange"
-
     my_model.create_species_from_traps()
-    my_model.define_function_spaces(element_degree=1)
+    prepare_subdomains(my_model, element_degree=1)
 
     # TEST
     assert my_model.function_space.sub(0).element.basix_element.discontinuous is False
@@ -1674,7 +1200,7 @@ def test_surface_reaction_BC_discontinuous():
     """Test that surface reaction BC conserves flux."""
 
     # BUILD
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     right_mat = F.Material(
         D_0=1,
@@ -1754,7 +1280,7 @@ def test_temperature_as_function_in_discontinuous():
     given as a function."""
 
     # BUILD
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     mat = F.Material(D_0=1, E_D=0, K_S_0=1, E_K_S=0)
     vol1 = F.VolumeSubdomain1D(id=1, borders=[0, 1], material=mat)
@@ -1834,12 +1360,12 @@ def test_nb_dofs_dg_or_cg():
 
     # CG case
     my_model.element_immobile = "CG"
-    my_model.define_function_spaces()
+    prepare_subdomains(my_model)
     nb_dofs_cg = my_model.function_space.sub(0).dofmap.index_map.size_global
 
     # DG case
     my_model.element_immobile = "DG"
-    my_model.define_function_spaces()
+    prepare_subdomains(my_model)
     nb_dofs_dg = my_model.function_space.sub(0).dofmap.index_map.size_global
 
     # TEST

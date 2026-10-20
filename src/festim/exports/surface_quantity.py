@@ -62,8 +62,7 @@ class SurfaceQuantity(DerivedQuantity):
         # a manifold is a codim-1 VolumeSubdomain and is passed directly wherever a
         # surface is expected. Checking whether it really is codim 1 needs the mesh,
         # so it's checked at initialisation: via export_surface_context in
-        # HydrogenTransportProblemDiscontinuous, and rejected outright in
-        # HydrogenTransportProblem and its children since they don't support codim
+        # HydrogenTransportProblem.
         accepted = int | SurfaceSubdomain | VolumeSubdomain
         if not isinstance(value, accepted) or isinstance(value, bool):
             raise TypeError(

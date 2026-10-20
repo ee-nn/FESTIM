@@ -133,7 +133,7 @@ def test_run_MMS_spherical_mixed_domain():
     """Tests that festim produces the correct concentration field in spherical
     coordinates in a discontinuous domain with two materials."""
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     r_interface = 1.5
     left_domain = np.linspace(1, r_interface, num=1000)

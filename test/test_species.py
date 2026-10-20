@@ -8,10 +8,11 @@ from dolfinx.mesh import create_unit_cube
 
 import festim as F
 
+from .utils import prepare_subdomains
 
-def test_assign_functions_to_species():
-    """Test that checks if the function assign_functions_to_species creates the correct
-    attributes for each species."""
+
+def test_subdomain_functions_assigned_to_species():
+    """Allocated subdomain fields provide the species' single-domain aliases."""
 
     mesh = F.Mesh1D(
         vertices=np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
@@ -23,8 +24,7 @@ def test_assign_functions_to_species():
             F.Species(name="Trap"),
         ],
     )
-    model.define_function_spaces()
-    model.assign_functions_to_species()
+    prepare_subdomains(model)
 
     for spe in model.species:
         assert spe.solution is not None

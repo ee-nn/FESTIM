@@ -73,8 +73,6 @@ from .helpers import (
 )
 from .hydrogen_transport_problem import (
     HydrogenTransportProblem,
-    HydrogenTransportProblemDiscontinuous,
-    HydrogenTransportProblemDiscontinuousChangeVar,
 )
 from .initial_condition import (
     InitialConcentration,
@@ -112,3 +110,24 @@ from .subdomain.volume_subdomain import (
     map_surface_to_volume_subdomains,
 )
 from .trap import Trap
+
+
+def __getattr__(name):
+    if name == "HydrogenTransportProblemDiscontinuous":
+        import warnings
+
+        warnings.warn(
+            "HydrogenTransportProblemDiscontinuous is deprecated; use "
+            "HydrogenTransportProblem instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return HydrogenTransportProblem
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# Keep wildcard imports of the deprecated name working without eagerly resolving it
+# (which would suppress the warning on subsequent direct accesses).
+__all__ = [name for name in globals() if not name.startswith("_")] + [
+    "HydrogenTransportProblemDiscontinuous"
+]

@@ -19,7 +19,7 @@ class MaximumVolume(VolumeQuantity):
         see `festim.VolumeQuantity`
         volume_meshtags: the cell meshtags of the mesh the field is defined on. Is
             ``None`` when the field is defined on a submesh that already coincides
-            with the volume subdomain (``festim.HydrogenTransportProblemDiscontinuous``)
+            with the volume subdomain (``festim.HydrogenTransportProblem``)
     """
 
     volume_meshtags: dolfinx.mesh.MeshTags | None = None
@@ -31,7 +31,7 @@ class MaximumVolume(VolumeQuantity):
     @property
     def is_submesh(self) -> bool:
         """Whether the field's solution lives on a submesh of ``volume`` itself, as in
-        ``festim.HydrogenTransportProblemDiscontinuous``. See issue #1191."""
+        ``festim.HydrogenTransportProblem``. See issue #1191."""
         return self.volume in self.field.subdomain_to_post_processing_solution
 
     @property

@@ -5,6 +5,7 @@ import dolfinx
 import numpy as np
 import pytest
 import ufl
+from dolfinx import fem
 
 import festim as F
 
@@ -51,13 +52,8 @@ def test_petsc_options():
     my_model.run()
 
 
-def test_D_global_on_2d_mesh():
-    """Test that the D_global is defined correctly on a 2D mesh with two different
-    materials.
-
-    The D_global should be defined as a piecewise constant function with two different
-    values, one for each material.
-    """
+def test_subdomain_diffusivities_on_2d_mesh():
+    """Each volume uses its own material's diffusivity on a 2D mesh."""
     mesh, mt, ct = generate_mesh(20)
 
     my_model = F.HydrogenTransportProblem()
@@ -80,7 +76,7 @@ def test_D_global_on_2d_mesh():
         bottom_surface,
     ]
 
-    H = F.Species("H", mobile=True)
+    H = F.Species("H", mobile=True, subdomains=[bottom_domain, top_domain])
     my_model.species = [H]
 
     my_model.boundary_conditions = []
@@ -91,12 +87,14 @@ def test_D_global_on_2d_mesh():
 
     my_model.initialise()
 
-    # run
-
-    D, _ = my_model.define_D_global(species=H)
-
-    # test that there are two values in D
-    assert len(np.unique(D.x.array[:])) == 2
+    diffusivities = []
+    for volume in [bottom_domain, top_domain]:
+        D = my_model.diffusion_coefficient(volume, H)
+        V = fem.functionspace(my_model.mesh.mesh, ("P", 1))
+        field = fem.Function(V)
+        field.interpolate(fem.Expression(D, V.element.interpolation_points))
+        diffusivities.append(field.x.array[0])
+    np.testing.assert_allclose(diffusivities, [1.0, 5.0])
 
 
 @pytest.mark.parametrize(
@@ -133,6 +131,11 @@ def test_min_max_vol_on_2d_mesh(species):
     H = species[0]
 
     my_model.species = species
+    for spe in species:
+        spe.subdomains = [bottom_domain, top_domain]
+    my_model.interfaces = [
+        F.Interface(5, [bottom_domain, top_domain], method="nitsche")
+    ]
 
     my_model.boundary_conditions = [
         F.FixedConcentrationBC(top_surface, value=1, species=H),
@@ -199,7 +202,7 @@ def test_temp_dependent_bc_mixed_domain_temperature_as_function():
     T = dolfinx.fem.Function(V)
     T.interpolate(lambda x: 800.0 + 100 * x[0] + x[1])
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh)
     my_model.volume_meshtags = ct
     my_model.facet_meshtags = mt
@@ -244,7 +247,7 @@ def test_temp_dependent_bc_mixed_domain_temperature_as_function():
 
 def test_del():
     """Test that deleting a model with exports works fine (no segfault)"""
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     H = F.Species("H")
     my_model.exports = [F.VTXSpeciesExport(filename="h.bp", field=H)]
 
@@ -301,7 +304,7 @@ def test_implicit_species_bug_reaction():
 
     W_volume = F.VolumeSubdomain1D(id=6, borders=[0, 1], material=tungsten)
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(np.linspace(0, 1, 100))
 
     my_model.subdomains = [W_volume]
@@ -364,7 +367,7 @@ def test_timesteps():
 
 def test_sub_temperature_as_function_mixed_domain_not_updated():
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     n = 8
     mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, n, n)
@@ -397,12 +400,9 @@ def test_sub_temperature_as_function_mixed_domain_not_updated():
     assert not np.allclose(avg_surf.data, 4.0)
 
 
-@pytest.mark.parametrize(
-    "model_class", [F.HydrogenTransportProblem, F.HydrogenTransportProblemDiscontinuous]
-)
+@pytest.mark.parametrize("model_class", [F.HydrogenTransportProblem])
 def test_MMS_weak_dirichlet(
-    model_class: type[F.HydrogenTransportProblem]
-    | type[F.HydrogenTransportProblemDiscontinuous],
+    model_class: type[F.HydrogenTransportProblem],
 ):
     """
     MMS test with one mobile species at steady state, with Dirichlet BCs enforced
@@ -442,9 +442,8 @@ def test_MMS_weak_dirichlet(
     H2 = F.Species("D")
     my_model.species = [H, H2]
 
-    if isinstance(my_model, F.HydrogenTransportProblemDiscontinuous):
-        H.subdomains = [vol]
-        H2.subdomains = [vol]
+    H.subdomains = [vol]
+    H2.subdomains = [vol]
 
     my_model.temperature = T_expr
 
@@ -474,10 +473,7 @@ def test_MMS_weak_dirichlet(
     my_model.initialise()
     my_model.run()
 
-    if isinstance(my_model, F.HydrogenTransportProblemDiscontinuous):
-        H_computed = H.subdomain_to_post_processing_solution[vol]
-    else:
-        H_computed = H.post_processing_solution
+    H_computed = H.subdomain_to_post_processing_solution[vol]
 
     L2_error = error_L2(H_computed, H_analytical_np)
 
@@ -523,8 +519,7 @@ def solve_weak_dirichlet_mms(
 
     H = F.Species("H")
     my_model.species = [H]
-    if isinstance(my_model, F.HydrogenTransportProblemDiscontinuous):
-        H.subdomains = [vol]
+    H.subdomains = [vol]
 
     my_model.temperature = 500
 
@@ -548,21 +543,15 @@ def solve_weak_dirichlet_mms(
     my_model.initialise()
     my_model.run()
 
-    if isinstance(my_model, F.HydrogenTransportProblemDiscontinuous):
-        H_computed = H.subdomain_to_post_processing_solution[vol]
-    else:
-        H_computed = H.post_processing_solution
+    H_computed = H.subdomain_to_post_processing_solution[vol]
 
     return error_L2(H_computed, H_analytical_np)
 
 
-@pytest.mark.parametrize(
-    "model_class", [F.HydrogenTransportProblem, F.HydrogenTransportProblemDiscontinuous]
-)
+@pytest.mark.parametrize("model_class", [F.HydrogenTransportProblem])
 @pytest.mark.parametrize("D_0", [1.0, 0.01])
 def test_weak_dirichlet_convergence_rate(
-    model_class: type[F.HydrogenTransportProblem]
-    | type[F.HydrogenTransportProblemDiscontinuous],
+    model_class: type[F.HydrogenTransportProblem],
     D_0: float,
 ):
     """The weakly enforced Dirichlet BC must be consistent, ie. converge at the
@@ -583,12 +572,9 @@ def test_weak_dirichlet_convergence_rate(
     assert np.all(rates > 1.8), f"convergence rates {rates} are not close to 2"
 
 
-@pytest.mark.parametrize(
-    "model_class", [F.HydrogenTransportProblem, F.HydrogenTransportProblemDiscontinuous]
-)
+@pytest.mark.parametrize("model_class", [F.HydrogenTransportProblem])
 def test_weak_dirichlet_insensitive_to_penalty(
-    model_class: type[F.HydrogenTransportProblem]
-    | type[F.HydrogenTransportProblemDiscontinuous],
+    model_class: type[F.HydrogenTransportProblem],
 ):
     """A consistent Nitsche scheme converges to the same solution regardless of the
     penalty value. With D missing from the consistency and symmetry terms, the error
@@ -604,12 +590,9 @@ def test_weak_dirichlet_insensitive_to_penalty(
     )
 
 
-@pytest.mark.parametrize(
-    "model_class", [F.HydrogenTransportProblem, F.HydrogenTransportProblemDiscontinuous]
-)
+@pytest.mark.parametrize("model_class", [F.HydrogenTransportProblem])
 def test_weak_dirichlet_penalty_is_dimensionless(
-    model_class: type[F.HydrogenTransportProblem]
-    | type[F.HydrogenTransportProblemDiscontinuous],
+    model_class: type[F.HydrogenTransportProblem],
 ):
     """The Nitsche penalty scales as ``penalty * D / h``, so at a fixed ``penalty`` the
     discrete problem is D * (a fixed unit problem) and the error does not depend on the
@@ -626,9 +609,7 @@ def test_weak_dirichlet_penalty_is_dimensionless(
     )
 
 
-@pytest.mark.parametrize(
-    "model_class", [F.HydrogenTransportProblem, F.HydrogenTransportProblemDiscontinuous]
-)
+@pytest.mark.parametrize("model_class", [F.HydrogenTransportProblem])
 def test_custom_quantity_with_immobile_species(model_class):
     """
     Test that a CustomQuantity can be defined on an immobile species.
@@ -649,9 +630,8 @@ def test_custom_quantity_with_immobile_species(model_class):
 
     T = F.Species(name="T", mobile=False)
     T_mobile = F.Species(name="T_mobile", mobile=True)
-    if isinstance(my_model, F.HydrogenTransportProblemDiscontinuous):
-        T.subdomains = [vol]
-        T_mobile.subdomains = [vol]
+    T.subdomains = [vol]
+    T_mobile.subdomains = [vol]
 
     my_model.species = [T, T_mobile]
 

@@ -101,7 +101,7 @@ def test_radial_point_coupling(coordinates, power, interior, transient):
     total = F.TotalVolume(field=surface, volume=gamma)
     average = F.AverageVolume(field=surface, volume=gamma)
     surface_total = F.TotalSurface(field=bulk, surface=gamma)
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh1D(
             np.linspace(1, 3 if interior else 2, 129), coordinate_system=coordinates
         ),
@@ -173,7 +173,7 @@ def test_cylindrical_manifold_radial_transport(speed):
     outlet_flux = F.SurfaceFlux(c_g, outlet)
     velocity = dolfinx.fem.Function(dolfinx.fem.functionspace(mesh, ("P", 1, (2,))))
     velocity.interpolate(lambda x: np.tile([speed, 0.8], (x.shape[1], 1)).T)
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh, coordinate_system="cylindrical"),
         subdomains=[bulk, gamma, walls, ends, outlet],
         species=[c_b, c_g],
@@ -260,7 +260,7 @@ def test_spherical_point_trapping():
     empty = F.ImplicitSpecies(n=lambda x: x[0], others=[trapped])
     total_mobile = F.TotalVolume(mobile, gamma)
     total_trapped = F.TotalVolume(trapped, gamma)
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh1D(np.linspace(1, 3, 17), coordinate_system="spherical"),
         subdomains=[bulk, gamma],
         species=[bulk_species, mobile, trapped],

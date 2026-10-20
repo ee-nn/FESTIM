@@ -39,7 +39,7 @@ def test_drift_in_0D_warns_and_ignores(term_type, monkeypatch):
     term = term_type(species=point_species, subdomain=point, **kwargs)
     drift_velocity = Mock(side_effect=AssertionError("0D drift must not be evaluated"))
     monkeypatch.setattr(term, "drift_velocity", drift_velocity)
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=mesh,
         subdomains=[bulk, point, left],
         species=[bulk_species, point_species],

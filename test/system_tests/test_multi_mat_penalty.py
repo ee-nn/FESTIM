@@ -85,7 +85,7 @@ def test_2_materials_2d_mms(tmpdir):
 
     mesh, mt, ct = generate_mesh(100)
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh)
     my_model.volume_meshtags = ct
     my_model.facet_meshtags = mt
@@ -164,7 +164,7 @@ def test_derived_quantities_multi_mat():
 
     mesh, mt, ct = generate_mesh(20)
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh)
     my_model.volume_meshtags = ct
     my_model.facet_meshtags = mt
@@ -224,7 +224,7 @@ def test_derived_quantities_multi_mat():
 
 
 def test_penalty_multispecies():
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.method_interface = "penalty"
 
     protium = F.Species("H")

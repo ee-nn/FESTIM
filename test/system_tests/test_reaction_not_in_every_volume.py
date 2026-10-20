@@ -9,13 +9,15 @@ def test_sim_reaction_not_in_every_volume():
     my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh1D(np.linspace(0, 2e-04, num=1001))
 
-    my_mat = F.Material(D_0=4.1e-07, E_D=0.37, name="my_mat")
+    my_mat = F.Material(D_0=4.1e-07, E_D=0.37, name="my_mat", K_S_0=1.0, E_K_S=0.0)
     vol_1 = F.VolumeSubdomain1D(id=1, borders=[0, 1e-04], material=my_mat)
     vol_2 = F.VolumeSubdomain1D(id=2, borders=[1e-04, 2e-04], material=my_mat)
     left = F.SurfaceSubdomain1D(id=1, x=0)
     my_model.subdomains = [vol_1, vol_2, left]
 
-    cm, ct = F.Species("cm"), F.Species("ct", mobile=False)
+    cm = F.Species("cm", subdomains=[vol_1, vol_2])
+    ct = F.Species("ct", mobile=False, subdomains=[vol_1])
+    my_model.interfaces = [F.Interface(3, [vol_1, vol_2], method="nitsche")]
     my_model.species = [cm, ct]
     trap = F.ImplicitSpecies(n=8.19e25, others=[ct])
     my_model.reactions = [

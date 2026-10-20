@@ -250,8 +250,16 @@ class ProblemBase:
 
         petsc_options.update(
             {
-                "snes_atol": self.settings.atol,
-                "snes_rtol": self.settings.rtol,
+                "snes_atol": (
+                    self.settings.atol(float(self.t))
+                    if callable(self.settings.atol)
+                    else self.settings.atol
+                ),
+                "snes_rtol": (
+                    self.settings.rtol(float(self.t))
+                    if callable(self.settings.rtol)
+                    else self.settings.rtol
+                ),
                 "snes_max_it": self.settings.max_iterations,
             }
         )

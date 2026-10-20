@@ -152,7 +152,8 @@ def test_surface_flux_accounts_for_drift():
                 fem.form(
                     -flux.D
                     * ufl.dot(ufl.grad(H.post_processing_solution), normal)
-                    * model.ds(right.id)
+                    * model.ds(right.id),
+                    entity_maps=[_volume.cell_map],
                 )
             )
         )
@@ -474,13 +475,8 @@ def test_conservative_drift_mms_in_curvilinear_coordinates(coordinate_system, po
     assert rate > 1.8, rate
 
 
-def test_drift_is_applied_in_the_change_of_variable_problem():
-    """A drift term used to be silently ignored by the change-of-variable problem.
-
-    With a uniform solubility the change of variable is a rescaling, so the Soret
-    equilibrium of ``test_soret_equilibrium_matches_the_closed_form`` still holds for
-    the concentration ``u * K_S``.
-    """
+def test_soret_equilibrium_is_independent_of_uniform_solubility():
+    """Uniform solubility does not change the no-flux Soret equilibrium."""
     length, Q_star, T_cold, T_hot, K_S = 1.0, 0.1, 400.0, 600.0, 3.0
     n = 300
 
@@ -490,13 +486,13 @@ def test_drift_is_applied_in_the_change_of_variable_problem():
     right = F.SurfaceSubdomain1D(id=2, x=length)
     H = F.Species("H", mobile=True)
 
-    model = F.HydrogenTransportProblemDiscontinuousChangeVar(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh1D(np.linspace(0.0, length, n + 1)),
         subdomains=[volume, left, right],
         species=[H],
         temperature=lambda x: T_cold + (T_hot - T_cold) * x[0] / length,
         initial_conditions=[
-            F.InitialConcentration(value=1.0 / K_S, volume=volume, species=H)
+            F.InitialConcentration(value=1.0, volume=volume, species=H)
         ],
         drift_terms=[F.SoretTerm(species=H, Q_star=Q_star, subdomain=volume)],
         settings=F.Settings(atol=1e-12, rtol=1e-12, transient=True, final_time=20.0),

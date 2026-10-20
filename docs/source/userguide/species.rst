@@ -50,13 +50,37 @@ A species that is not mobile (typically a trapped concentration) is defined with
 
 Immobile species do not diffuse and only evolve through reactions and sources.
 
-In multi-material problems using :class:`festim.HydrogenTransportProblemDiscontinuous`, a species can be restricted to some of the volume subdomains with the ``subdomains`` argument:
+Use the ``subdomains`` argument to declare where each species is solved, including
+in single-material problems:
 
 .. testcode:: species
 
     from festim import Species
 
     H = Species(name="H", subdomains=[my_vol])
+
+Each volume subdomain has its own mixed solution. Read a species field with
+``H.subdomain_to_post_processing_solution[my_vol]`` and its current UFL expression
+with ``H.subdomain_to_solution[my_vol]``. The complete mixed functions are
+``my_vol.u`` and ``my_vol.u_n``.
+
+Older single-domain scripts that omit ``Species.subdomains`` continue to work with
+a ``DeprecationWarning``. FESTIM infers ordinary volume subdomains only; membership
+of a manifold must be explicit. An explicitly empty list is an error.
+
+The former ``HydrogenTransportProblemDiscontinuous`` name is a deprecated alias of
+``HydrogenTransportProblem``. The change-of-variable class has been removed.
+Legacy problem and species solution attributes remain deprecated aliases when
+there is one possible target; accessing them for several subdomains raises an
+ambiguity error.
+
+Multi-material models must declare interfaces explicitly. Omitting species
+subdomains in a model with several ordinary volumes and no interfaces raises a
+migration error: separate submeshes do not inherit the old continuous field's
+implicit concentration continuity. See :doc:`subdomains` for interface laws.
+To reproduce concentration continuity, use matching solubility coefficients on
+both materials (for example ``K_S_0=1.0, E_K_S=0.0``) and an explicit Nitsche
+interface. Different solubilities impose the interface's partition law instead.
 
 .. _implicit_species:
 

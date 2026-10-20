@@ -53,7 +53,7 @@ stores it in its own function space instead, so it can be read back exactly.
 One file for a multi-material model
 -----------------------------------
 
-In a :class:`festim.HydrogenTransportProblemDiscontinuous`, each subdomain has its own
+In a :class:`festim.HydrogenTransportProblem`, each subdomain has its own
 mesh, so each export normally produces its own file. The ``"vtkhdf"`` format lets them
 share one, with each subdomain stored as a named block:
 
@@ -63,6 +63,12 @@ share one, with each subdomain stored as a named block:
         F.SpeciesExport("results.vtkhdf", field=[H], subdomain=vol1, format="vtkhdf"),
         F.SpeciesExport("results.vtkhdf", field=[H], subdomain=vol2, format="vtkhdf"),
     ]
+
+For species, custom-field and profile exports, ``subdomain`` may be omitted only
+when there is one valid volume for all requested fields. Otherwise FESTIM requires
+an explicit selection. Custom fields can depend on ``x``, ``t``, ``T`` and local
+species fields; their coefficients are kept on the selected submesh and updated at
+each step. Constant temperatures can also be written with ``TemperatureExport``.
 
 .. note::
 

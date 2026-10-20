@@ -483,65 +483,42 @@ class GenericReaction(ReactionBase):
 
     @property
     def _mixed_domain(self) -> bool:
-        """True in the discontinuous case, where each species has one solution per
-        subdomain rather than a single concentration attribute.
+        """Whether functions were allocated by a transport problem.
 
-        NOTE: becomes always True once the discontinuous formulation is the only
-        problem path; this property (and the branch on it below) can be dropped."""
+        Standalone reaction expressions can still use manually assigned fields.
+        """
         return any(
             isinstance(spe, Species) and spe.subdomain_to_solution != {}
             for spe in self.reactant + self.product
         )
 
-    def _concentrations(self, species: list, overrides: list | None) -> list:
-        """The concentration of each species. Where a (non-None) override is given
-        for a species it is used in place of the species' own concentration."""
-        # NOTE: `overrides` exists only for the change-of-variable problem
-        # (HydrogenTransportProblemDiscontinuousChangeVar, its u*K_S substitution)
-        # and can be removed together with the reaction_term arguments feeding it
-        # once that class is dropped
-        overrides = overrides or [None] * len(species)
+    def _concentrations(self, species: list) -> list:
+        """Concentrations on the reaction volume, or standalone UFL fields."""
         concentrations = []
-        for spe, override in zip(species, overrides, strict=True):
-            if override is not None:
-                concentrations.append(override)
-            elif self._mixed_domain:
+        for spe in species:
+            if self._mixed_domain:
                 concentrations.append(spe.concentration_submesh(self.volume))
             else:
                 concentrations.append(spe.concentration)
         return concentrations
 
-    def reaction_term(
-        self,
-        # NOTE: reactant_concentrations/product_concentrations exist only for the
-        # change-of-variable problem and can be removed with it (see _concentrations)
-        reactant_concentrations: list | None = None,
-        product_concentrations: list | None = None,
-    ) -> ufl.core.expr.Expr:
+    def reaction_term(self) -> ufl.core.expr.Expr:
         """Compute the net reaction rate ``R`` as a ufl expression.
 
         The rate coefficients must already be converted to fenics objects (done by
         ``HydrogenTransportProblem.convert_reaction_rates_to_fenics_objects``).
 
-        Arguments:
-            reactant_concentrations: The concentration to use for each reactant,
-                same length as the reactants. Where an entry is None the reactant's
-                own concentration is used. If None, all reactant concentrations
-                are used.
-            product_concentrations: The concentrations of the products, following
-                the same rules as ``reactant_concentrations``.
-
         Returns:
             The net reaction rate to be used in a formulation.
         """
-        reactants = self._concentrations(self.reactant, reactant_concentrations)
+        reactants = self._concentrations(self.reactant)
         forward = self.forward_rate.fenics_object * reduce(mul, reactants)
 
         # no backward term for an irreversible reaction or one with no products
         if self.backward_rate.input_value is None or not self.product:
             return forward
 
-        products = self._concentrations(self.product, product_concentrations)
+        products = self._concentrations(self.product)
         backward = self.backward_rate.fenics_object * reduce(mul, products)
         return forward - backward
 

@@ -128,7 +128,7 @@ def solve_contactor(counter_current: bool, n: int = 80):
             species_dependent_value={"c_f": fluid, "c_w": c_wall},
         )
 
-    model = F.HydrogenTransportProblemDiscontinuous(
+    model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
         species=[c_wall, c_a, c_b],
         subdomains=[wall, channel_a, channel_b, a_inlet, a_outlet, b_inlet, b_outlet],

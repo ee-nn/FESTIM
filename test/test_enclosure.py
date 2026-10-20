@@ -25,7 +25,7 @@ def make_enclosure(**kwargs):
 
 def make_model(enclosures=None, transient=True):
     mesh = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, 8)
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     my_model.mesh = F.Mesh(mesh=mesh)
     material = F.Material(name="mat", D_0=1e-9, E_D=0.0)
     volume = F.VolumeSubdomain1D(id=1, borders=[0.0, 1.0], material=material)
@@ -295,12 +295,11 @@ class TestValidation:
         my_model, *_ = make_model(enclosures=[enclosure], transient=True)
         my_model.initialise()  # must not raise
 
-    def test_base_problem_rejects_enclosures(self):
+    def test_consolidated_problem_accepts_enclosures(self):
         H2 = make_gas_species()
-        my_model = F.HydrogenTransportProblem()
-        my_model.enclosures = [make_enclosure(species=[H2])]
-        with pytest.raises(NotImplementedError, match="Discontinuous"):
-            my_model.initialise()
+        my_model, *_ = make_model(enclosures=[make_enclosure(species=[H2])])
+        my_model.initialise()
+        assert H2.solution is not None
 
     def test_cylindrical_1d_requires_length(self):
         """A 1D cylindrical model is per unit axial length: the metric factor only
@@ -497,6 +496,6 @@ def test_enclosures_rejected_on_old_dolfinx():
     """On dolfinx < 0.11 the feature must fail early with a helpful message."""
     H2 = F.GasSpecies(name="H2")
     enclosure = F.Enclosure(volume=1e-3, species=[H2], temperature=500.0)
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
     with pytest.raises(NotImplementedError, match=re.escape("require dolfinx >= 0.11")):
         my_model.enclosures = [enclosure]

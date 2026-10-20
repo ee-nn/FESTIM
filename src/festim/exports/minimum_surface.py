@@ -20,7 +20,7 @@ class MinimumSurface(SurfaceQuantity):
         see `festim.SurfaceQuantity`
         facet_meshtags: the facet meshtags of the parent mesh
         volume: the volume subdomain the surface bounds. Set by the problem;
-            ``None`` outside `festim.HydrogenTransportProblemDiscontinuous`
+            ``None`` outside `festim.HydrogenTransportProblem`
     """
 
     facet_meshtags: dolfinx.mesh.MeshTags | None = None
@@ -33,7 +33,7 @@ class MinimumSurface(SurfaceQuantity):
     @property
     def is_submesh(self) -> bool:
         """Whether the field's solution lives on the submesh of ``volume``, as in
-        ``festim.HydrogenTransportProblemDiscontinuous``. See issue #1191."""
+        ``festim.HydrogenTransportProblem``. See issue #1191."""
         return (
             self.volume is not None
             and self.volume in self.field.subdomain_to_post_processing_solution

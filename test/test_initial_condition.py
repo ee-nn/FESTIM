@@ -9,6 +9,7 @@ import pytest
 from dolfinx import fem
 
 import festim as F
+from festim.helpers import nmm_interpolate
 
 dummy_mat = F.Material(D_0=1, E_D=0.1, name="dummy_mat")
 test_mesh = F.Mesh1D(np.linspace(0, 1, 100))
@@ -268,11 +269,11 @@ def test_checkpointing_multiple_species(tmpdir):
 
     # test that the initial condition is correct
     u_prev1 = fem.Function(V)
-    u_prev1.interpolate(my_problem.u_n.sub(0))
+    nmm_interpolate(u_prev1, vol.u_n.sub(0))
     np.testing.assert_allclose(u_ref1.x.array, u_prev1.x.array, atol=1e-14)
 
     u_prev2 = fem.Function(V)
-    u_prev2.interpolate(my_problem.u_n.sub(1))
+    nmm_interpolate(u_prev2, vol.u_n.sub(1))
     np.testing.assert_allclose(u_ref2.x.array, u_prev2.x.array, atol=1e-14)
 
 
@@ -337,7 +338,7 @@ def test_initial_condition_discontinuous():
     """Test the initial condition in a multispecies case with a discontinuous volume
     subdomain."""
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     vertices_left = np.linspace(0, 0.5, 500)
     vertices_right = np.linspace(0.5, 1, 500)
@@ -410,7 +411,7 @@ def test_initial_condition_discontinuous_space_dependent(value, expected):
     the submesh of its volume only, in the discontinuous case."""
 
     # BUILD
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     vertices = np.concatenate((np.linspace(0, 0.5, 50), np.linspace(0.5, 1, 50)))
     my_model.mesh = F.Mesh1D(vertices)
@@ -477,6 +478,8 @@ def test_initial_condition_continuous_multimaterial():
     spe1 = F.Species("1", mobile=True)
     my_model.species = [spe1]
 
+    spe1.subdomains = [vol1, vol2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2])]
     my_model.temperature = 300
 
     intial_cond_value = 100
@@ -494,13 +497,14 @@ def test_initial_condition_continuous_multimaterial():
 
     # assert value of spe1 is not all the same across the domain
 
-    assert not np.allclose(my_model.u_n.x.array[:], intial_cond_value)
+    assert np.allclose(vol1.u_n.x.array, intial_cond_value)
+    assert np.allclose(vol2.u_n.x.array, 0.0)
 
 
 def test_initial_condition_mixed_domain():
     """Test the initial condition in a multi-material discontinous case."""
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     vertices_left = np.linspace(0, 0.5, 500)
     vertices_right = np.linspace(0.5, 1, 500)
@@ -545,7 +549,7 @@ def test_initial_condition_mixed_domain():
 def test_initial_condition_mixed_domain_multispecies():
     """Test the initial condition in a multispecies multi-material discontinous case."""
 
-    my_model = F.HydrogenTransportProblemDiscontinuous()
+    my_model = F.HydrogenTransportProblem()
 
     vertices_left = np.linspace(0, 0.5, 500)
     vertices_right = np.linspace(0.5, 1, 500)
