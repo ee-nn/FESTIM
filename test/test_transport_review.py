@@ -131,6 +131,36 @@ def test_species_reuse_resolves_new_volumes_and_resets_fields():
     assert set(species.subdomain_to_solution) == {volume2}
 
 
+def test_interface_reaction_accepts_inferred_species_membership():
+    model, left, right, species = two_domain_model(explicit=False)
+    model.interfaces = [
+        F.InterfaceReaction(
+            3,
+            [left, right],
+            k_plus=2.0,
+            k_minus=1.0,
+            reactants=species,
+            products=species,
+        )
+    ]
+    model.initial_conditions = [
+        F.InitialConcentration(1.0, species=species, volume=left),
+        F.InitialConcentration(0.0, species=species, volume=right),
+    ]
+    inventories = [F.TotalVolume(species, v) for v in (left, right)]
+    model.exports = inventories
+    with pytest.warns(DeprecationWarning, match="Inferring"):
+        model.initialise()
+    model.run()
+    assert species.subdomains is None
+    np.testing.assert_allclose(
+        np.sum([inventory.data for inventory in inventories], axis=0),
+        0.5,
+        atol=1e-10,
+    )
+    assert inventories[1].data[-1] > 0.0
+
+
 @pytest.mark.parametrize("family,degree", [("P", 1), ("P", 2), ("DG", 0), ("DG", 2)])
 def test_parent_temperature_transfer_needs_no_geometric_search(
     monkeypatch, family, degree
