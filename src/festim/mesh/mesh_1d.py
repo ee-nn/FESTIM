@@ -4,6 +4,7 @@ import basix.ufl
 import dolfinx.mesh
 import numpy as np
 import ufl
+from packaging.version import Version
 
 from festim.mesh.mesh import Mesh
 
@@ -102,8 +103,18 @@ class Mesh1D(Mesh):
         domain = ufl.Mesh(
             basix.ufl.element(basix.ElementFamily.P, "interval", degree, shape=(1,))
         )
+        # Interface integrals need both adjacent cells, including across MPI
+        # partitions. DOLFINx create_mesh otherwise defaults to no ghost cells.
+        partitioner_args = [dolfinx.mesh.GhostMode.shared_facet]
+        if Version(dolfinx.__version__) >= Version("0.11"):
+            partitioner_args.append(2)
+        partitioner = dolfinx.mesh.create_cell_partitioner(*partitioner_args)
         return dolfinx.mesh.create_mesh(
-            comm=MPI.COMM_WORLD, cells=cells, x=mesh_points, e=domain
+            comm=MPI.COMM_WORLD,
+            cells=cells,
+            x=mesh_points,
+            e=domain,
+            partitioner=partitioner,
         )
 
     def check_borders(self, volume_subdomains):

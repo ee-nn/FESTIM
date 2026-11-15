@@ -221,6 +221,7 @@ def test_writing_and_reading_of_species_function_using_checkpoints_discontinuous
     surf1 = F.SurfaceSubdomain(id=1, locator=lambda x: np.isclose(x[0], 0.0))
     surf2 = F.SurfaceSubdomain(id=2, locator=lambda x: np.isclose(x[0], 1.0))
     my_model.subdomains = [vol1, vol2, surf1, surf2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2], method="nitsche")]
 
     H = F.Species(name="H", subdomains=[vol1, vol2])
     D = F.Species(name="D", subdomains=[vol1, vol2])
@@ -261,6 +262,7 @@ def test_writing_and_reading_of_species_function_using_checkpoints_discontinuous
     my_model2 = F.HydrogenTransportProblem()
     my_model2.mesh = F.Mesh(mesh)
     my_model2.subdomains = [vol1, vol2, surf1]
+    my_model2.interfaces = [F.Interface(3, [vol1, vol2], method="nitsche")]
 
     H = F.Species("H", subdomains=[vol1, vol2])
     D = F.Species("D", subdomains=[vol1, vol2])
@@ -388,6 +390,7 @@ def _discontinuous_model(final_time=2.0):
     surf1 = F.SurfaceSubdomain(id=1, locator=lambda x: np.isclose(x[0], 0.0))
     surf2 = F.SurfaceSubdomain(id=2, locator=lambda x: np.isclose(x[0], 1.0))
     my_model.subdomains = [vol1, vol2, surf1, surf2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2], method="nitsche")]
 
     H = F.Species(name="H", subdomains=[vol1, vol2])
     my_model.species = [H]

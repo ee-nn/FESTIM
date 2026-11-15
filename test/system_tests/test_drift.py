@@ -475,37 +475,68 @@ def test_conservative_drift_mms_in_curvilinear_coordinates(coordinate_system, po
     assert rate > 1.8, rate
 
 
-def test_soret_equilibrium_is_independent_of_uniform_solubility():
-    """Uniform solubility does not change the no-flux Soret equilibrium."""
-    length, Q_star, T_cold, T_hot, K_S = 1.0, 0.1, 400.0, 600.0, 3.0
-    n = 300
+def test_soret_equilibrium_obeys_partition_law_and_conserves_inventory():
+    """Solubility enters a real interface law, with zero total Soret flux."""
+    from test.utils import evaluate_at_point
 
-    material = F.Material(D_0=1.0, E_D=0.0, K_S_0=K_S, E_K_S=0.0)
-    volume = F.VolumeSubdomain1D(id=1, borders=[0.0, length], material=material)
-    left = F.SurfaceSubdomain1D(id=1, x=0.0)
-    right = F.SurfaceSubdomain1D(id=2, x=length)
-    H = F.Species("H", mobile=True)
+    Q = 0.1
+    materials = [
+        F.Material(D_0=1.0 / K, E_D=0.0, K_S_0=K, E_K_S=0.0) for K in (1.0, 3.0)
+    ]
+    left = F.VolumeSubdomain1D(1, [0.0, 0.5], materials[0])
+    right = F.VolumeSubdomain1D(2, [0.5, 1.0], materials[1])
+    H = F.Species("H", subdomains=[left, right])
 
+    def temperature(x):
+        return 400.0 + 200.0 * x[0]
+
+    def shape(x):
+        return np.exp(Q / F.k_B * (1.0 / temperature(x) - 1.0 / 400.0))
+
+    totals = [F.TotalVolume(H, volume) for volume in (left, right)]
     model = F.HydrogenTransportProblem(
-        mesh=F.Mesh1D(np.linspace(0.0, length, n + 1)),
-        subdomains=[volume, left, right],
+        mesh=F.Mesh1D(np.linspace(0.0, 1.0, 201)),
+        subdomains=[left, right],
         species=[H],
-        temperature=lambda x: T_cold + (T_hot - T_cold) * x[0] / length,
-        initial_conditions=[
-            F.InitialConcentration(value=1.0, volume=volume, species=H)
+        temperature=temperature,
+        interfaces=[
+            F.Interface(3, [left, right], method="nitsche", penalty_term=100.0)
         ],
-        drift_terms=[F.SoretTerm(species=H, Q_star=Q_star, subdomain=volume)],
-        settings=F.Settings(atol=1e-12, rtol=1e-12, transient=True, final_time=20.0),
+        initial_conditions=[
+            F.InitialConcentration(
+                lambda x: ufl.exp(Q / F.k_B * (1.0 / temperature(x) - 1.0 / 400.0)),
+                species=H,
+                volume=left,
+            ),
+            F.InitialConcentration(
+                lambda x: (
+                    3.0 * ufl.exp(Q / F.k_B * (1.0 / temperature(x) - 1.0 / 400.0))
+                ),
+                species=H,
+                volume=right,
+            ),
+        ],
+        drift_terms=[F.SoretTerm(H, Q, volume) for volume in (left, right)],
+        exports=totals,
+        settings=F.Settings(atol=1e-12, rtol=1e-12, stepsize=0.05, final_time=1.0),
     )
-    model.settings.stepsize = F.Stepsize(0.1)
-
+    model.show_progress_bar = False
     model.initialise()
     model.run()
-
-    x, concentration = _profile(H)
-
-    temperature = T_cold + (T_hot - T_cold) * x / length
-    shape = np.exp(Q_star / (F.k_B * temperature))
-    exact = shape * length / np.trapezoid(shape, x)
-
-    assert np.max(np.abs(concentration - exact)) / np.max(exact) < 1e-4
+    np.testing.assert_allclose(
+        np.sum([total.data for total in totals], axis=0),
+        sum(total.data[0] for total in totals),
+        rtol=1e-9,
+    )
+    fields = [H.subdomain_to_post_processing_solution[v] for v in (left, right)]
+    ratio = evaluate_at_point(fields[1], 0.5) / evaluate_at_point(fields[0], 0.5)
+    assert ratio == pytest.approx(3.0, rel=1e-4)
+    for field, volume, K in zip(fields, (left, right), (1.0, 3.0)):
+        points = field.function_space.tabulate_dof_coordinates()[:, 0]
+        np.testing.assert_allclose(
+            field.x.array, K * shape(np.array([points])), rtol=5e-4
+        )
+        T = volume.sub_T
+        flux = -1.0 / K * (ufl.grad(field) + Q * field / (F.k_B * T**2) * ufl.grad(T))
+        squared = fem.assemble_scalar(fem.form(ufl.inner(flux, flux) * ufl.dx))
+        assert field.function_space.mesh.comm.allreduce(squared, op=MPI.SUM) < 1e-4

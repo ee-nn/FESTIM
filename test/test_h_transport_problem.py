@@ -993,14 +993,18 @@ def test_define_meshtags_and_measures_with_custom_fenics_mesh():
 
     # BUILD
     mesh_1D = dolfinx.mesh.create_unit_interval(MPI.COMM_WORLD, 10)
-    # 1D meshtags
-    my_surface_meshtags = dolfinx.mesh.meshtags(
-        mesh_1D,
-        0,
-        np.array([0, 10], dtype=np.int32),
-        np.array([1, 2], dtype=np.int32),
+    left = dolfinx.mesh.locate_entities_boundary(
+        mesh_1D, 0, lambda x: np.isclose(x[0], 0)
     )
-
+    right = dolfinx.mesh.locate_entities_boundary(
+        mesh_1D, 0, lambda x: np.isclose(x[0], 1)
+    )
+    facets = np.concatenate([left, right])
+    values = np.concatenate([np.full_like(left, 1), np.full_like(right, 2)])
+    order = np.argsort(facets)
+    my_surface_meshtags = dolfinx.mesh.meshtags(
+        mesh_1D, 0, facets[order], values[order]
+    )
     num_cells = mesh_1D.topology.index_map(1).size_local
     my_volume_meshtags = dolfinx.mesh.meshtags(
         mesh_1D,
@@ -1008,14 +1012,15 @@ def test_define_meshtags_and_measures_with_custom_fenics_mesh():
         np.arange(num_cells, dtype=np.int32),
         np.full(num_cells, 1, dtype=np.int32),
     )
-
-    my_mesh = F.Mesh(mesh=mesh_1D)
-
-    my_model = F.HydrogenTransportProblem(mesh=my_mesh)
+    my_model = F.HydrogenTransportProblem(mesh=F.Mesh(mesh_1D))
     my_model.facet_meshtags = my_surface_meshtags
     my_model.volume_meshtags = my_volume_meshtags
-
-    # TEST
+    my_model.define_meshtags_and_measures()
+    assert my_model.facet_meshtags is my_surface_meshtags
+    assert my_model.volume_meshtags is my_volume_meshtags
+    for measure in (my_model.dx(1), my_model.ds(1), my_model.ds(2)):
+        value = dolfinx.fem.assemble_scalar(dolfinx.fem.form(1.0 * measure))
+        assert np.isclose(mesh_1D.comm.allreduce(value, op=MPI.SUM), 1.0)
 
 
 def test_error_raised_when_custom_fenics_mesh_wrong_facet_meshtags_type():

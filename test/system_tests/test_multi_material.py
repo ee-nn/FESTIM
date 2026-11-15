@@ -530,6 +530,7 @@ def test_extrema_export_on_a_volume_without_the_species(make_export, location):
     surf2 = F.SurfaceSubdomain1D(id=2, x=1)
 
     my_model.subdomains = [vol1, vol2, surf1, surf2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2], method="nitsche")]
 
     # H spans both volumes so vol2 is not left without a species;
     # D lives only in vol1, but the export below asks for it in vol2

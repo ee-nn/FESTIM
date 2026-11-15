@@ -518,6 +518,7 @@ def test_initial_condition_mixed_domain():
     vol1 = F.VolumeSubdomain1D(id=1, borders=[0, 0.5], material=material_left)
     vol2 = F.VolumeSubdomain1D(id=2, borders=[0.5, 1], material=material_right)
     my_model.subdomains = [vol1, vol2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2])]
 
     spe1 = F.Species("1", mobile=True, subdomains=[vol1, vol2])
     my_model.species = [spe1]
@@ -563,6 +564,7 @@ def test_initial_condition_mixed_domain_multispecies():
     vol1 = F.VolumeSubdomain1D(id=1, borders=[0, 0.5], material=material_left)
     vol2 = F.VolumeSubdomain1D(id=2, borders=[0.5, 1], material=material_right)
     my_model.subdomains = [vol1, vol2]
+    my_model.interfaces = [F.Interface(3, [vol1, vol2])]
 
     spe1 = F.Species("1", mobile=True, subdomains=[vol1, vol2])
     spe2 = F.Species("2", mobile=True, subdomains=[vol1, vol2])

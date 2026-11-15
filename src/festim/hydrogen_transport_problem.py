@@ -104,7 +104,8 @@ class HydrogenTransportProblem(problem.ProblemBase):
         enclosures: Gas enclosures; requires DOLFINx >= 0.11.
 
     Species with omitted subdomains temporarily default to all ordinary volumes, with
-    a deprecation warning. Multi-material models must declare interfaces explicitly.
+    a deprecation warning. Adjacent volumes sharing mobile species require interfaces
+    or explicit codimension-one separation, even when they share one material.
     Access solutions through ``volume.u``, ``volume.u_n`` and the species'
     ``subdomain_to_*`` mappings. Deprecated single-domain aliases remain available
     where there is exactly one possible target.
@@ -464,13 +465,6 @@ class HydrogenTransportProblem(problem.ProblemBase):
         for spe in self.species:
             membership = spe.subdomains
             if membership is None:
-                if len(ordinary) > 1 and not self.interfaces:
-                    raise ValueError(
-                        f"Species {spe.name} has omitted subdomains in a "
-                        "multi-material "
-                        "problem. Declare species subdomains and explicit interfaces; "
-                        "concentration continuity is no longer implicit."
-                    )
                 warnings.warn(
                     f"Inferring subdomains for species {spe.name} is deprecated; "
                     "set Species.subdomains explicitly.",
@@ -492,6 +486,114 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 raise ValueError(f"Species {spe.name} has duplicate subdomains")
             resolved[spe] = tuple(membership)
         self.species_to_subdomains = resolved
+
+    def _validate_interface_coverage(self):
+        """Reject accidental isolation of adjacent volume fields, collectively.
+
+        A codimension-one subdomain explicitly separates the volumes: transport
+        through it is controlled by its coupling terms, not an implicit interface.
+        Its facets therefore need no direct volume-to-volume interface. Immobile
+        species and geometrically disconnected volumes need no interface either.
+        """
+        mesh = self.mesh.mesh
+        topology = mesh.topology
+        dim = topology.dim
+        ordinary_volumes = {v for v in self.volume_subdomains if v.codim(dim) == 0}
+        if not any(
+            s.mobile
+            and len(ordinary_volumes.intersection(self.species_subdomains(s))) > 1
+            for s in self.species
+        ):
+            return
+        topology.create_connectivity(dim - 1, dim)
+        adjacency = topology.connectivity(dim - 1, dim)
+        cell_map = topology.index_map(dim)
+        # Scatter cell tags so a boundary crossing an MPI partition is checked
+        # even when the caller provided tags for owned cells only.
+        tags = dolfinx.la.vector(cell_map, bs=1, dtype=np.float64)
+        tags.array[:] = -1
+        tags.array[self.volume_meshtags.indices] = self.volume_meshtags.values
+        tags.scatter_forward()
+        cell_tags = tags.array.astype(np.int64)
+        facet_tags = dict(zip(self.facet_meshtags.indices, self.facet_meshtags.values))
+        ordinary = {v.id: v for v in self.volume_subdomains if v.codim(dim) == 0}
+        manifold_tags = {v.id for v in self.manifold_subdomains}
+        interfaces = {}
+        for interface in self.interfaces:
+            pair = frozenset(v.id for v in interface.subdomains)
+            interfaces.setdefault(pair, set()).add(interface.id)
+        missing = set()
+        facet_map = topology.index_map(dim - 1)
+        candidates = set()
+        # Ghostless custom meshes still need an accurate migration diagnostic.
+        # Exchange only incomplete partition facets, not the full cell mesh.
+        partition_facets = []
+        counts = np.diff(adjacency.offsets)
+        interior = np.flatnonzero(counts[: facet_map.size_local] == 2)
+        cells = adjacency.array[adjacency.offsets[interior, None] + np.arange(2)]
+        pairs = cell_tags[cells]
+        different = pairs[:, 0] != pairs[:, 1]
+        # Only volume boundaries need Python-level processing, not every facet.
+        for facet, pair in zip(interior[different], pairs[different]):
+            candidates.add((tuple(sorted(pair)), facet_tags.get(facet)))
+        # On ghostless meshes exterior_facet_indices can include the owner of
+        # a partition facet. Pair all one-cell facets by global ID instead;
+        # true exterior facets have only one volume in the collective result.
+        incomplete = np.flatnonzero(counts == 1).astype(np.int32)
+        for facet, global_facet in zip(
+            incomplete, facet_map.local_to_global(incomplete)
+        ):
+            cell = adjacency.array[adjacency.offsets[facet]]
+            partition_facets.append(
+                (int(global_facet), int(cell_tags[cell]), facet_tags.get(facet))
+            )
+        shared = {}
+        for entries in mesh.comm.allgather(partition_facets):
+            for facet, volume, marker in entries:
+                shared.setdefault(facet, set()).add((volume, marker))
+        ghostless_interfaces = set()
+        for entries in shared.values():
+            pair = tuple(sorted({volume for volume, _ in entries}))
+            if len(pair) == 2:
+                for _, marker in entries:
+                    candidates.add((pair, marker))
+                    if marker in interfaces.get(frozenset(pair), ()):
+                        ghostless_interfaces.add(marker)
+        for pair, marker in candidates:
+            if pair[0] == pair[1] or any(tag not in ordinary for tag in pair):
+                continue
+            if marker in manifold_tags or marker in interfaces.get(frozenset(pair), ()):
+                continue
+            for index, species in enumerate(self.species):
+                domains = self.species_subdomains(species)
+                if species.mobile and all(ordinary[tag] in domains for tag in pair):
+                    missing.add(
+                        (
+                            index,
+                            int(pair[0]),
+                            int(pair[1]),
+                            int(marker) if marker is not None else None,
+                        )
+                    )
+        missing = set().union(*mesh.comm.allgather(missing))
+        if missing:
+            details = "; ".join(
+                f"species {self.species[index].name}, volumes {left}/{right}, "
+                f"facet tag {marker if marker is not None else 'untagged'}"
+                for index, left, right, marker in sorted(missing, key=repr)
+            )
+            raise ValueError(
+                "Missing explicit interfaces on shared facets: " + details + ". "
+                "Declare interfaces, or use codimension-one subdomains with the "
+                "intended coupling settings to model intentional separation."
+            )
+
+        if ghostless_interfaces:
+            raise ValueError(
+                f"Interfaces {sorted(ghostless_interfaces)} cross an MPI partition "
+                "without adjacent ghost cells. Create the mesh with "
+                "GhostMode.shared_facet to assemble interface integrals."
+            )
 
     def _single_domain_alias(self, name):
         if not self._spaces_defined:
@@ -615,6 +717,8 @@ class HydrogenTransportProblem(problem.ProblemBase):
         # when it is declared rather than only if something happens to couple to it
         for manifold in self.manifold_subdomains:
             self.manifold_is_interior(manifold)
+
+        self._validate_interface_coverage()
 
         # create submeshes and transfer meshtags to subdomains
         for subdomain in self.volume_subdomains:
@@ -1129,6 +1233,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
             mesh.topology.create_connectivity(tdim - 1, tdim)
             facet_to_cell = mesh.topology.connectivity(tdim - 1, tdim)
             facets = self.facet_meshtags.find(manifold.id)
+            # Ghost facets on the edge of the ghost layer can have only one
+            # visible neighbour despite being interior globally. Count owners.
+            facets = facets[facets < mesh.topology.index_map(tdim - 1).size_local]
             # vectorised: the number of cells a facet connects to is the width of
             # its slice in the adjacency list, and there can be tens of thousands
             # of facets in a manifold

@@ -282,6 +282,7 @@ def test_ready_made_diffusivity_can_be_used_for_each_volume():
     D.interpolate(lambda x: 1.0 + x[0])
     first.material.D = D
     second.material.D = D
+    model.interfaces = [F.Interface(3, [first, second])]
     model.initialise()
     assert model.diffusion_coefficient(first, species) is D
     assert model.diffusion_coefficient(second, species) is D

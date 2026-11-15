@@ -61,8 +61,8 @@ def test_subdomain_diffusivities_on_2d_mesh():
     my_model.volume_meshtags = ct
     my_model.facet_meshtags = mt
 
-    material_top = F.Material(D_0=5.0, E_D=0)
-    material_bottom = F.Material(D_0=1.0, E_D=0)
+    material_top = F.Material(D_0=5.0, E_D=0, K_S_0=1, E_K_S=0)
+    material_bottom = F.Material(D_0=1.0, E_D=0, K_S_0=1, E_K_S=0)
 
     top_domain = F.VolumeSubdomain(4, material=material_top)
     bottom_domain = F.VolumeSubdomain(3, material=material_bottom)
@@ -78,6 +78,9 @@ def test_subdomain_diffusivities_on_2d_mesh():
 
     H = F.Species("H", mobile=True, subdomains=[bottom_domain, top_domain])
     my_model.species = [H]
+    my_model.interfaces = [
+        F.Interface(5, [bottom_domain, top_domain], method="nitsche")
+    ]
 
     my_model.boundary_conditions = []
 
@@ -225,6 +228,9 @@ def test_temp_dependent_bc_mixed_domain_temperature_as_function():
     H = F.Species("H", mobile=True, subdomains=[bottom_domain, top_domain])
 
     my_model.species = [H]
+    my_model.interfaces = [
+        F.Interface(5, [bottom_domain, top_domain], method="nitsche")
+    ]
 
     my_model.boundary_conditions = [
         F.FixedConcentrationBC(top_surface, value=lambda T: 2 * T, species=H),

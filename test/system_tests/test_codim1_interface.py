@@ -748,7 +748,26 @@ def build_shared_bulk_species(n=12):
     H_mr = F.Species("H_mr", subdomains=[middle, right])
     H_g = F.Species("H_g", subdomains=[gamma])
 
-    sources, bcs = [], []
+    separator = F.VolumeSubdomain(
+        id=GAMMA_2_ID,
+        material=mat,
+        dim=1,
+        locator=lambda x: np.isclose(x[0], 2 / 3),
+    )
+    isolated = F.Species("isolated_separator", subdomains=[separator])
+    # A unit decay fixes the otherwise free steady manifold field at zero;
+    # there is deliberately no exchange with either neighbouring bulk.
+    sources, bcs = (
+        [
+            F.ParticleSource(
+                value=lambda c: -c,
+                species=isolated,
+                volume=separator,
+                species_dependent_value={"c": isolated},
+            )
+        ],
+        [],
+    )
     for bulk_species, k in ((H_l, K1_LEFT), (H_mr, K1_RIGHT)):
         source, flux = _exchange(gamma, H_g, bulk_species, k)
         sources.append(source)
@@ -760,8 +779,8 @@ def build_shared_bulk_species(n=12):
 
     model = F.HydrogenTransportProblem(
         mesh=F.Mesh(mesh),
-        species=[H_l, H_mr, H_g],
-        subdomains=[left, middle, right, gamma, outer_l, outer_r],
+        species=[H_l, H_mr, H_g, isolated],
+        subdomains=[left, middle, right, gamma, separator, outer_l, outer_r],
         sources=sources,
         boundary_conditions=bcs,
         temperature=500,
