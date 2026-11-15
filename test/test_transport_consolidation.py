@@ -1,6 +1,7 @@
 """Contracts for the single mixed-submesh hydrogen transport engine."""
 
 import importlib
+import warnings
 
 import numpy as np
 import pytest
@@ -41,9 +42,11 @@ def test_deprecated_class_name_is_the_same_class():
         assert alias is F.HydrogenTransportProblem
         assert not hasattr(module, "HydrogenTransportProblemDiscontinuousChangeVar")
         namespace = {}
-        with pytest.warns(DeprecationWarning):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
             exec(f"from {module.__name__} import *", namespace)
-        assert namespace["HydrogenTransportProblemDiscontinuous"] is alias
+        assert "HydrogenTransportProblemDiscontinuous" not in namespace
+        assert namespace["HydrogenTransportProblem"] is alias
     assert F.HydrogenTransportProblem.__bases__ == (F.ProblemBase,)
 
 

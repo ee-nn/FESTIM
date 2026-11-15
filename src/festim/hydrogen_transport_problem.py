@@ -61,10 +61,7 @@ from festim.mixed_dimensional_assembly import (
 
 from .mesh import CoordinateSystem, Mesh
 
-__all__ = [
-    "HydrogenTransportProblem",
-    "HydrogenTransportProblemDiscontinuous",  # noqa: F822 - resolved by __getattr__
-]
+__all__ = ["HydrogenTransportProblem"]
 
 
 def _warn_advection_terms_deprecated():

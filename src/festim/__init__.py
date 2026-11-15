@@ -126,8 +126,5 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# Keep wildcard imports of the deprecated name working without eagerly resolving it
-# (which would suppress the warning on subsequent direct accesses).
-__all__ = [name for name in globals() if not name.startswith("_")] + [
-    "HydrogenTransportProblemDiscontinuous"
-]
+# Deprecated names remain available through explicit access only.
+__all__ = [name for name in globals() if not name.startswith("_")]
