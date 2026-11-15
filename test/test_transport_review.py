@@ -5,8 +5,10 @@ from mpi4py import MPI
 import dolfinx
 import numpy as np
 import pytest
+from dolfinx import fem
 
 import festim as F
+from festim.helpers import FunctionTransfer
 
 from .test_transport_consolidation import make_model, two_domain_model
 
@@ -129,6 +131,77 @@ def test_species_reuse_resolves_new_volumes_and_resets_fields():
     assert set(species.subdomain_to_solution) == {volume2}
 
 
+@pytest.mark.parametrize("family,degree", [("P", 1), ("P", 2), ("DG", 0), ("DG", 2)])
+def test_parent_temperature_transfer_needs_no_geometric_search(
+    monkeypatch, family, degree
+):
+    model, volume, _ = make_model()
+    V = fem.functionspace(model.mesh.mesh, (family, degree))
+    temperature = fem.Function(V)
+    temperature.interpolate(lambda x: 300.0 + x[0] ** degree)
+    model.temperature = temperature
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A parent/submesh transfer must not search geometrically")
+
+    monkeypatch.setattr(fem, "create_interpolation_data", forbidden)
+    model.initialise()
+    for step in range(2):
+        temperature.x.array[:] += 10.0
+        model.iterate()
+        expected = fem.Function(volume.sub_T.function_space)
+        expected.interpolate(lambda x: 300.0 + 10.0 * (step + 1) + x[0] ** degree)
+        np.testing.assert_allclose(volume.sub_T.x.array, expected.x.array)
+
+
+def test_nonmatching_transfer_reuses_search_data(monkeypatch):
+    source_mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 4, 4)
+    target_mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 7, 7)
+    source = fem.Function(fem.functionspace(source_mesh, ("P", 2)))
+    target = fem.Function(fem.functionspace(target_mesh, ("P", 2)))
+    source.interpolate(lambda x: 300.0 + x[0] ** 2 + x[1])
+    transfer = FunctionTransfer(target, source)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Geometric interpolation data should be cached")
+
+    monkeypatch.setattr(fem, "create_interpolation_data", forbidden)
+    for step in range(2):
+        source.x.array[:] += 10.0
+        transfer.update()
+        expected = fem.Function(target.function_space)
+        expected.interpolate(lambda x: 310.0 + step * 10.0 + x[0] ** 2 + x[1])
+        np.testing.assert_allclose(target.x.array, expected.x.array)
+
+
+def test_owned_static_temperature_is_transferred_once(monkeypatch):
+    model, volume, _ = make_model()
+    model.temperature = lambda x: 300.0 + x[0]
+    model.initialise()
+
+    def forbidden():
+        raise AssertionError("Static temperature should not be transferred again")
+
+    monkeypatch.setattr(model._temperature_transfers[volume], "update", forbidden)
+    model.run()
+
+
+def test_constant_temperature_export_needs_no_expression(monkeypatch):
+    model, _, _ = make_model()
+    model.temperature = fem.Constant(model.mesh.mesh, 300.0)
+    model.initialise()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Constant temperature can be assigned directly")
+
+    monkeypatch.setattr(fem, "Expression", forbidden)
+    field = model._get_temperature_field_as_function()
+    model.post_processing()
+    model.temperature.value = 400.0
+    model.post_processing()
+    np.testing.assert_allclose(field.x.array, 400.0)
+
+
 def test_callable_tolerances_reach_petsc():
     model, _, _ = make_model()
     model.settings.atol = lambda t: 1e-10 * (1 + t)
@@ -177,3 +250,85 @@ def test_ghostless_custom_mesh_still_reports_missing_interfaces():
     )
     with pytest.raises(ValueError, match="Missing explicit interfaces"):
         model.initialise()
+
+
+def test_manifold_temperature_transfer_reuses_search(monkeypatch):
+    model, left, _, _ = split_square()
+    gamma = F.VolumeSubdomain(
+        3, material=left.material, dim=1, locator=lambda x: np.isclose(x[0], 0.5)
+    )
+    model.subdomains.append(gamma)
+    model.species.append(F.Species("surface", mobile=False, subdomains=[gamma]))
+    thermal = fem.Function(fem.functionspace(model.mesh.mesh, ("P", 2)))
+    thermal.interpolate(lambda x: 300.0 + x[0] ** 2 + x[1])
+    model.temperature = thermal
+    model.initialise()
+    transfer = model._temperature_transfers[gamma]
+    assert transfer.parent_cells is None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("The manifold interpolation search must be reused")
+
+    monkeypatch.setattr(fem, "create_interpolation_data", forbidden)
+    thermal.x.array[:] += 10.0
+    model.iterate()
+    expected = fem.Function(gamma.sub_T.function_space)
+    expected.interpolate(lambda x: 310.0 + x[0] ** 2 + x[1])
+    np.testing.assert_allclose(gamma.sub_T.x.array, expected.x.array)
+
+
+def test_reinitialization_rebuilds_temperature_transfers():
+    model, volume, _ = make_model()
+    thermal = fem.Function(fem.functionspace(model.mesh.mesh, ("P", 2)))
+    thermal.interpolate(lambda x: 300.0 + x[0] ** 2)
+    model.temperature = thermal
+    model.initialise()
+    previous = model._temperature_transfers[volume]
+    thermal.x.array[:] += 10.0
+    model.initialise()
+    current = model._temperature_transfers[volume]
+    assert current is not previous
+    assert current.target is volume.sub_T
+    assert current.target.function_space.mesh is not previous.target.function_space.mesh
+    expected = fem.Function(volume.sub_T.function_space)
+    expected.interpolate(lambda x: 310.0 + x[0] ** 2)
+    np.testing.assert_allclose(volume.sub_T.x.array, expected.x.array)
+
+
+@pytest.mark.parametrize("function_temperature", [False, True])
+def test_boundary_expression_uses_submesh_space_time_and_temperature(
+    function_temperature,
+):
+    model, volume, species = make_model()
+    surface = F.SurfaceSubdomain1D(2, 0.0)
+    model.subdomains.append(surface)
+    if function_temperature:
+        thermal = fem.Function(fem.functionspace(model.mesh.mesh, ("P", 1)))
+        thermal.interpolate(lambda x: 300.0 + x[0])
+    else:
+        thermal = fem.Constant(model.mesh.mesh, 300.0)
+    model.temperature = thermal
+    bc = F.FixedConcentrationBC(
+        surface, lambda x, t, T: 1.0 + x[0] + t + T / 300.0, species
+    )
+    model.boundary_conditions = [bc]
+    model.initialise()
+    for step in range(3):
+        if step:
+            if function_temperature:
+                thermal.x.array[:] += 10.0
+            else:
+                thermal.value += 10.0
+            model.iterate()
+        expected = fem.Function(bc.value_fenics.function_space)
+        expected.interpolate(
+            lambda x: (
+                1.0
+                + x[0]
+                + float(model.t)
+                + (300.0 + 10.0 * step + (x[0] if function_temperature else 0.0))
+                / 300.0
+            )
+        )
+        np.testing.assert_allclose(bc.value_fenics.x.array, expected.x.array)
+        assert bc.value_fenics.function_space.mesh is volume.submesh

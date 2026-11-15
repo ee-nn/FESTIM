@@ -41,6 +41,7 @@ from festim.enclosure.gas_species import GasSpecies as _GasSpecies
 from festim.enclosure.gas_species import create_real_function_space
 from festim.enclosure.openings import EnclosureConnection
 from festim.helpers import (
+    FunctionTransfer,
     KSPMonitor,
     SnesMonitor,
     as_fenics_constant,
@@ -356,12 +357,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 V = dolfinx.fem.functionspace(self.mesh.mesh, ("P", 1))
                 self._temperature_as_function = fem.Function(V)
             temperature_field = self._temperature_as_function
-            V = temperature_field.function_space
-            temperature_expr = fem.Expression(
-                self.temperature_fenics,
-                V.element.interpolation_points,
-            )
-            temperature_field.interpolate(temperature_expr)
+            temperature_field.x.array[:] = float(self.temperature_fenics)
+            temperature_field.x.scatter_forward()
+            self._temperature_export_value = float(self.temperature_fenics)
             return temperature_field
 
     def drift_velocity_in(
@@ -659,6 +657,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         self.subdomain_to_species.clear()
         self.subdomain_to_V_CG1.clear()
         self._temperature_as_function = None
+        self._temperature_export_value = None
         self._total_volume = None
         for species in self.species:
             # Species hold runtime fields for one model at a time. Reuse is
@@ -841,6 +840,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         self._define_submesh_temperatures()
 
     def _define_submesh_temperatures(self):
+        self._temperature_transfers = {}
         for subdomain in self.volume_subdomains:
             if not hasattr(subdomain, "submesh"):
                 continue
@@ -851,7 +851,19 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 V = fem.functionspace(subdomain.submesh, (family, degree))
                 subdomain.sub_T = fem.Function(V)
                 subdomain.sub_T.name = "temperature"
-                nmm_interpolate(subdomain.sub_T, self.temperature_fenics)
+                transfer = FunctionTransfer(
+                    subdomain.sub_T,
+                    self.temperature_fenics,
+                    cell_map=(
+                        subdomain.cell_map
+                        if subdomain.codim(self.mesh.vdim) == 0
+                        and self.temperature_fenics.function_space.mesh
+                        is self.mesh.mesh
+                        else None
+                    ),
+                )
+                self._temperature_transfers[subdomain] = transfer
+                transfer.update()
             else:
                 subdomain.sub_T = as_fenics_constant(
                     float(self.temperature_fenics), subdomain.submesh
@@ -862,7 +874,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
             if not hasattr(subdomain, "sub_T"):
                 continue
             if isinstance(self.temperature_fenics, fem.Function):
-                nmm_interpolate(subdomain.sub_T, self.temperature_fenics)
+                self._temperature_transfers[subdomain].update()
             else:
                 subdomain.sub_T.value = float(self.temperature_fenics)
 
@@ -891,25 +903,13 @@ class HydrogenTransportProblem(problem.ProblemBase):
         sub_V = bc.species.subdomain_to_function_space[volume_subdomain]
         collapsed_V, _ = sub_V.collapse()
 
-        # in the discontinuous case, if the temperature is given as a function
-        # then we can't use the temperature on the parent mesh
-        # see issue #1007
-        if on_manifold:
-            # the value is interpolated onto the manifold's submesh, so the coefficients
-            # it is built from have to live there too
-            temp = volume_subdomain.sub_T
-            time = volume_subdomain.sub_t
-        elif isinstance(self.temperature_fenics, fem.Function):
-            temp = volume_subdomain.sub_T
-            time = self.t
-        else:
-            temp = self.temperature_fenics
-            time = self.t
-
+        # Boundary expressions are interpolated on this submesh. Both temperature
+        # and time must belong to it, including Constants: DOLFINx 0.10 requires
+        # a unique expression domain for values combining x, t and T.
         bc.create_value(
-            temperature=temp,
+            temperature=volume_subdomain.sub_T,
             function_space=collapsed_V,
-            t=time,
+            t=volume_subdomain.sub_t,
         )
 
         volume_subdomain.submesh.topology.create_connectivity(
@@ -1159,7 +1159,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 )
 
     def convert_drift_terms_to_fenics_objects(self):
-        """As the base class, but on the function space of the term's own subdomain.
+        """Convert drift inputs on the function space of the term's own subdomain.
 
         Every coefficient of a submesh integral has to be built on that submesh -- FFCx
         cannot tabulate a parent-mesh coefficient on submesh cells -- so the temperature
@@ -1551,13 +1551,14 @@ class HydrogenTransportProblem(problem.ProblemBase):
         return foreign
 
     def create_submesh_time_constants(self):
-        """Mirrors ``t`` and ``dt`` onto the submesh of every manifold subdomain.
+        """Mirrors ``t`` and ``dt`` onto every subdomain's submesh.
 
         The self terms of a manifold are integrated over its own submesh (see
         :meth:`subdomain_measure`) and every coefficient of such an integral must live
         on that submesh: a ``fem.Constant`` bound to the parent mesh makes the integral
         mixed-dimensional and fails inside FFCx with an undiagnosable
-        ``UnboundLocalError``. The mirrors are kept in sync by
+        ``UnboundLocalError``. Boundary and export expressions on ordinary submeshes
+        also need coefficients on their own mesh. The mirrors are kept in sync by
         :meth:`update_submesh_time_constants`.
         """
         for subdomain in self.volume_subdomains:
@@ -1596,7 +1597,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         return self.temperature_fenics
 
     def convert_reaction_rates_to_fenics_objects(self):
-        """As the base class, but with the temperature of the reaction's own mesh.
+        """Convert reaction rates with the temperature of their integration mesh.
 
         A reaction on a manifold becomes a source integrated over that manifold's
         submesh, so its rate cannot be built from the parent-mesh temperature: FFCx
@@ -2718,12 +2719,11 @@ class HydrogenTransportProblem(problem.ProblemBase):
             isinstance(self.temperature_fenics, fem.Constant)
             and self._temperature_as_function is not None
         ):
-            self._temperature_as_function.interpolate(
-                fem.Expression(
-                    self.temperature_fenics,
-                    self._temperature_as_function.function_space.element.interpolation_points,
-                )
-            )
+            value = float(self.temperature_fenics)
+            if value != self._temperature_export_value:
+                self._temperature_as_function.x.array[:] = value
+                self._temperature_as_function.x.scatter_forward()
+                self._temperature_export_value = value
 
         for export in self.exports:
             # skip if it isn't time to export
@@ -2825,7 +2825,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
             else:
                 self.temperature_fenics.interpolate(self.temperature_expr)
                 self.temperature_fenics.x.scatter_forward()
-        if self.temperature_fenics is not None:
+        if self.temperature_time_dependent or isinstance(
+            self.temperature, fem.Function | fem.Constant
+        ):
             # A ready-made Function (e.g. supplied by the heat solver) can change
             # externally even though temperature_time_dependent is False.
             self._update_submesh_temperatures()

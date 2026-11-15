@@ -456,6 +456,46 @@ class Value:
                     self.fenics_object.interpolate(self.fenics_interpolation_expression)
 
 
+class FunctionTransfer:
+    """Reusable interpolation between fixed function spaces.
+
+    Ordinary parent/submesh transfers use the known cell correspondence. Other
+    transfers cache the geometric search and MPI ownership data. Recreate this
+    object whenever the meshes, their geometry, or the function spaces change.
+    """
+
+    def __init__(self, target: fem.Function, source: fem.Function, cell_map=None):
+        self.target = target
+        self.source = source
+        mesh = target.function_space.mesh
+        index_map = mesh.topology.index_map(mesh.topology.dim)
+        self.cells = np.arange(
+            index_map.size_local + index_map.num_ghosts, dtype=np.int32
+        )
+        self.parent_cells = (
+            cell_map.sub_topology_to_topology(self.cells, inverse=False)
+            if cell_map is not None
+            else None
+        )
+        self.data = None
+        if self.parent_cells is None:
+            self.data = fem.create_interpolation_data(
+                target.function_space, source.function_space, self.cells, padding=1e-11
+            )
+
+    def update(self):
+        self.source.x.scatter_forward()
+        if self.parent_cells is not None:
+            self.target.interpolate(
+                self.source, cells0=self.parent_cells, cells1=self.cells
+            )
+        else:
+            self.target.interpolate_nonmatching(
+                self.source, self.cells, interpolation_data=self.data
+            )
+        self.target.x.scatter_forward()
+
+
 def nmm_interpolate(
     f_out: fem.Function,
     f_in: fem.Function,

@@ -1,6 +1,9 @@
 """Numerical acceptance tests for the consolidated transport engine."""
 
+from mpi4py import MPI
+
 import numpy as np
+import pytest
 import ufl
 from dolfinx import fem
 from dolfinx.fem.petsc import LinearProblem
@@ -42,6 +45,90 @@ def slab(n, transient=True):
     )
     model.show_progress_bar = False
     return model, left, right, inlet, outlet, species
+
+
+@pytest.mark.parametrize("nonmatching", [False, True])
+def test_multivolume_coupled_heat_manufactured_solution(nonmatching):
+    model, left, right, inlet, outlet, species = slab(40)
+    material = left.material
+    material.E_D = 0.02
+
+    def exact_temperature(x, t):
+        return 400.0 + 20.0 * x[0] + 10.0 * t
+
+    def exact_concentration(x, t):
+        return 1.0 + x[0] + t
+
+    def source(x, t):
+        thermal = exact_temperature(x, t)
+        D = ufl.exp(-material.E_D / (F.k_B * thermal))
+        return 1.0 - D * material.E_D * 20.0 / (F.k_B * thermal**2)
+
+    heat = F.HeatTransferProblem(
+        mesh=F.Mesh1D(np.linspace(0, 1, 63)) if nonmatching else model.mesh,
+        subdomains=[left, right, inlet, outlet],
+        boundary_conditions=[
+            F.FixedTemperatureBC(s, exact_temperature) for s in (inlet, outlet)
+        ],
+        initial_condition=F.InitialTemperature(
+            lambda x: exact_temperature(x, 0.0), left
+        ),
+        sources=[F.HeatSource(10.0, volume=v) for v in (left, right)],
+        settings=F.Settings(atol=1e-11, rtol=1e-11, stepsize=0.1, final_time=0.2),
+    )
+    model.boundary_conditions = [
+        F.FixedConcentrationBC(s, exact_concentration, species) for s in (inlet, outlet)
+    ]
+    model.sources = [
+        F.ParticleSource(source, volume=v, species=species) for v in (left, right)
+    ]
+    model.initial_conditions = [
+        F.InitialConcentration(
+            lambda x: exact_concentration(x, 0.0), volume=v, species=species
+        )
+        for v in (left, right)
+    ]
+    coupled = F.CoupledTransientHeatTransferHydrogenTransport(heat, model)
+    coupled.initialise()
+    assert (
+        error_L2(model.temperature_fenics, lambda x: exact_temperature(x, 0.0)) < 1e-8
+    )
+    for volume in (left, right):
+        assert error_L2(volume.sub_T, lambda x: exact_temperature(x, 0.0)) < 1e-8
+    for _ in range(4):
+        coupled.iterate()
+        time = float(model.t)
+        assert float(heat.t) == pytest.approx(time)
+        assert float(heat.dt) == pytest.approx(float(model.dt))
+        assert (
+            error_L2(model.temperature_fenics, lambda x: exact_temperature(x, time))
+            < 1e-8
+        )
+        for volume in (left, right):
+            assert error_L2(volume.sub_T, lambda x: exact_temperature(x, time)) < 1e-8
+            assert (
+                error_L2(
+                    species.subdomain_to_post_processing_solution[volume],
+                    lambda x: exact_concentration(x, time),
+                )
+                < 1e-8
+            )
+        # Same physical flux on each side of the interface (ordered restrictions).
+        D = material.get_diffusion_coefficient(
+            model.mesh.mesh, model.temperature_fenics, species
+        )
+        fluxes = [
+            -D(side) * ufl.grad(species.subdomain_to_solution[v])(side)[0]
+            for v, side in zip((left, right), ("+", "-"))
+        ]
+        jump = fem.form(
+            (fluxes[0] - fluxes[1]) ** 2 * model.interior_facet_measure(5),
+            entity_maps=[left.cell_map, right.cell_map],
+        )
+        assert (
+            model.mesh.mesh.comm.allreduce(fem.assemble_scalar(jump), op=MPI.SUM)
+            < 1e-14
+        )
 
 
 def test_split_material_converges_to_continuous_cg_with_local_source():

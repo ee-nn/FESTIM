@@ -2,7 +2,7 @@ import tqdm.auto
 from dolfinx import fem
 
 from festim.heat_transfer_problem import HeatTransferProblem
-from festim.helpers import nmm_interpolate
+from festim.helpers import FunctionTransfer
 from festim.hydrogen_transport_problem import (
     HydrogenTransportProblem,
 )
@@ -104,12 +104,17 @@ class CoupledTransientHeatTransferHydrogenTransport:
             )
 
         self.heat_problem.initialise()
+        # The initial temperature is stored in u_n by the heat problem. Hydrogen
+        # must see it before its own coefficients and initial exports are built.
+        self.heat_problem.u.x.array[:] = self.heat_problem.u_n.x.array
+        self.heat_problem.u.x.scatter_forward()
 
         if self.non_matching_meshes:
             V = fem.functionspace(self.hydrogen_problem.mesh.mesh, ("P", 1))
             T_func = fem.Function(V)
 
-            nmm_interpolate(T_func, self.heat_problem.u)
+            self._temperature_transfer = FunctionTransfer(T_func, self.heat_problem.u)
+            self._temperature_transfer.update()
 
             self.hydrogen_problem.temperature = T_func
         else:
@@ -121,9 +126,7 @@ class CoupledTransientHeatTransferHydrogenTransport:
         self.heat_problem.iterate()
 
         if self.non_matching_meshes:
-            nmm_interpolate(
-                self.hydrogen_problem.temperature_fenics, self.heat_problem.u
-            )
+            self._temperature_transfer.update()
 
         self.hydrogen_problem.iterate()
 
