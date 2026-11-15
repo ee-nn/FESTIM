@@ -459,7 +459,6 @@ class Interface(InterfaceBase):
                 defined in both subdomains.
         """
 
-        subdomain_0, subdomain_1 = self.subdomains
         F_0, F_1 = dolfinx.fem.form(0), dolfinx.fem.form(0)
         method_to_function = {
             InterfaceMethod.penalty: self.penalty_method,
@@ -470,7 +469,7 @@ class Interface(InterfaceBase):
         )
 
         for spe in species:
-            assert subdomain_0 in spe.subdomains and subdomain_1 in spe.subdomains, (
+            assert all(v in spe.subdomain_to_solution for v in self.subdomains), (
                 f"Species {spe.name} must be defined in both subdomains of the "
                 "interface for the interface conditions to be applied"
             )

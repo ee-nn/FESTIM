@@ -166,7 +166,7 @@ class Species:
         return self.solution
 
     def concentration_submesh(self, subdomain: _VolumeSubdomain):
-        assert subdomain in self.subdomains, (
+        assert subdomain in self.subdomain_to_solution, (
             f"Species {self.name} has no solution on subdomain {subdomain}."
         )
         return self.subdomain_to_solution[subdomain]

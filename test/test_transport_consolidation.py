@@ -51,7 +51,8 @@ def test_inferred_subdomains_warn_and_preserve_single_domain_setup():
     model, volume, species = make_model(explicit=False)
     with pytest.warns(DeprecationWarning, match="Inferring subdomains"):
         model.initialise()
-    assert species.subdomains == [volume]
+    assert species.subdomains is None
+    assert model.species_to_subdomains[species] == (volume,)
     model.run()
     assert np.allclose(
         species.subdomain_to_post_processing_solution[volume].x.array, 2.0
@@ -90,7 +91,8 @@ def test_inferred_multimaterial_membership_with_explicit_interfaces():
     model.interfaces = [F.Interface(3, [first, second])]
     with pytest.warns(DeprecationWarning, match="Inferring subdomains"):
         model.initialise()
-    assert species.subdomains == [first, second]
+    assert species.subdomains is None
+    assert model.species_to_subdomains[species] == (first, second)
 
 
 def test_single_domain_aliases_reference_live_functions():

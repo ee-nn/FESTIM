@@ -185,6 +185,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         self.interfaces = interfaces or []
         self.enclosures = enclosures or []
         self.surface_to_volume = {}
+        self.species_to_subdomains = {}
         self.subdomain_to_species = {}
         self.subdomain_to_V_CG1 = {}
         self._total_volume = None
@@ -328,7 +329,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
             if trap.volume not in self.volume_subdomains:
                 raise ValueError(f"Trap {trap.name} has a volume outside this problem")
             if trap.mobile_species not in self.species or trap.volume not in (
-                trap.mobile_species.subdomains or []
+                self.species_subdomains(trap.mobile_species)
             ):
                 raise ValueError(
                     f"Mobile species of trap {trap.name} must be defined in volume "
@@ -338,6 +339,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 trap.create_species_and_reaction()
                 self.species.append(trap.trapped_concentration)
                 self.reactions.append(trap.reaction)
+            self.species_to_subdomains[trap.trapped_concentration] = (trap.volume,)
 
     def _get_temperature_field_as_function(self) -> dolfinx.fem.Function:
         """Based on the type of the temperature_fenics attribute, converts it as a
@@ -452,10 +454,16 @@ class HydrogenTransportProblem(problem.ProblemBase):
         else:
             raise TypeError("method_interface must be of type str or InterfaceMethod")
 
+    def species_subdomains(self, species):
+        """Resolved membership, without rewriting the user's Species configuration."""
+        return self.species_to_subdomains.get(species, species.subdomains or [])
+
     def _normalise_species_subdomains(self):
         ordinary = [v for v in self.volume_subdomains if v.codim(self.mesh.vdim) == 0]
+        resolved = {}
         for spe in self.species:
-            if spe.subdomains is None:
+            membership = spe.subdomains
+            if membership is None:
                 if len(ordinary) > 1 and not self.interfaces:
                     raise ValueError(
                         f"Species {spe.name} has omitted subdomains in a "
@@ -469,19 +477,21 @@ class HydrogenTransportProblem(problem.ProblemBase):
                     DeprecationWarning,
                     stacklevel=3,
                 )
-                spe.subdomains = list(ordinary)
-            if not isinstance(spe.subdomains, list):
+                membership = ordinary
+            if not isinstance(membership, list):
                 raise TypeError("subdomains attribute in Species should be list")
-            if not spe.subdomains:
+            if not membership:
                 raise ValueError(
                     f"Species {spe.name} must have a non-empty list of subdomains"
                 )
-            if any(v not in self.volume_subdomains for v in spe.subdomains):
+            if any(v not in self.volume_subdomains for v in membership):
                 raise ValueError(
                     f"Species {spe.name} has a subdomain outside this problem"
                 )
-            if len({id(v) for v in spe.subdomains}) != len(spe.subdomains):
+            if len({id(v) for v in membership}) != len(membership):
                 raise ValueError(f"Species {spe.name} has duplicate subdomains")
+            resolved[spe] = tuple(membership)
+        self.species_to_subdomains = resolved
 
     def _single_domain_alias(self, name):
         if not self._spaces_defined:
@@ -543,6 +553,17 @@ class HydrogenTransportProblem(problem.ProblemBase):
 
         self._normalise_species_subdomains()
         self.create_species_from_traps()
+        self._spaces_defined = False
+        self.subdomain_to_species.clear()
+        self.subdomain_to_V_CG1.clear()
+        self._temperature_as_function = None
+        self._total_volume = None
+        for species in self.species:
+            # Species hold runtime fields for one model at a time. Reuse is
+            # sequential; retaining an old model requires separate Species objects.
+            for name, value in vars(species).items():
+                if name.startswith("subdomain_to_"):
+                    value.clear()
         self.bc_forms = []
         self._timesteps = []
 
@@ -843,12 +864,14 @@ class HydrogenTransportProblem(problem.ProblemBase):
         Raises:
             ValueError: if the species does not live on exactly one manifold subdomain
         """
-        candidates = [s for s in self.manifold_subdomains if s in species.subdomains]
+        candidates = [
+            s for s in self.manifold_subdomains if s in self.species_subdomains(species)
+        ]
         if len(candidates) != 1:
             raise ValueError(
                 f"cannot tell which manifold surface subdomain {surface.id} bounds: "
                 f"species {species.name} lives on volume subdomains "
-                f"{[s.id for s in species.subdomains]}, of which "
+                f"{[s.id for s in self.species_subdomains(species)]}, of which "
                 f"{[s.id for s in candidates]} are manifolds. A codim-2 surface "
                 "subdomain is resolved through the species of the boundary condition "
                 "using it, so that species must live on exactly one manifold."
@@ -919,7 +942,9 @@ class HydrogenTransportProblem(problem.ProblemBase):
         """
         # get number of species defined in the subdomain
         self.subdomain_to_species[subdomain] = [
-            species for species in self.species if subdomain in species.subdomains
+            species
+            for species in self.species
+            if subdomain in self.species_subdomains(species)
         ]
 
         # instead of using the set function we use a list to keep the order
@@ -1313,13 +1338,16 @@ class HydrogenTransportProblem(problem.ProblemBase):
                 adjacent volume subdomains
         """
         candidates = [
-            v for v in self.manifold_to_volumes[manifold] if v in species.subdomains
+            v
+            for v in self.manifold_to_volumes[manifold]
+            if v in self.species_subdomains(species)
         ]
         if len(candidates) != 1:
             raise ValueError(
                 f"cannot tell which side of codim-1 subdomain {manifold.id} species "
                 f"{species.name} is on: it lives on volume subdomains "
-                f"{[s.id for s in species.subdomains]} while {manifold.id} is adjacent "
+                f"{[s.id for s in self.species_subdomains(species)]} while "
+                f"{manifold.id} is adjacent "
                 f"to {[v.id for v in self.manifold_to_volumes[manifold]]}. Declare one "
                 "term per side, each naming the species of that side."
             )
@@ -1403,7 +1431,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         foreign = [
             species
             for species in dependencies.values()
-            if manifold not in species.subdomains
+            if manifold not in self.species_subdomains(species)
         ]
         sides = {self.coupling_side(manifold, species) for species in foreign}
         if len(sides) > 1:
@@ -1595,7 +1623,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         form_coupling = 0
         # add diffusion and time derivative for each species
         for spe in self.species:
-            if subdomain not in spe.subdomains:
+            if subdomain not in self.species_subdomains(spe):
                 continue
             u = spe.subdomain_to_solution[subdomain]
             u_n = spe.subdomain_to_prev_solution[subdomain]
@@ -2011,7 +2039,11 @@ class HydrogenTransportProblem(problem.ProblemBase):
         for species in self.species:
             if not species.mobile:
                 continue
-            present = [s for s in (subdomain_0, subdomain_1) if s in species.subdomains]
+            present = [
+                s
+                for s in (subdomain_0, subdomain_1)
+                if s in self.species_subdomains(species)
+            ]
             if len(present) == 2:
                 coupled.append(species)
             elif present:
@@ -2330,7 +2362,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
                     "subdomain occupies facets; give a surface subdomain, or a volume "
                     "quantity over this subdomain."
                 )
-            if surface in export.field.subdomains:
+            if surface in self.species_subdomains(export.field):
                 raise ValueError(
                     f"species {export.field.name} lives on codim-1 volume subdomain "
                     f"{surface.id} itself, so it has no flux across it. Export it with "
@@ -2563,7 +2595,7 @@ class HydrogenTransportProblem(problem.ProblemBase):
         # with new solution
         for subdomain in self.volume_subdomains:
             for species in self.species:
-                if subdomain not in species.subdomains:
+                if subdomain not in self.species_subdomains(species):
                     continue
                 collapsed_function = species.subdomain_to_post_processing_solution[
                     subdomain

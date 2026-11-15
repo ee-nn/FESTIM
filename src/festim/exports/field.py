@@ -285,7 +285,7 @@ class SpeciesExport(FieldExportBase):
             else:
                 outfiles = []
                 for field in self._field:
-                    if self.subdomain in field.subdomains:
+                    if self.subdomain in field.subdomain_to_post_processing_solution:
                         outfiles.append(
                             field.subdomain_to_post_processing_solution[self.subdomain]
                         )
