@@ -330,6 +330,7 @@
    :hidden:
 
    installation
+   transport_migration
    userguide/index
    api/index
    devguide/index

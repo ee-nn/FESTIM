@@ -41,6 +41,19 @@ jobs:
         run: |
           xvfb-run -a python3 -m pytest test/ --cov festim --cov-report xml --cov-report term
       
+      - name: Run transport MPI regressions
+        env:
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          OMPI_ALLOW_RUN_AS_ROOT: "1"
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+        run: |
+          mpiexec -n 2 python3 -m pytest \
+            test/test_transport_review.py \
+            test/system_tests/test_transport_review.py \
+            test/system_tests/test_io.py \
+            test/test_h_transport_problem.py::test_define_meshtags_and_measures_with_custom_fenics_mesh -q
+
       - name: Upload to codecov
         uses: codecov/codecov-action@v7
         with:

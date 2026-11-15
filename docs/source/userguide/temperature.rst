@@ -179,3 +179,8 @@ Temperature can also be read from a checkpoint file written by a previous simula
     The file must have been written by a :class:`festim.TemperatureExport` with :code:`format="checkpoint"`.
     The ``name`` argument is the name of the function in the file: for a :class:`festim.HeatTransferProblem` this is the name of its solution ``my_heat_model.u.name``, which is ``"f"`` unless you rename it before running.
     Files in the visualisation formats (``"vtx"``, ``"vtkhdf"``, ``"xdmf"``) cannot be read back.
+
+Coupling with several hydrogen volumes is supported for matching and nonmatching
+heat meshes. Every hydrogen submesh receives the initial temperature and each
+subsequent heat solution before temperature-dependent inputs are evaluated.
+See :doc:`../transport_migration` for interface and temperature-transfer details.

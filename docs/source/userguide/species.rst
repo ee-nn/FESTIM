@@ -74,13 +74,19 @@ Legacy problem and species solution attributes remain deprecated aliases when
 there is one possible target; accessing them for several subdomains raises an
 ambiguity error.
 
-Multi-material models must declare interfaces explicitly. Omitting species
-subdomains in a model with several ordinary volumes and no interfaces raises a
-migration error: separate submeshes do not inherit the old continuous field's
-implicit concentration continuity. See :doc:`subdomains` for interface laws.
-To reproduce concentration continuity, use matching solubility coefficients on
-both materials (for example ``K_S_0=1.0, E_K_S=0.0``) and an explicit Nitsche
-interface. Different solubilities impose the interface's partition law instead.
+Models with several adjacent volumes must declare interfaces explicitly, including
+when the volumes share one material. FESTIM checks all shared facets for each
+mobile species, whether its membership is explicit or inferred. Existing
+codimension-one subdomains can instead declare intentional separation, with
+exchange controlled by their configured coupling terms. Disconnected volumes and
+immobile species do not require interfaces.
+
+Inferred membership is stored in ``my_model.species_to_subdomains`` without
+modifying ``Species.subdomains``. Sequential reuse resets allocated fields; use
+separate Species instances for concurrently active models.
+
+See :doc:`../transport_migration` for the breaking changes, weak continuity
+enforcement, physical solubility choices and migration examples.
 
 .. _implicit_species:
 
